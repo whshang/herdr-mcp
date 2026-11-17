@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,6 +25,28 @@ const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
 const PROMPT_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60_000;
+/// S4: repair redispatches allowed for one receipt. Caller-identified via
+/// `repair_of`; the budget is per receipt, not per lane, and exhaustion is a
+/// terminal repair state (never `delivery_uncertain`).
+pub(crate) const REPAIR_BUDGET_ATTEMPTS: u32 = 3;
+/// S4: retention is configurable but bounded. Terminal task rows past this
+/// window leave default inbox queries and stay in the archive; they are never
+/// deleted by the runtime.
+pub(crate) const PROMPT_TASK_RETENTION_ENV: &str = "HERDR_MCP_AGENT_TASK_RETENTION_MS";
+const PROMPT_TASK_RETENTION_MIN_MS: u64 = 60 * 60_000;
+const PROMPT_TASK_RETENTION_MAX_MS: u64 = 30 * 24 * 60 * 60_000;
+
+fn prompt_task_ttl_ms() -> u64 {
+    parse_retention_ms(std::env::var(PROMPT_TASK_RETENTION_ENV).ok().as_deref())
+}
+
+/// Pure retention parse: unset/invalid keeps the default, every configured
+/// value is clamped into the supported window.
+fn parse_retention_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(PROMPT_TASK_RETENTION_MIN_MS, PROMPT_TASK_RETENTION_MAX_MS))
+        .unwrap_or(PROMPT_TASK_TTL_MS)
+}
 const PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS: u64 = 10_000;
 const MAX_REPLAY_JSON_BYTES: usize = 128 * 1024;
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,8 +91,30 @@ const SPAWN_READY_POLL: Duration = Duration::from_millis(200);
 /// chain reports a resumable checkpoint instead of an orphan in-flight key.
 const SPAWN_READY_MIN_POLL_MS: u64 = 250;
 const SPAWN_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 1.2 S5: how long after a confirmed `agent.start` the chain keeps watching
+/// for an early exit. A healthy agent is held for the whole window: presence
+/// does not prove liveness, and dead-on-start agents often die several
+/// seconds in. The window is capped by the chain budget and prompt reserve
+/// so a small caller budget still keeps its prompt reserve.
+const SPAWN_EARLY_EXIT_WINDOW_MS: u64 = 10_000;
+/// Poll cadence inside the early-exit window; coarser than readiness polling
+/// because death is a discrete event, not a latency-sensitive transition.
+const SPAWN_EARLY_EXIT_POLL: Duration = Duration::from_millis(500);
+/// Bound on the sanitized pane tail attached to an `agent_start_failed`.
+const SPAWN_FAILURE_TAIL_LINES: usize = 20;
+/// S4 ready criterion, part 2: a self-reported `agent_status == "idle"` counts
+/// as ready only after it has been observed continuously for this settle
+/// window. `interactive_ready == true` is the agent's own handshake and needs
+/// no settle. The window is a floor on the heuristic, never an added delay on
+/// the handshake path.
+const SPAWN_READY_SETTLE_MS: u64 = 250;
 /// Upper bound for one pane mutation, always cut down to the remaining chain.
 const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
+/// Lower bound for one pane socket call. A caller may grant the chain less
+/// than this; the pane step still gets a usable window because the chain
+/// deadline is enforced by the `remaining == 0` gates around each step, not by
+/// starving a single in-flight mutation of any socket time at all.
+const SPAWN_PANE_SOCKET_FLOOR_MS: u64 = 4_000;
 const SPAWN_AGENT_NAME_MAX: usize = 32;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -93,6 +137,12 @@ struct RegisterTaskInput<'a> {
     parent_target: Option<&'a str>,
     parent_session_ref: Option<&'a str>,
     stall_after_ms: Option<u64>,
+    max_runtime_ms: Option<u64>,
+    on_budget: Option<&'a str>,
+    /// S0 wire correlation id (`RuntimeContext.wire_request_id`) for the call
+    /// that created this task. Persisted so the terminal inbox row can be
+    /// matched back to the envelope `request_id` the dispatcher saw.
+    request_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +178,10 @@ impl PromptTaskLifecycle {
     }
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PromptTaskRecord {
     schema_version: u32,
@@ -148,6 +202,14 @@ struct PromptTaskRecord {
     activity_observed: bool,
     prior_settle_observed: bool,
     turn_id: Option<String>,
+    /// The `state_change_seq` this task's dispatch was pinned to, when the
+    /// pane reported one. An interrupt is only legal while the pane still
+    /// sits on this sequence: a later seq means the agent already moved past
+    /// this task's turn, so the C-c would land on unrelated work (S5 review
+    /// P1-4). Absent on older records, which keep interrupting on the
+    /// `working`-status evidence alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_seq: Option<u64>,
     exact_native_turn: bool,
     terminal_status: Option<String>,
     terminal_cursor: Option<u64>,
@@ -190,6 +252,31 @@ struct PromptTaskRecord {
     worker_done_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stall_after_ms: Option<u64>,
+    /// Correlates this task back to the wire `request_id` on the envelope of
+    /// the dispatch call that created it. Absent on records written before S3
+    /// and on calls that carried no wire id (direct `tool_call`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    /// 1.2 S5: optional wall-clock run cap from task creation. Expiry emits
+    /// an `agent_budget_exceeded` event to the parent; it never terminates the
+    /// task by itself. Absent on older records, which keep loading unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_runtime_ms: Option<u64>,
+    /// What to do when a budget expires: "notify" (default) or "interrupt".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_budget: Option<String>,
+    /// Durable budget events already emitted for this task, so a restart or a
+    /// second tracker pass never re-notifies or re-interrupts. Each entry is
+    /// `{event, at_ms, notification_state, [interrupt_state]}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    budget_events: Vec<Value>,
+    /// S4 per-receipt repair budget. `repair_of` on a later dispatch records one
+    /// attempt here; the receipt turns terminal for repairs at
+    /// [`REPAIR_BUDGET_ATTEMPTS`] and further repair redispatches are refused.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    repair_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repair_exhausted_at_ms: Option<u64>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -247,6 +334,9 @@ impl PromptTaskRecord {
             "acknowledged": self.acknowledged_at_ms.is_some(),
             "created_at_ms": self.created_at_ms,
             "updated_at_ms": self.updated_at_ms,
+            // S3 receipt vocabulary: `receipt_id` aliases the task id so a
+            // waiting caller can join task rows to the dispatch envelope.
+            "receipt_id": self.task_id,
         });
         if let Some(requested) = &self.requested_target {
             public["requested_target"] = json!(requested);
@@ -260,6 +350,7 @@ impl PromptTaskRecord {
                 ("last_heartbeat_at_ms", self.last_heartbeat_at_ms),
                 ("worker_done_at_ms", self.worker_done_at_ms),
                 ("stall_after_ms", self.stall_after_ms),
+                ("max_runtime_ms", self.max_runtime_ms),
             ] {
                 if let Some(value) = value {
                     object.insert(key.to_owned(), json!(value));
@@ -273,6 +364,45 @@ impl PromptTaskRecord {
             }
             if let Some(awaiting_children) = self.awaiting_children {
                 object.insert("awaiting_children".to_owned(), json!(awaiting_children));
+            }
+            if let Some(on_budget) = &self.on_budget {
+                object.insert("on_budget".to_owned(), json!(on_budget));
+            }
+            if !self.budget_events.is_empty() {
+                object.insert("budget_events".to_owned(), json!(self.budget_events));
+            }
+            // S3: correlate the row back to the dispatch envelope's wire id.
+            if let Some(request_id) = &self.request_id {
+                object.insert("request_id".to_owned(), json!(request_id));
+            }
+            if self.repair_attempts > 0 || self.repair_exhausted_at_ms.is_some() {
+                object.insert(
+                    "repair".to_owned(),
+                    json!({
+                        "attempts": self.repair_attempts,
+                        "limit": REPAIR_BUDGET_ATTEMPTS,
+                        "exhausted": self.repair_exhausted_at_ms.is_some(),
+                        "exhausted_at_ms": self.repair_exhausted_at_ms,
+                    }),
+                );
+            }
+            // S4: `delivery_uncertain` means "may already have been delivered".
+            // The row therefore carries the read-only check a caller can run to
+            // find out, instead of a bare doubt. The pane echo cursor is the
+            // closest durable evidence this runtime owns; when the pane is
+            // unknown the hint still names the surface without inventing one.
+            if self.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
+                let pane = self.pane_id.clone().or_else(|| Some(self.target.clone()));
+                object.insert(
+                    "confirm_hint".to_owned(),
+                    json!({
+                        "action": "herdr_mcp.agent.read",
+                        "target": pane,
+                        "cursor": self.terminal_cursor,
+                        "reason": self.notification_error,
+                        "meaning": "the prompt may or may not have reached the agent; read the pane before re-dispatching",
+                    }),
+                );
             }
         }
         public
@@ -333,6 +463,10 @@ struct PromptRegistryInner {
     /// Idempotency keys whose resumable spawn checkpoint is being continued,
     /// so two concurrent replays cannot both prompt the same agent.
     spawn_resumes: Mutex<HashSet<String>>,
+    /// Test seam: scripted Herdr fakes answer a fixed request sequence, so a
+    /// dispatch test that already scripted create/start/prompt would see the S5
+    /// early-exit probe consume a scripted reply. Production never sets it.
+    spawn_early_exit_watch_disabled: AtomicBool,
     #[cfg(test)]
     clock: Option<Arc<AtomicU64>>,
     records: Mutex<HashMap<String, PromptRecord>>,
@@ -381,6 +515,18 @@ impl PromptRegistry {
         Self::default()
     }
 
+    /// Disable the S5 post-readiness early-exit watch for this registry.
+    ///
+    /// Test-only: a scripted Herdr fake answers one fixed sequence regardless of
+    /// method, so the watch's `agent.get` probe would consume a reply the test
+    /// scripted for `agent.prompt`. Production never calls this.
+    #[cfg(test)]
+    pub(crate) fn disable_spawn_early_exit_watch(&self) {
+        self.inner
+            .spawn_early_exit_watch_disabled
+            .store(true, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub fn with_store(store: Arc<Mutex<StateStore>>) -> Self {
         Self {
@@ -388,6 +534,7 @@ impl PromptRegistry {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -409,6 +556,7 @@ impl PromptRegistry {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -589,6 +737,9 @@ impl PromptRegistry {
             parent_target,
             parent_session_ref,
             stall_after_ms,
+            max_runtime_ms,
+            on_budget,
+            request_id,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
@@ -638,6 +789,13 @@ impl PromptRegistry {
                 &format!("seq:{}", after_seq.unwrap_or_default()),
             ));
         }
+        // Pin the dispatch to the pane's observed seq when one was reported;
+        // an interrupt later refuses once the pane moves past it.
+        let turn_seq = if seq_advanced {
+            after_seq
+        } else {
+            baseline_seq
+        };
 
         let mut record = PromptTaskRecord {
             schema_version: 1,
@@ -657,6 +815,7 @@ impl PromptRegistry {
             activity_observed,
             prior_settle_observed: false,
             turn_id,
+            turn_seq,
             exact_native_turn: false,
             terminal_status: None,
             terminal_cursor: None,
@@ -665,6 +824,10 @@ impl PromptRegistry {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            request_id: None,
+            max_runtime_ms: None,
+            on_budget: None,
+            budget_events: Vec::new(),
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -682,11 +845,16 @@ impl PromptRegistry {
             acknowledged_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
+            repair_attempts: 0,
+            repair_exhausted_at_ms: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
         }
         record.stall_after_ms = stall_after_ms;
+        record.max_runtime_ms = max_runtime_ms;
+        record.on_budget = on_budget.map(str::to_owned);
+        record.request_id = request_id.map(str::to_owned);
         self.save_task(&record, Some(fingerprint))?;
         drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
@@ -912,8 +1080,23 @@ impl PromptRegistry {
             include_acknowledged,
             advisory,
             limit,
+            receipt_id: None,
+            status: None,
+            since_ms: None,
         };
         match self.inbox_payload(&query) {
+            Ok(payload) => payload,
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    /// S4: one inbox read for a fully populated query (filters included).
+    fn task_inbox_with_query(&self, query: &InboxQuery<'_>) -> Value {
+        match self.inbox_payload(query) {
             Ok(payload) => payload,
             Err(error) => json!({
                 "ok": false,
@@ -1016,7 +1199,13 @@ impl PromptRegistry {
         if let Some(object) = payload.as_object_mut() {
             object.insert(
                 "wait".to_owned(),
-                json!({"waited_ms": waited_ms, "woke": woke}),
+                json!({
+                    "waited_ms": waited_ms,
+                    "woke": woke,
+                    // Expiry is a checkpoint, not an error: the caller may
+                    // re-wait on the same scope; it is not a request timeout.
+                    "still_running": woke == "timeout",
+                }),
             );
         }
         payload
@@ -1030,6 +1219,252 @@ impl PromptRegistry {
     /// path must not sweep every lane's already-terminal notification
     /// bookkeeping, because that would run parent probes and attention advice
     /// on each tick instead of only on the returned snapshot.
+    /// S4 per-receipt repair budget.
+    ///
+    /// A caller that redispatches a repair identifies the receipt it repairs
+    /// (`repair_of`). Each accepted repair spends one attempt; at
+    /// [`REPAIR_BUDGET_ATTEMPTS`] the receipt's repair lane is terminal and any
+    /// further repair is refused as `not_delivered` instead of being submitted.
+    /// Repair accounting never changes the receipt's own delivered lifecycle.
+    pub fn record_repair_attempt(&self, receipt_id: &str) -> Value {
+        let Some(store) = self.inner.store.as_ref() else {
+            return json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": "agent task store is not configured",
+            });
+        };
+        let now_ms = self.now_ms();
+        let decision = {
+            let mut store = match store.lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return json!({
+                        "ok": false,
+                        "code": "agent_task_store_unavailable",
+                        "message": "agent task store lock unavailable",
+                    });
+                }
+            };
+            // One IMMEDIATE transaction owns read -> check -> increment ->
+            // write, so concurrent repairs cannot overspend this receipt.
+            store.update_operation_result(
+                receipt_id,
+                PROMPT_TASK_OPERATION_KIND,
+                |result_json| {
+                    let mut task = decode_task_record_json(result_json)?;
+                    if !task.is_terminal() {
+                        return Ok((
+                            None,
+                            json!({
+                                "ok": false,
+                                "code": "repair_target_not_terminal",
+                                "receipt_id": receipt_id,
+                                "delivery_state": "not_delivered",
+                                "retryable": false,
+                                "message": "only a terminal receipt can be repaired",
+                            }),
+                        ));
+                    }
+                    if task.repair_exhausted_at_ms.is_some()
+                        || task.repair_attempts >= REPAIR_BUDGET_ATTEMPTS
+                    {
+                        let mut exhausted = json!({
+                            "ok": false,
+                            "code": "repair_budget_exhausted",
+                            "receipt_id": receipt_id,
+                            "attempts": task.repair_attempts,
+                            "limit": REPAIR_BUDGET_ATTEMPTS,
+                            "terminal": true,
+                            "delivery_state": "not_delivered",
+                            "retryable": false,
+                            "fallback_allowed": false,
+                            "hint": "this receipt's repair lane is terminal; start a fresh dispatch instead of repairing it again",
+                        });
+                        if task.repair_exhausted_at_ms.is_none() {
+                            task.repair_exhausted_at_ms = Some(now_ms);
+                            let encoded = serde_json::to_string(&task)
+                                .map_err(|error| format!("cannot encode agent task: {error}"))?;
+                            exhausted["attempts"] = json!(task.repair_attempts);
+                            return Ok((Some(encoded), exhausted));
+                        }
+                        return Ok((None, exhausted));
+                    }
+                    task.repair_attempts = task.repair_attempts.saturating_add(1);
+                    let encoded = serde_json::to_string(&task)
+                        .map_err(|error| format!("cannot encode agent task: {error}"))?;
+                    Ok((
+                        Some(encoded),
+                        json!({
+                            "ok": true,
+                            "receipt_id": receipt_id,
+                            "attempts": task.repair_attempts,
+                            "limit": REPAIR_BUDGET_ATTEMPTS,
+                            "remaining": REPAIR_BUDGET_ATTEMPTS.saturating_sub(task.repair_attempts),
+                        }),
+                    ))
+                },
+            )
+        };
+        match decision {
+            Ok(Some(value)) => value,
+            Ok(None) => json!({
+                "ok": false,
+                "code": "agent_task_not_found",
+                "receipt_id": receipt_id,
+            }),
+            Err(error) => json!({
+                "ok": false,
+                "code": "agent_task_store_unavailable",
+                "message": error,
+            }),
+        }
+    }
+
+    /// Terminal receipts whose retention window elapsed. They are hidden from
+    /// default queries and were never deleted, so this is the archive surface.
+    fn list_archived_tasks(&self, limit: usize) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        let rows = store.operation_ledgers_archived(PROMPT_TASK_OPERATION_KIND, limit)?;
+        drop(store);
+        rows.into_iter()
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                if let Some(store) = self.inner.store.as_ref() {
+                    let store = store
+                        .lock()
+                        .map_err(|_| "agent task store lock unavailable".to_owned())?;
+                    task.gate = store.open_decision_gate(&task.task_id)?;
+                }
+                Ok(task)
+            })
+            .collect()
+    }
+
+    fn inbox_scope_matches(&self, task: &PromptTaskRecord, query: &InboxQuery) -> bool {
+        task_matches_scope(
+            task,
+            query.workspace_id,
+            query.parent_target,
+            query.parent_session_ref,
+        ) && task_matches_receipt_filters(task, query.receipt_id, query.status, query.since_ms)
+    }
+
+    /// S4 read-only counters for one inbox scope. No mutation, no task bodies.
+    fn inbox_stats(&self, tasks: &[PromptTaskRecord], query: &InboxQuery) -> Value {
+        let mut running = 0_u64;
+        let mut completed = 0_u64;
+        let mut blocked = 0_u64;
+        let mut failed = 0_u64;
+        let mut uncertain = 0_u64;
+        let mut oldest_updated_ms = None::<u64>;
+        let mut newest_updated_ms = None::<u64>;
+        for task in tasks
+            .iter()
+            .filter(|task| self.inbox_scope_matches(task, query))
+        {
+            match task.lifecycle {
+                PromptTaskLifecycle::Running
+                | PromptTaskLifecycle::AwaitingActivity
+                | PromptTaskLifecycle::AwaitingPriorSettle => running += 1,
+                PromptTaskLifecycle::DeliveryUncertain => uncertain += 1,
+                PromptTaskLifecycle::Completed => completed += 1,
+                PromptTaskLifecycle::Blocked => blocked += 1,
+                PromptTaskLifecycle::Failed => failed += 1,
+            }
+            oldest_updated_ms = Some(
+                oldest_updated_ms.map_or(task.updated_at_ms, |value| value.min(task.updated_at_ms)),
+            );
+            newest_updated_ms = Some(
+                newest_updated_ms.map_or(task.updated_at_ms, |value| value.max(task.updated_at_ms)),
+            );
+        }
+        let archived = self
+            .list_archived_tasks(512)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|task| task.is_terminal() && self.inbox_scope_matches(task, query))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        json!({
+            "read_only": true,
+            "scope": {
+                "workspace_id": query.workspace_id,
+                "parent_scoped": query.parent_target.is_some()
+                    || query.parent_session_ref.is_some(),
+            },
+            "active": running,
+            "completed": completed,
+            "blocked": blocked,
+            "failed": failed,
+            "delivery_uncertain": uncertain,
+            "terminal": completed + blocked + failed + uncertain,
+            "archived": archived,
+            "oldest_updated_ms": oldest_updated_ms,
+            "newest_updated_ms": newest_updated_ms,
+            "retention_ms": prompt_task_ttl_ms(),
+        })
+    }
+
+    /// S4 archive read: terminal receipts past retention, within the caller's
+    /// scope and filters. Default queries never include these rows.
+    fn archive_payload(&self, query: &InboxQuery) -> Value {
+        // The embedded stats describe the caller's live scope as well as the
+        // archive: computing them from an empty set would report `active: 0` /
+        // `terminal: 0` for a scope that still has live receipts (S4 review P2).
+        let live = self.list_tasks(512).unwrap_or_default();
+        let archived = match self.list_archived_tasks(512) {
+            Ok(archived) => archived,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "code": "agent_task_store_unavailable",
+                    "message": error,
+                });
+            }
+        };
+        let mut tasks = archived
+            .into_iter()
+            .filter(|task| task.is_terminal() && self.inbox_scope_matches(task, query))
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at_ms));
+        tasks.truncate(query.limit.clamp(1, 512));
+        json!({
+            "ok": true,
+            "archive": true,
+            "retention_ms": prompt_task_ttl_ms(),
+            "tasks": tasks
+                .into_iter()
+                .map(|task| task.public_json_at(self.now_ms()))
+                .collect::<Vec<_>>(),
+            "stats": self.inbox_stats(&live, query),
+        })
+    }
+
+    /// S4 stats-only view: counters for the caller's scope, no task rows.
+    fn stats_payload(&self, query: &InboxQuery) -> Value {
+        let tasks = match self.list_tasks(512) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return json!({
+                    "ok": false,
+                    "code": "agent_task_store_unavailable",
+                    "message": error,
+                });
+            }
+        };
+        json!({
+            "ok": true,
+            "stats": self.inbox_stats(&tasks, query),
+        })
+    }
+
     fn inbox_has_pending_terminal(&self, query: &InboxQuery) -> Result<bool, String> {
         let in_scope = |task: &PromptTaskRecord| {
             task_matches_scope(
@@ -1040,7 +1475,15 @@ impl PromptRegistry {
             )
         };
         let pending = |task: &PromptTaskRecord| {
-            in_scope(task) && task.is_terminal() && task.acknowledged_at_ms.is_none()
+            in_scope(task)
+                && task_matches_receipt_filters(
+                    task,
+                    query.receipt_id,
+                    query.status,
+                    query.since_ms,
+                )
+                && task.is_terminal()
+                && task.acknowledged_at_ms.is_none()
         };
         let tasks = self.list_tasks(512)?;
         if tasks.iter().any(pending) {
@@ -1068,6 +1511,9 @@ impl PromptRegistry {
             include_acknowledged,
             advisory,
             limit,
+            receipt_id,
+            status,
+            since_ms,
         } = *query;
         self.reconcile_active_tasks();
         let tasks = self.list_tasks(512)?;
@@ -1076,6 +1522,7 @@ impl PromptRegistry {
             .filter(|task| {
                 task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
             })
+            .filter(|task| task_matches_receipt_filters(task, receipt_id, status, since_ms))
             .filter(|task| {
                 !task.is_terminal() || include_acknowledged || task.acknowledged_at_ms.is_none()
             })
@@ -1147,6 +1594,9 @@ impl PromptRegistry {
                 "failed": failed,
                 "uncertain": uncertain,
             },
+            // S4 read-only governance stats for this scope. Counts only; the
+            // archive count comes from rows whose retention window elapsed.
+            "stats": self.inbox_stats(&tasks, query),
             "tasks": terminal.into_iter().map(|task| task.public_json_at(self.now_ms())).collect::<Vec<_>>(),
             "attention": attention,
             "escalation": escalation,
@@ -1278,6 +1728,7 @@ impl PromptRegistry {
                             "completed": false,
                             "task_id": task_id,
                             "outcome": "checkpoint",
+                            "still_running": true,
                             "task": task.public_json_at(self.now_ms()),
                         });
                     }
@@ -1331,6 +1782,7 @@ impl PromptRegistry {
                         };
                         let registry = PromptRegistry { inner };
                         registry.reconcile_activity_timeouts();
+                        registry.sweep_task_budgets();
                         last_timeout_scan = std::time::Instant::now();
                     }
                 }
@@ -1359,6 +1811,238 @@ impl PromptRegistry {
         for task in tasks {
             if task.lifecycle == PromptTaskLifecycle::AwaitingActivity {
                 let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+    }
+
+    /// 1.2 S5: emit budget events for non-terminal tasks whose explicit
+    /// `stall_after_ms` or `max_runtime_ms` has expired. Notify-only by
+    /// default; `on_budget:"interrupt"` additionally sends one explicit C-c.
+    /// Each event is recorded durably before delivery so a restart or a second
+    /// pass never re-notifies or re-interrupts. Tasks without caps are skipped
+    /// entirely (the default 20-minute stall liveness projection is unchanged
+    /// and emits nothing). Never terminates a task.
+    fn sweep_task_budgets(&self) {
+        // Active tasks only: the bounded recent-512 window can evict a still
+        // running task behind newer terminal history and silence its caps
+        // forever (S5 review P1-5).
+        let Ok(tasks) = self.list_active_tasks() else {
+            return;
+        };
+        let now = self.now_ms();
+        for task in tasks {
+            if task.is_terminal() {
+                continue;
+            }
+            // The event row is persisted as `pending` before delivery. A crash
+            // in that window would otherwise leave it pending forever, because
+            // the row's existence suppresses a fresh event. Re-deliver pending
+            // rows on the next sweep (at-least-once recovery, same intent as
+            // the pending terminal notification): a duplicate parent message is
+            // preferable to a parent that never learns the cap expired.
+            // The interrupt is different: an undelivered C-c must never be
+            // replayed, so recovery passes `interrupt=false` and the delivery
+            // pass finalizes a leftover `pending` interrupt as `uncertain`
+            // instead of sending a second keystroke (S5 review P2-1).
+            let pending: Vec<String> = task
+                .budget_events
+                .iter()
+                .filter(|row| {
+                    row.get("notification_state").and_then(Value::as_str) == Some("pending")
+                })
+                .filter_map(|row| row.get("event").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+            for event in pending {
+                self.deliver_budget_event(&task.task_id, &event, now, false);
+            }
+            let mut due: Vec<&'static str> = Vec::new();
+            if let Some(stall) = task.stall_after_ms
+                && now.saturating_sub(task.updated_at_ms) >= stall
+                && !task.budget_events.iter().any(|event| {
+                    event.get("event").and_then(Value::as_str) == Some("agent_stalled")
+                })
+            {
+                due.push("agent_stalled");
+            }
+            if let Some(cap) = task.max_runtime_ms
+                && now.saturating_sub(task.created_at_ms) >= cap
+                && !task.budget_events.iter().any(|event| {
+                    event.get("event").and_then(Value::as_str) == Some("agent_budget_exceeded")
+                })
+            {
+                due.push("agent_budget_exceeded");
+            }
+            for event in due {
+                self.emit_budget_event(&task.task_id, event, now);
+            }
+        }
+    }
+
+    /// Record one budget event under the task mutation lock, then deliver the
+    /// parent notification (and optional interrupt) outside the lock. The
+    /// event row is persisted first with `notification_state:"pending"`; the
+    /// delivery outcome updates that row, mirroring terminal notifications.
+    fn emit_budget_event(&self, task_id: &str, event: &str, now: u64) {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        let Ok(Some(mut task)) = self.load_task(task_id) else {
+            return;
+        };
+        if task.is_terminal()
+            || task
+                .budget_events
+                .iter()
+                .any(|row| row.get("event").and_then(Value::as_str) == Some(event))
+        {
+            return;
+        }
+        // Interrupt eligibility is a one-shot, durably reserved at emit time
+        // under the task mutation lock: a second due event (stall + runtime
+        // cap expiring together, or a later threshold on the same task) may
+        // still notify the parent but must never produce a second C-c
+        // (S5 review P1-3).
+        let interrupt_reserved = task.on_budget.as_deref() == Some("interrupt")
+            && !task.budget_events.iter().any(|row| {
+                row.get("interrupt_state").and_then(Value::as_str) != Some("not_requested")
+                    && row.get("interrupt_state").and_then(Value::as_str).is_some()
+            });
+        task.budget_events.push(json!({
+            "event": event,
+            "at_ms": now,
+            "notification_state": "pending",
+            "interrupt_state": if interrupt_reserved { "pending" } else { "not_requested" },
+        }));
+        // The delivery call below interrupts only for the row that reserved
+        // eligibility above.
+        // Budget events are observations, not activity: do not touch
+        // updated_at_ms, or a stall event would reset its own stall clock.
+        if self.save_task(&task, None).is_err() {
+            return;
+        }
+        drop(_guard);
+        self.deliver_budget_event(task_id, event, now, interrupt_reserved);
+    }
+
+    fn deliver_budget_event(&self, task_id: &str, event: &str, now: u64, interrupt: bool) {
+        let Some(client) = self.inner.client.as_ref() else {
+            return;
+        };
+        let Ok(Some(task)) = self.load_task(task_id) else {
+            return;
+        };
+        let mut notification_state = "not_attempted".to_owned();
+        let mut notification_error: Option<String> = None;
+        if let Some(parent_target) = task.parent_target.as_deref() {
+            let text = format!(
+                "Herdr child-task budget event: {event} for task {} (child {}). The task is still running; this is a notification, not a completion. Inspect it with agent status/inbox before deciding to wait, interrupt, or re-dispatch.",
+                task.task_id, task.target
+            );
+            match client.call_with_timeout(
+                "agent.prompt",
+                json!({"target": parent_target, "text": text}),
+                Duration::from_secs(10),
+            ) {
+                Ok(_) => notification_state = "delivered".to_owned(),
+                Err(error) => {
+                    notification_state = if definitely_not_delivered(&error) {
+                        "not_delivered".to_owned()
+                    } else {
+                        "uncertain".to_owned()
+                    };
+                    notification_error = Some(truncate_chars(&error.message, 512));
+                }
+            }
+        }
+        // A recovered sweep passes `interrupt=false`: never replay a C-c whose
+        // first delivery crashed between persist and send. The row's `pending`
+        // interrupt is finalized as `uncertain` below (S5 review P2-1).
+        let interrupt_state = if interrupt {
+            Some(self.interrupt_task_pane(client, &task))
+        } else {
+            None
+        };
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        let Ok(Some(mut task)) = self.load_task(task_id) else {
+            return;
+        };
+        if let Some(row) = task
+            .budget_events
+            .iter_mut()
+            .find(|row| row.get("event").and_then(Value::as_str) == Some(event))
+        {
+            row["notification_state"] = json!(notification_state);
+            row["interrupt_state"] = json!(match interrupt_state {
+                Some(state) => state,
+                None => {
+                    if row.get("interrupt_state").and_then(Value::as_str) == Some("pending") {
+                        "uncertain".to_owned()
+                    } else {
+                        row["interrupt_state"]
+                            .as_str()
+                            .unwrap_or("not_requested")
+                            .to_owned()
+                    }
+                }
+            });
+            if let Some(error) = notification_error {
+                row["notification_error"] = json!(error);
+            }
+            let _ = now;
+        }
+        let _ = self.save_task(&task, None);
+    }
+
+    /// One explicit C-c to the task's own pane, only when an agent is actively
+    /// working on *this task's* turn (mirrors browser_control::execute_interrupt's
+    /// guard plus the durable ownership checks below). Never sends to a parent,
+    /// an idle pane, a task that already settled, or a pane that moved past
+    /// the seq this task was pinned to (S5 review P1-4).
+    fn interrupt_task_pane(&self, client: &HerdrClient, task: &PromptTaskRecord) -> String {
+        let Some(pane_id) = task.pane_id.as_deref() else {
+            return "no_pane".to_owned();
+        };
+        let Some(state) = agent_state_of(client, pane_id) else {
+            return "agent_gone".to_owned();
+        };
+        if state.agent_status.as_deref() != Some("working") {
+            return "no_active_turn".to_owned();
+        }
+        // Side-effect fence, re-checked at send time: the notification call
+        // above can span seconds, during which a worker_done/terminal event
+        // may settle this task or the pane may start an unrelated new turn.
+        // Reload the durable record and require the pane to still sit on the
+        // seq this task was pinned to before touching the keyboard; anything
+        // that cannot prove ownership fails closed (S5 review P1-4).
+        match self.load_task(&task.task_id) {
+            Ok(Some(fresh)) => {
+                if fresh.is_terminal() {
+                    return "task_settled".to_owned();
+                }
+                match (fresh.turn_seq, state.state_change_seq) {
+                    (Some(pinned), Some(live)) if live == pinned => {}
+                    (Some(_), Some(_)) => return "turn_mismatch".to_owned(),
+                    _ => return "turn_unverifiable".to_owned(),
+                }
+            }
+            // A record that vanished or a store that cannot answer cannot
+            // prove the pane still belongs to this task.
+            _ => return "turn_unverifiable".to_owned(),
+        }
+        match client.call_with_timeout(
+            "pane.send_keys",
+            json!({"pane_id": pane_id, "keys": ["C-c"]}),
+            Duration::from_secs(5),
+        ) {
+            Ok(_) => "sent".to_owned(),
+            Err(error) => {
+                if definitely_not_delivered(&error) {
+                    "not_delivered".to_owned()
+                } else {
+                    "uncertain".to_owned()
+                }
             }
         }
     }
@@ -1691,6 +2375,29 @@ impl PromptRegistry {
             .collect()
     }
 
+    /// Every task whose ledger row is still non-terminal, unbounded by the
+    /// recent-window cap: the budget sweep must see a long-running task even
+    /// when hundreds of newer terminal tasks were written after it (S5
+    /// review P1-5). Open gates stay live the same way `list_tasks` sees
+    /// them, so gated tasks still appear here.
+    fn list_active_tasks(&self) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        store
+            .operation_ledgers_by_phase(PROMPT_TASK_OPERATION_KIND, "active")?
+            .into_iter()
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
+            .collect()
+    }
+
     fn save_task(&self, task: &PromptTaskRecord, request_hash: Option<&str>) -> Result<(), String> {
         let Some(store) = self.inner.store.as_ref() else {
             return Ok(());
@@ -1698,7 +2405,7 @@ impl PromptRegistry {
         let encoded = serde_json::to_string(task)
             .map_err(|error| format!("cannot encode agent task: {error}"))?;
         let now = now_ms();
-        let expires_at = now.saturating_add(PROMPT_TASK_TTL_MS);
+        let expires_at = now.saturating_add(prompt_task_ttl_ms());
         let mut store = store
             .lock()
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
@@ -1743,6 +2450,29 @@ struct InboxQuery<'a> {
     include_acknowledged: bool,
     advisory: bool,
     limit: usize,
+    /// S4 filters. `receipt_id` aliases the task id, `status` matches the
+    /// lifecycle/terminal status string, `since_ms` keeps receipts updated at or
+    /// after that millisecond timestamp.
+    receipt_id: Option<&'a str>,
+    status: Option<&'a str>,
+    since_ms: Option<u64>,
+}
+
+/// S4 receipt filters, applied identically to the default inbox, the archive
+/// and the bounded wait. `status` accepts the lifecycle name (`completed`,
+/// `failed`, `blocked`, `delivery_uncertain`, `running`, ...) or the recorded
+/// terminal status.
+fn task_matches_receipt_filters(
+    task: &PromptTaskRecord,
+    receipt_id: Option<&str>,
+    status: Option<&str>,
+    since_ms: Option<u64>,
+) -> bool {
+    receipt_id.is_none_or(|receipt_id| task.task_id == receipt_id)
+        && status.is_none_or(|status| {
+            task.lifecycle.as_str() == status || task.terminal_status.as_deref() == Some(status)
+        })
+        && since_ms.is_none_or(|since_ms| task.updated_at_ms >= since_ms)
 }
 
 /// Inbox task projection: `full` keeps today's payload, `compact` drops the
@@ -1751,6 +2481,11 @@ struct InboxQuery<'a> {
 enum InboxView {
     Full,
     Compact,
+    /// S4: terminal receipts past retention. They left the default queries but
+    /// were never deleted, so they stay queryable here.
+    Archive,
+    /// S4: read-only counters for the caller's scope; no task rows.
+    Stats,
 }
 
 /// Fields kept by `view: compact`. Attention facts are only carried when the
@@ -1758,8 +2493,10 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 15] = [
+const COMPACT_TASK_FIELDS: [&str; 17] = [
     "task_id",
+    "receipt_id",
+    "request_id",
     "dispatch_id",
     "requested_target",
     "target",
@@ -1790,6 +2527,8 @@ fn compact_task(task: Map<String, Value>) -> Map<String, Value> {
 fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
     let mut row = json!({
         "task_id": task.task_id,
+        "receipt_id": task.task_id,
+        "request_id": task.request_id,
         "dispatch_id": task.dispatch_id,
         "workspace_id": task.workspace_id,
         "lifecycle": task.lifecycle.as_str(),
@@ -1807,7 +2546,9 @@ fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
 }
 
 fn apply_inbox_view(payload: Value, view: InboxView) -> Value {
-    if view == InboxView::Full {
+    if !matches!(view, InboxView::Compact) {
+        // `full`, `archive` and `stats` payloads are already final: archive
+        // rows keep every fact a caller may need to reconcile a receipt.
         return payload;
     }
     let Value::Object(mut object) = payload else {
@@ -1830,7 +2571,11 @@ fn parse_inbox_view(params: &Value) -> Result<InboxView, Value> {
     match view.as_str() {
         Some("full") => Ok(InboxView::Full),
         Some("compact") => Ok(InboxView::Compact),
-        _ => Err(invalid(r#"view must be "full" or "compact""#)),
+        Some("archive") => Ok(InboxView::Archive),
+        Some("stats") => Ok(InboxView::Stats),
+        _ => Err(invalid(
+            r#"view must be "full", "compact", "archive" or "stats""#,
+        )),
     }
 }
 
@@ -2118,6 +2863,12 @@ fn task_attention_state(attention: &Value, task_id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Decode one task payload without a ledger row, for atomic in-transaction
+/// read-modify-write paths (`update_operation_result`).
+fn decode_task_record_json(encoded: &str) -> Result<PromptTaskRecord, String> {
+    serde_json::from_str(encoded).map_err(|error| format!("cannot decode agent task: {error}"))
+}
+
 fn decode_task_record(record: &OperationLedgerRecord) -> Result<PromptTaskRecord, String> {
     let encoded = record
         .result_json
@@ -2224,6 +2975,13 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
                     task.task_id.as_str(),
                     &format!("cursor:{cursor}"),
                 ));
+            }
+            // The task's live turn is the seq the pane entered working on;
+            // re-pin the interrupt fence here so a dispatch-time baseline
+            // cannot hold the interrupt back, and a later unrelated turn
+            // still refuses (S5 review P1-4).
+            if let Some(seq) = task_event_state_change_seq(event) {
+                task.turn_seq = Some(seq);
             }
             task.updated_at_ms = now;
             true
@@ -3034,6 +3792,45 @@ pub fn task_call_with_parent_session(
                 Ok(view) => view,
                 Err(error) => return error,
             };
+            // S4 receipt filters: `receipt_id` aliases the task id, `status`
+            // matches the lifecycle/terminal status, `since_ms` keeps receipts
+            // updated at or after that timestamp. They apply identically to the
+            // default inbox, the bounded wait, the archive and the stats view.
+            let receipt_id = match params.get("receipt_id") {
+                None => None,
+                Some(value) => match value.as_str() {
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 128
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    _ => {
+                        return invalid("receipt_id must be a non-empty string up to 128 bytes");
+                    }
+                },
+            };
+            let status = match params.get("status") {
+                None => None,
+                Some(value) => match value.as_str() {
+                    Some(value)
+                        if !value.is_empty()
+                            && value.len() <= 64
+                            && !value.chars().any(char::is_control) =>
+                    {
+                        Some(value)
+                    }
+                    _ => return invalid("status must be a non-empty string up to 64 bytes"),
+                },
+            };
+            let since_ms = match params.get("since_ms") {
+                None => None,
+                Some(value) => match value.as_u64() {
+                    Some(value) => Some(value),
+                    None => return invalid("since_ms must be a non-negative integer"),
+                },
+            };
             let query = InboxQuery {
                 workspace_id,
                 parent_target,
@@ -3041,17 +3838,17 @@ pub fn task_call_with_parent_session(
                 include_acknowledged,
                 advisory,
                 limit,
+                receipt_id,
+                status,
+                since_ms,
             };
-            let inbox = match wait_ms {
-                Some(wait_ms) => registry.task_inbox_waiting(&query, wait_ms),
-                None => registry.task_inbox(
-                    workspace_id,
-                    parent_target,
-                    parent_session_ref,
-                    include_acknowledged,
-                    advisory,
-                    limit,
-                ),
+            let inbox = match view {
+                InboxView::Archive => registry.archive_payload(&query),
+                InboxView::Stats => registry.stats_payload(&query),
+                _ => match wait_ms {
+                    Some(wait_ms) => registry.task_inbox_waiting(&query, wait_ms),
+                    None => registry.task_inbox_with_query(&query),
+                },
             };
             apply_inbox_view(inbox, view)
         }
@@ -3088,7 +3885,7 @@ pub fn task_call_with_parent_session(
 }
 
 pub fn run(client: &HerdrClient, registry: &PromptRegistry, args: &Value) -> Value {
-    run_with_parent_session(client, registry, args, None)
+    run_with_parent_session(client, registry, args, None, None)
 }
 
 /// Rejections for a dispatch that would make the delegation chain unsafe. Both
@@ -3177,6 +3974,7 @@ pub fn run_with_parent_session(
     registry: &PromptRegistry,
     args: &Value,
     parent_session_ref: Option<&str>,
+    request_id: Option<&str>,
 ) -> Value {
     if let Err(error) = mutation::check_global("herdr_prompt") {
         return error;
@@ -3203,6 +4001,27 @@ pub fn run_with_parent_session(
             Err(error) => return error,
         },
     };
+    // S4: an explicit repair redispatch names the terminal receipt it repairs.
+    // The per-receipt budget is spent before any socket call, so an exhausted
+    // budget is `not_delivered` by construction (nothing was submitted).
+    let repair_of = match args.get("repair_of") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some(value)
+                if !value.is_empty()
+                    && value.len() <= 128
+                    && !value.chars().any(char::is_control) =>
+            {
+                Some(value)
+            }
+            _ => return invalid("repair_of must be a non-empty receipt id up to 128 bytes"),
+        },
+    };
+    if repair_of.is_some() && spawn.is_some() {
+        return spawn_invalid(
+            "repair_of cannot be combined with spawn: a repair redispatches to an existing target",
+        );
+    }
     let role = match role_targets::RoleTarget::parse(target) {
         Ok(role) => role,
         Err(error) => return error,
@@ -3254,6 +4073,27 @@ pub fn run_with_parent_session(
             _ => return invalid("stall_after_ms must be an integer in 60000..=7200000"),
         },
     };
+    // 1.2 S5: optional run cap and budget action. Like stall_after_ms these
+    // are observation/governance preferences, not part of the mutation
+    // fingerprint; expiry notifies (or explicitly interrupts) but never
+    // terminates the task on its own.
+    let max_runtime_ms = match args.get("max_runtime_ms") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_u64() {
+            Some(value) if (60_000..=24 * 60 * 60_000).contains(&value) => Some(value),
+            _ => return invalid("max_runtime_ms must be an integer in 60000..=86400000"),
+        },
+    };
+    let on_budget = match args.get("on_budget") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value == "notify" || value == "interrupt" => {
+            Some(value.as_str())
+        }
+        Some(_) => return invalid("on_budget must be \"notify\" or \"interrupt\""),
+    };
+    if on_budget.is_some() && max_runtime_ms.is_none() && stall_after_ms.is_none() {
+        return invalid("on_budget requires max_runtime_ms or stall_after_ms");
+    }
     let inject_task_identity = match args.get("inject_task_identity") {
         None => false,
         Some(Value::Bool(value)) => *value,
@@ -3288,6 +4128,45 @@ pub fn run_with_parent_session(
                 Some(checkpoint) => spawn_resume = Some(checkpoint),
                 None => return result,
             },
+        }
+    }
+    // S5 review P1-2: model admission runs only after the durable record was
+    // consulted. A replay of an already-recorded outcome returns above and
+    // never probes the live model list or schema; a resumed chain whose agent
+    // is still pending re-uses the persisted delivery form and only
+    // re-admits when the checkpoint predates the field.
+    let mut spawn = spawn;
+    if let Some(spawn) = spawn.as_mut() {
+        match spawn_resume
+            .as_ref()
+            .map(|resume| resume.model_deliverable.clone())
+        {
+            Some(Some(deliverable)) => spawn.model_deliverable = Some(deliverable),
+            Some(None) if spawn_resume.is_some() => {
+                // Checkpoint written before the delivery form was persisted:
+                // re-run admission rather than drop the requested model.
+                if let Err(refusal) = admit_spawn_model(spawn) {
+                    return finish_spawn_failure(
+                        registry,
+                        idempotency_key,
+                        &fingerprint,
+                        task_id,
+                        refusal,
+                    );
+                }
+            }
+            None => {
+                if let Err(refusal) = admit_spawn_model(spawn) {
+                    return finish_spawn_failure(
+                        registry,
+                        idempotency_key,
+                        &fingerprint,
+                        task_id,
+                        refusal,
+                    );
+                }
+            }
+            _ => {}
         }
     }
     // Resolve the spawn plan (workspace, cwd, agent name) before any mutation:
@@ -3416,6 +4295,29 @@ pub fn run_with_parent_session(
     } else {
         None
     };
+    // S4 repair budget (droid P1-1): spend it only after the whole request has
+    // been parsed, validated and admitted. An invalid `text`/`wait`/
+    // `stall_after_ms`/lease or a rejected role resolution must never burn an
+    // attempt, and a refusal here is still `not_delivered` because nothing has
+    // been submitted yet.
+    if let Some(receipt_id) = repair_of {
+        let mut budget = registry.record_repair_attempt(receipt_id);
+        if budget.get("ok").and_then(Value::as_bool) != Some(true) {
+            if let Some(object) = budget.as_object_mut() {
+                object.insert("dispatch_id".to_owned(), json!(task_id));
+            }
+            // Persist the refusal under this key like every other pre-delivery
+            // failure, so a same-key retry replays it instead of staying in
+            // flight until the reservation TTL.
+            if let Some(key) = idempotency_key
+                && let Err(persist_error) = registry.complete(key, &fingerprint, &budget)
+            {
+                return annotate_idempotency_persistence(budget, persist_error);
+            }
+            return budget;
+        }
+    }
+
     // A spawn resolves its target by creating it, or by resuming the pane a
     // resumable checkpoint already persisted.
     let mut spawn_outcome = None;
@@ -3531,6 +4433,9 @@ pub fn run_with_parent_session(
         parent_target,
         parent_session_ref,
         stall_after_ms,
+        max_runtime_ms,
+        on_budget,
+        request_id,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -3652,6 +4557,24 @@ struct SpawnRequest {
     split_from: Option<String>,
     direction: Option<String>,
     startup_timeout_ms: u64,
+    /// Explicit model alias (1.2 S5). Part of the mutation identity: a
+    /// different model is a different spawn intent under the same key.
+    model: Option<String>,
+    /// The validated, schema-deliverable form produced at parse time. `None`
+    /// means either no model was requested or the live schema cannot carry
+    /// one — the latter refuses during parse, before any pane is created.
+    model_deliverable: Option<ModelDelivery>,
+}
+
+/// How a validated model alias is delivered on `agent.start`, decided during
+/// `parse_spawn` so a schema that cannot carry a model fails before the chain
+/// creates any pane (S5 review P1-3).
+#[derive(Debug, Clone)]
+enum ModelDelivery {
+    /// The schema exposes a native `model` property: pass the canonical form.
+    Property(String),
+    /// pi's documented `--model` passthrough via the `args` array.
+    Args(String),
 }
 
 impl SpawnRequest {
@@ -3660,7 +4583,7 @@ impl SpawnRequest {
     /// budget is an execution preference like `wait`, so it cannot fork a key.
     fn request_fingerprint(&self, text: &str) -> String {
         let slot = |value: &Option<String>| value.clone().unwrap_or_default();
-        let spec = format!(
+        let mut spec = format!(
             "spawn/1\nkind={}\nworkspace={}\ncwd={}\ntab_label={}\nsplit_from={}\ndirection={}\nname={}",
             self.kind,
             slot(&self.workspace),
@@ -3670,6 +4593,11 @@ impl SpawnRequest {
             slot(&self.direction),
             slot(&self.name),
         );
+        // Keep the historical fingerprint byte-identical when no model is
+        // requested, so stored keys from older runtimes still replay.
+        if let Some(model) = &self.model {
+            spec.push_str(&format!("\nmodel={model}"));
+        }
         request_fingerprint(&spec, text)
     }
 }
@@ -3738,7 +4666,7 @@ struct SpawnProgress {
 
 impl SpawnProgress {
     fn facts(&self, spawn: &SpawnDispatch) -> Value {
-        json!({
+        let mut facts = json!({
             "pane_id": self.pane_id,
             "tab_id": self.tab_id,
             "agent_name": spawn.agent_name,
@@ -3748,7 +4676,25 @@ impl SpawnProgress {
             "created": self.pane_id.is_some(),
             "agent_started": self.agent_started,
             "steps": self.steps,
-        })
+        });
+        // The admitted delivery form is durable checkpoint state: a resume
+        // must deliver the same canonical model without re-running live
+        // admission probes (S5 review P1-2).
+        if let Some(object) = facts.as_object_mut() {
+            if let Some(delivery) = &spawn.request.model_deliverable {
+                let (form, canonical) = match delivery {
+                    ModelDelivery::Property(canonical) => ("property", canonical.clone()),
+                    ModelDelivery::Args(canonical) => ("args", canonical.clone()),
+                };
+                object.insert(
+                    "model_deliverable".to_owned(),
+                    json!({"form": form, "canonical": canonical}),
+                );
+            } else if let Some(model) = &spawn.request.model {
+                object.insert("model".to_owned(), json!(model));
+            }
+        }
+        facts
     }
 
     fn failure(&self, spawn: &SpawnDispatch, failed_step: &str, error: &SpawnStepError) -> Value {
@@ -3827,6 +4773,9 @@ struct SpawnResume {
     phase: String,
     steps: Vec<Value>,
     attempts: u64,
+    /// The admitted delivery form persisted by `SpawnProgress::facts`: a
+    /// resumed chain replays the same canonical model without re-validating.
+    model_deliverable: Option<ModelDelivery>,
 }
 
 impl SpawnResume {
@@ -3857,6 +4806,14 @@ fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
         return None;
     }
     let spawn = result.get("spawn")?;
+    let model_deliverable = spawn.get("model_deliverable").and_then(|value| {
+        let canonical = value.get("canonical").and_then(Value::as_str)?.to_owned();
+        match value.get("form").and_then(Value::as_str)? {
+            "property" => Some(ModelDelivery::Property(canonical)),
+            "args" => Some(ModelDelivery::Args(canonical)),
+            _ => None,
+        }
+    });
     Some(SpawnResume {
         pane_id: spawn.get("pane_id").and_then(Value::as_str)?.to_owned(),
         tab_id: spawn
@@ -3874,6 +4831,7 @@ fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
             .cloned()
             .unwrap_or_default(),
         attempts: result.get("attempts").and_then(Value::as_u64).unwrap_or(0),
+        model_deliverable,
     })
 }
 
@@ -3982,6 +4940,7 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
                 | "split_from"
                 | "direction"
                 | "startup_timeout_ms"
+                | "model"
         ) {
             return Err(spawn_invalid(&format!(
                 "spawn.{key} is not a supported spawn field"
@@ -4034,6 +4993,11 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
             }
         },
     };
+    // 1.2 S5: the model alias is validated later, at admission time — after
+    // the idempotency record has been consulted (S5 review P1-2). Parsing
+    // here only preserves the raw alias so a replay whose key already owns a
+    // durable result never touches the live model list or schema.
+    let model = spawn_optional_string(object, "model", 256)?;
     Ok(Some(SpawnRequest {
         kind,
         name,
@@ -4043,7 +5007,64 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         split_from,
         direction,
         startup_timeout_ms,
+        model,
+        model_deliverable: None,
     }))
+}
+
+/// Admit the spawn's explicit model alias against live evidence.
+///
+/// Runs only for a new reservation or a checkpoint resume whose agent step is
+/// still pending — a replay of an already-recorded outcome never reaches this
+/// function, so a transient pi/schema outage cannot downgrade a completed
+/// dispatch to `model_alias_unknown` / `model_delivery_unsupported` (S5 review
+/// P1-2). A refusal here is the key's recorded outcome: persisted like every
+/// other pre-pane failure, so a same-key replay returns it instead of
+/// re-running the live probes.
+fn admit_spawn_model(spawn: &mut SpawnRequest) -> Result<(), Value> {
+    let Some(alias) = &spawn.model else {
+        return Ok(());
+    };
+    let check = crate::model_alias::validate_model_alias(&spawn.kind, alias);
+    let crate::model_alias::ModelAliasCheck::Validated { canonical } = &check else {
+        let mut refusal = crate::model_alias::model_alias_refusal(&spawn.kind, alias, &check);
+        if let Some(object) = refusal.as_object_mut() {
+            object.insert("failed_step".to_owned(), json!("validate"));
+            object.insert("requires_human".to_owned(), json!(false));
+        }
+        return Err(refusal);
+    };
+    // The schema delivery decision is admission too: a schema that cannot
+    // carry a model must refuse before the chain creates a pane, so the
+    // caller is never left with a residual pane and a failed start.
+    let deliverable = match crate::schema::agent_start_param_properties() {
+        Ok(Some(properties)) if properties.contains_key("model") => {
+            Some(ModelDelivery::Property(canonical.clone()))
+        }
+        Ok(Some(properties)) if properties.contains_key("args") && spawn.kind == "pi" => {
+            Some(ModelDelivery::Args(canonical.clone()))
+        }
+        _ => None,
+    };
+    let Some(delivery) = deliverable else {
+        let fact = crate::model_alias::validation_fact(&spawn.kind, alias, &check);
+        return Err(json!({
+            "ok": false,
+            "code": "model_delivery_unsupported",
+            "kind": spawn.kind,
+            "requested_model": alias,
+            "delivery_state": "not_delivered",
+            "submitted": false,
+            "fallback_allowed": false,
+            "retryable": false,
+            "model_validation": fact,
+            "failed_step": "validate",
+            "requires_human": false,
+            "message": "the live herdr agent.start schema cannot carry a model (no model property, and no args passthrough for a pi kind); the validated alias was not silently dropped",
+        }));
+    };
+    spawn.model_deliverable = Some(delivery);
+    Ok(())
 }
 
 fn spawn_optional_string(
@@ -4398,6 +5419,8 @@ fn spawn_create_pane(
 struct SpawnAgentReadiness {
     state: AgentState,
     ready: bool,
+    /// The agent CLI's explicit readiness handshake; settles the idle heuristic.
+    interactive_ready: bool,
 }
 
 /// Readiness evidence from one agent payload: `interactive_ready` is the
@@ -4410,7 +5433,33 @@ fn spawn_agent_readiness(value: &Value) -> Option<SpawnAgentReadiness> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let ready = interactive_ready || state.agent_status.as_deref() == Some("idle");
-    Some(SpawnAgentReadiness { state, ready })
+    Some(SpawnAgentReadiness {
+        state,
+        ready,
+        interactive_ready,
+    })
+}
+
+/// The shipped S4 ready criterion.
+///
+/// An agent is ready to receive a prompt when either
+/// - `interactive_ready == true` (the agent CLI's own handshake), or
+/// - `agent_status == "idle"` **and** that idle state has been observed for at
+///   least [`SPAWN_READY_SETTLE_MS`] of the chain budget.
+///
+/// The settle window exists because idle is a self-reported status: a start that
+/// is still building its composer can already claim idle. `first_idle_ms` is the
+/// first observation of idle after the start; `None` means the handshake has not
+/// happened and idle has not been observed yet.
+fn spawn_readiness_satisfied(
+    interactive_ready: bool,
+    first_idle_ms: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    if interactive_ready {
+        return true;
+    }
+    first_idle_ms.is_some_and(|first| now_ms.saturating_sub(first) >= SPAWN_READY_SETTLE_MS)
 }
 
 /// One bounded readiness probe. Returns the agent state only when it is ready.
@@ -4425,6 +5474,15 @@ fn spawn_probe_ready(client: &HerdrClient, pane_id: &str, timeout: Duration) -> 
 enum SpawnReadyOutcome {
     Ready(AgentState),
     TimedOut(Option<String>),
+    /// The started agent provably disappeared (1.2 S5 early-exit detection).
+    /// Carries the native evidence code (`agent_not_found`/`unknown_pane`/…).
+    Exited(String),
+}
+
+/// Native error codes that prove the agent/pane no longer exists, as opposed
+/// to a transient probe failure. Shared with `prompt_failure`'s resolve check.
+fn agent_gone_code(code: &str) -> bool {
+    matches!(code, "agent_not_found" | "unknown_agent" | "unknown_pane")
 }
 
 /// Wait for interactive readiness strictly inside the chain deadline.
@@ -4439,6 +5497,12 @@ fn spawn_wait_ready(
     mut probe_even_when_exhausted: bool,
 ) -> SpawnReadyOutcome {
     let mut last_status = None;
+    // A single gone-probe could race a pane teardown/recreate; two consecutive
+    // gone probes are required before the chain declares the agent exited.
+    let mut consecutive_gone = 0u32;
+    // S4: first observation of the self-reported idle state. The handshake path
+    // (`interactive_ready`) ignores it entirely.
+    let mut first_idle_ms: Option<u64> = None;
     loop {
         let remaining = deadline_ms.saturating_sub(registry.now_ms());
         let probe_now = std::mem::take(&mut probe_even_when_exhausted);
@@ -4455,15 +5519,184 @@ fn spawn_wait_ready(
             probe_timeout,
         ) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(error) => {
+                if agent_gone_code(&error.code) {
+                    consecutive_gone += 1;
+                    if consecutive_gone >= 2 {
+                        return SpawnReadyOutcome::Exited(error.code);
+                    }
+                } else {
+                    consecutive_gone = 0;
+                }
+                continue;
+            }
         };
         let Some(readiness) = spawn_agent_readiness(&value) else {
+            // A successful probe with no agent payload at all is also evidence
+            // the agent is gone (the pane fell back to a shell).
+            consecutive_gone += 1;
+            if consecutive_gone >= 2 {
+                return SpawnReadyOutcome::Exited("agent_not_found".to_owned());
+            }
             continue;
         };
-        if readiness.ready {
+        consecutive_gone = 0;
+        if !readiness.ready {
+            first_idle_ms = None;
+            last_status = readiness.state.agent_status.clone();
+            continue;
+        }
+        if readiness.interactive_ready {
+            return SpawnReadyOutcome::Ready(readiness.state);
+        }
+        // Idle-only evidence: require the settle window before the prompt.
+        let now = registry.now_ms();
+        let first = *first_idle_ms.get_or_insert(now);
+        if spawn_readiness_satisfied(false, Some(first), now) {
             return SpawnReadyOutcome::Ready(readiness.state);
         }
         last_status = readiness.state.agent_status.clone();
+    }
+}
+
+/// Bounded, redacted pane tail for an `agent_start_failed` refusal. Reads the
+/// pane directly (the agent is gone, so `agent.read` may not serve it) and
+/// never returns raw secrets: ANSI/control stripping plus credential redaction.
+fn spawn_failure_pane_tail(client: &HerdrClient, pane_id: &str) -> Option<String> {
+    let response = client
+        .call_with_timeout(
+            "pane.read",
+            json!({"pane_id": pane_id, "lines": SPAWN_FAILURE_TAIL_LINES}),
+            Duration::from_secs(2),
+        )
+        .ok()?;
+    let read = response.get("read").unwrap_or(&response);
+    let text = ["content", "text", "output"]
+        .into_iter()
+        .find_map(|key| read.get(key).and_then(Value::as_str))?;
+    let stripped = strip_ansi_and_control(text);
+    let redacted = crate::work_capture::redact(&stripped);
+    let tail = redacted
+        .lines()
+        .rev()
+        .take(SPAWN_FAILURE_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// The early-exit refusal: the agent was started but provably exited before
+/// the prompt was submitted. Not resumable — replaying must not prompt a dead
+/// pane; the caller reclaims it and dispatches a fresh spawn.
+fn spawn_agent_start_failed(
+    client: &HerdrClient,
+    progress: &SpawnProgress,
+    spawn: &SpawnDispatch,
+    pane_id: &str,
+    evidence_code: &str,
+) -> Value {
+    let mut failure = progress.failure(
+        spawn,
+        "agent_start",
+        &SpawnStepError {
+            code: "agent_start_failed".to_owned(),
+            message: format!(
+                "agent in pane {pane_id} exited before the prompt was submitted (evidence: {evidence_code})"
+            ),
+            hint: Some(
+                "the agent died on start (often an invalid model/alias or missing credentials); inspect the pane tail, reclaim this pane, and dispatch a new spawn with a corrected model".to_owned(),
+            ),
+        },
+    );
+    if let Some(tail) = spawn_failure_pane_tail(client, pane_id) {
+        failure["pane_tail"] = json!(tail);
+        failure["pane_tail_redacted"] = json!(true);
+    }
+    failure
+}
+
+/// The early-exit watch window, configurable via
+/// `HERDR_MCP_SPAWN_EARLY_EXIT_MS` (0 disables the post-readiness watch;
+/// the readiness loop still detects an agent that dies before ready).
+/// Defaults to ~10s and is always capped by the chain budget.
+fn spawn_early_exit_window_ms() -> u64 {
+    std::env::var("HERDR_MCP_SPAWN_EARLY_EXIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.min(SPAWN_EARLY_EXIT_WINDOW_MS))
+        .unwrap_or(SPAWN_EARLY_EXIT_WINDOW_MS)
+}
+
+/// Post-readiness early-exit watch (1.2 S5). After the start proved ready,
+/// keep observing for a bounded window so a dead-on-start agent is reported
+/// as `agent_start_failed` instead of a delivered prompt to a corpse. The
+/// window is capped by the chain deadline minus the prompt reserve AND a
+/// fraction of the chain, so a small caller budget keeps its prompt reserve;
+/// a healthy agent that stays present ends the watch at the window.
+fn spawn_watch_early_exit(
+    client: &HerdrClient,
+    registry: &PromptRegistry,
+    pane_id: &str,
+    chain_deadline_ms: u64,
+    chain_ms: u64,
+) -> Option<String> {
+    if registry
+        .inner
+        .spawn_early_exit_watch_disabled
+        .load(Ordering::SeqCst)
+    {
+        return None;
+    }
+    let window = spawn_early_exit_window_ms();
+    if window == 0 {
+        return None;
+    }
+    let reserve = spawn_prompt_reserve_ms(chain_ms);
+    let watch_deadline = registry
+        .now_ms()
+        .saturating_add(window.min(chain_ms / 4))
+        .min(chain_deadline_ms.saturating_sub(reserve));
+    let mut consecutive_gone = 0u32;
+    loop {
+        let now = registry.now_ms();
+        if now >= watch_deadline {
+            return None;
+        }
+        thread::sleep(SPAWN_EARLY_EXIT_POLL.min(Duration::from_millis(
+            watch_deadline.saturating_sub(now).max(1),
+        )));
+        // Cap each watch probe well below the fake-server read window and the
+        // remaining watch budget so a slow peer cannot stretch the window.
+        let probe_timeout = SPAWN_READY_PROBE_TIMEOUT.min(Duration::from_millis(
+            watch_deadline
+                .saturating_sub(registry.now_ms())
+                .clamp(1, 1_000),
+        ));
+        match client.call_with_timeout("agent.get", json!({"target": pane_id}), probe_timeout) {
+            Ok(value) => {
+                if spawn_agent_readiness(&value).is_some() {
+                    consecutive_gone = 0;
+                } else {
+                    consecutive_gone += 1;
+                    if consecutive_gone >= 2 {
+                        return Some("agent_not_found".to_owned());
+                    }
+                }
+            }
+            Err(error) => {
+                if agent_gone_code(&error.code) {
+                    consecutive_gone += 1;
+                    if consecutive_gone >= 2 {
+                        return Some(error.code);
+                    }
+                } else {
+                    consecutive_gone = 0;
+                }
+            }
+        }
     }
 }
 
@@ -4508,7 +5741,14 @@ fn spawn_chain(
                 "replay the same idempotency key with a larger spawn.startup_timeout_ms",
             ));
         }
-        let timeout = Duration::from_millis(remaining.min(SPAWN_PANE_TIMEOUT_MS));
+        // Socket floor: `remaining` is the chain's accounting unit, but a
+        // budget measured in single-digit ms must not starve the pane call of
+        // any socket window — the step gate above already decided the chain
+        // may spend one mutation, and the next gate still re-checks the
+        // deadline before the agent step.
+        let timeout = Duration::from_millis(
+            remaining.clamp(SPAWN_PANE_SOCKET_FLOOR_MS, SPAWN_PANE_TIMEOUT_MS),
+        );
         let created = match spawn_create_pane(client, registry, spawn, timeout) {
             Ok(created) => created,
             Err(error) => return Err(progress.failure(spawn, "pane_create", &error)),
@@ -4571,12 +5811,24 @@ fn spawn_chain(
                 ));
             }
             let native_timeout = start_budget.min(SPAWN_CHAIN_MAX_MS);
-            let start_params = json!({
+            let mut start_params = json!({
                 "name": spawn.agent_name,
                 "kind": spawn.request.kind,
                 "pane_id": pane_id,
                 "timeout_ms": native_timeout,
             });
+            // 1.2 S5: the alias was validated and its delivery form chosen in
+            // parse_spawn; here we only apply it. A schema that cannot carry a
+            // model refused during parse, before this pane ever existed.
+            match &spawn.request.model_deliverable {
+                Some(ModelDelivery::Property(canonical)) => {
+                    start_params["model"] = json!(canonical);
+                }
+                Some(ModelDelivery::Args(canonical)) => {
+                    start_params["args"] = json!(["--model", canonical]);
+                }
+                None => {}
+            }
             match client.call_with_timeout(
                 "agent.start",
                 start_params,
@@ -4640,16 +5892,24 @@ fn spawn_chain(
                     state
                 }
                 SpawnReadyOutcome::TimedOut(last_status) => {
+                    // S4: a request that never reached delivery is
+                    // `not_delivered` (see `checkpoint`), never
+                    // `delivery_uncertain`; the public code names the cause.
                     return Err(progress.checkpoint(
                         spawn,
                         "agent_ready",
-                        "agent_ready_timeout",
+                        "agent_not_ready",
                         format!(
                             "agent in pane {pane_id} was not interactive-ready within the {}ms spawn chain (last status: {})",
                             chain_ms,
                             last_status.as_deref().unwrap_or("unknown")
                         ),
                         "replay the same idempotency key to re-check readiness and prompt once; the persisted pane and agent are reused",
+                    ));
+                }
+                SpawnReadyOutcome::Exited(evidence) => {
+                    return Err(spawn_agent_start_failed(
+                        client, &progress, spawn, &pane_id, &evidence,
                     ));
                 }
             }
@@ -4663,6 +5923,17 @@ fn spawn_chain(
             "ok": true,
             "agent_status": before.agent_status,
         }));
+    }
+
+    // 4. Early-exit watch (1.2 S5): a freshly started agent that dies within
+    //    the bounded window is reported as agent_start_failed, never prompted.
+    if started_method == "agent.start"
+        && let Some(evidence) =
+            spawn_watch_early_exit(client, registry, &pane_id, deadline, chain_ms)
+    {
+        return Err(spawn_agent_start_failed(
+            client, &progress, spawn, &pane_id, &evidence,
+        ));
     }
 
     let remaining = deadline.saturating_sub(registry.now_ms());
@@ -5047,6 +6318,12 @@ fn insert_task_id(result: &mut Value, task_id: &str) {
     if let Some(object) = result.as_object_mut() {
         object
             .entry("task_id".to_owned())
+            .or_insert_with(|| json!(task_id));
+        // S4: one receipt per dispatch, including a spawn chain whose failure
+        // still owns exactly one durable record. `receipt_id` aliases the task
+        // id (S3 vocabulary) and is the id the caller waits on.
+        object
+            .entry("receipt_id".to_owned())
             .or_insert_with(|| json!(task_id));
     }
 }
@@ -5760,19 +7037,54 @@ mod tests {
         })
     }
 
+    /// Disables the S5 post-readiness early-exit watch for the lifetime of the
+    /// guard, restoring the previous value on drop. Scripted spawn fakes answer
+    /// a fixed request sequence and must not receive extra watch probes. The
+    /// guard owns the crate-wide env lock for its whole lifetime, so callers
+    /// must never hold `test_env::lock()` across a `spawn_registry*` call: a
+    /// second acquire on the same non-reentrant mutex deadlocks the test.
+    /// The guard is returned alongside the registry so it lives exactly as
+    /// long as the test's registry binding, never leaking into a concurrent
+    /// test.
+    struct SpawnWatchOff {
+        previous: Option<std::ffi::OsString>,
+        // Held for the entire watch-off window; named `_lock` only to keep the
+        // field alive, the drop order restores env before releasing it.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SpawnWatchOff {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", value),
+                    None => env::remove_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS"),
+                }
+            }
+        }
+    }
+
     fn spawn_registry_with(
         store: Arc<Mutex<StateStore>>,
         root: &Path,
         pane_columns: u16,
-    ) -> PromptRegistry {
+    ) -> (PromptRegistry, SpawnWatchOff) {
+        // Lock first, then read/write env: a test needing the default watch
+        // window holds the same lock so its window stays uncontaminated.
+        let lock = crate::test_env::lock();
+        let guard = SpawnWatchOff {
+            previous: env::var_os("HERDR_MCP_SPAWN_EARLY_EXIT_MS"),
+            _lock: lock,
+        };
+        unsafe { env::set_var("HERDR_MCP_SPAWN_EARLY_EXIT_MS", "0") };
         let mut registry = PromptRegistry::with_store(store);
         Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
             EventCache::from_snapshot_for_test(spawn_snapshot(root, pane_columns)),
         ));
-        registry
+        (registry, guard)
     }
 
-    fn spawn_registry(root: &Path, pane_columns: u16) -> PromptRegistry {
+    fn spawn_registry(root: &Path, pane_columns: u16) -> (PromptRegistry, SpawnWatchOff) {
         spawn_registry_with(
             Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())),
             root,
@@ -5860,13 +7172,19 @@ mod tests {
                 };
                 // Accepted streams can inherit the listener's nonblocking mode on macOS.
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
+                // A peer that already closed can make this fail on macOS.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => continue,
+                    Ok(_) => {}
+                    // A bounded client probe can close before the fake reads;
+                    // that is the code under test, not a harness failure.
+                    Err(error) if fake_peer_gone(&error) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(error) => panic!("fake Herdr socket could not read a request: {error}"),
+                }
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
@@ -5906,6 +7224,515 @@ mod tests {
             "tab": {"tab_id": "w1:t2", "workspace_id": "w1", "label": "feat-x"},
             "root_pane": {"pane_id": "w1:p9", "tab_id": "w1:t2", "workspace_id": "w1"},
         }})
+    }
+
+    /// S4: seed one durable task row with a chosen lifecycle, update time and
+    /// retention deadline. `expires_at` in the past is what the archive view
+    /// reads; the row itself is never deleted.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_task_row(
+        registry: &PromptRegistry,
+        store: &Arc<Mutex<StateStore>>,
+        task_id: &str,
+        target: &str,
+        parent_session_ref: Option<&str>,
+        lifecycle: PromptTaskLifecycle,
+        updated_at_ms: u64,
+        expires_at: Option<i64>,
+    ) {
+        let mut task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target,
+                requested_target: None,
+                fingerprint: "fp-s4",
+                idempotency_key: None,
+                before: None,
+                after: None,
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: None,
+                parent_session_ref,
+                stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
+                request_id: None,
+            })
+            .unwrap()
+            .expect("store present, so the task is registered");
+        task.lifecycle = lifecycle.clone();
+        task.terminal_status = Some(lifecycle.as_str().to_owned());
+        task.terminal_at_ms = Some(updated_at_ms);
+        task.updated_at_ms = updated_at_ms;
+        let encoded = serde_json::to_string(&task).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .put_operation_ledger(OperationLedgerInput {
+                op_id: task_id,
+                kind: PROMPT_TASK_OPERATION_KIND,
+                idempotency_key: None,
+                request_hash: None,
+                phase: "terminal",
+                state: lifecycle.as_str(),
+                result_json: &encoded,
+                now_ms: i64::try_from(updated_at_ms).unwrap_or(i64::MAX),
+                expires_at,
+            })
+            .unwrap();
+    }
+
+    fn s4_query<'a>(
+        parent_session_ref: Option<&'a str>,
+        receipt_id: Option<&'a str>,
+        status: Option<&'a str>,
+        since_ms: Option<u64>,
+    ) -> InboxQuery<'a> {
+        InboxQuery {
+            workspace_id: None,
+            parent_target: None,
+            parent_session_ref,
+            include_acknowledged: true,
+            advisory: false,
+            limit: 50,
+            receipt_id,
+            status,
+            since_ms,
+        }
+    }
+
+    /// S4 the shipped ready criterion: the agent handshake is immediate, the
+    /// self-reported idle status must hold for the settle window.
+    #[test]
+    fn spawn_ready_criterion_needs_the_settle_window_for_idle_only_evidence() {
+        assert!(spawn_readiness_satisfied(true, None, 1_000));
+        assert!(!spawn_readiness_satisfied(false, None, 100_000));
+        assert!(!spawn_readiness_satisfied(false, Some(1_000), 1_100));
+        assert!(!spawn_readiness_satisfied(
+            false,
+            Some(1_000),
+            1_000 + SPAWN_READY_SETTLE_MS - 1
+        ));
+        assert!(spawn_readiness_satisfied(
+            false,
+            Some(1_000),
+            1_000 + SPAWN_READY_SETTLE_MS
+        ));
+    }
+
+    /// S4 a delivery-uncertain row explains how to confirm it, and a settled row
+    /// carries no such ambiguity.
+    #[test]
+    fn delivery_uncertain_rows_carry_a_confirm_hint() {
+        let root = spawn_project_root("confirm-hint");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-uncertain",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::DeliveryUncertain,
+            1_000,
+            None,
+        );
+        seed_task_row(
+            &registry,
+            &store,
+            "t-completed",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Completed,
+            1_000,
+            None,
+        );
+        let uncertain = registry.task_status("t-uncertain");
+        let row = &uncertain["task"];
+        assert_eq!(row["confirm_hint"]["action"], json!("herdr_mcp.agent.read"));
+        assert_eq!(row["confirm_hint"]["target"], json!("w1:p9"));
+        assert!(row["confirm_hint"].get("cursor").is_some(), "{row}");
+        let completed = registry.task_status("t-completed");
+        assert!(
+            completed["task"].get("confirm_hint").is_none(),
+            "{completed}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 inbox filters: receipt id, status and timestamp narrow one scope.
+    #[test]
+    fn inbox_filters_select_by_receipt_status_and_since() {
+        let root = spawn_project_root("inbox-filters");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        for (task_id, lifecycle, updated) in [
+            ("t-done", PromptTaskLifecycle::Completed, 1_000_u64),
+            ("t-failed", PromptTaskLifecycle::Failed, 2_000),
+            ("t-blocked", PromptTaskLifecycle::Blocked, 3_000),
+        ] {
+            seed_task_row(
+                &registry,
+                &store,
+                task_id,
+                "w1:p9",
+                Some("session-a"),
+                lifecycle,
+                updated,
+                None,
+            );
+        }
+
+        let by_receipt = registry.task_inbox_with_query(&s4_query(
+            Some("session-a"),
+            Some("t-failed"),
+            None,
+            None,
+        ));
+        assert_eq!(by_receipt["ok"], true, "{by_receipt}");
+        assert_eq!(by_receipt["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(by_receipt["tasks"][0]["receipt_id"], json!("t-failed"));
+
+        let by_status = registry.task_inbox_with_query(&s4_query(
+            Some("session-a"),
+            None,
+            Some("blocked"),
+            None,
+        ));
+        assert_eq!(
+            by_status["tasks"].as_array().unwrap().len(),
+            1,
+            "{by_status}"
+        );
+        assert_eq!(by_status["tasks"][0]["receipt_id"], json!("t-blocked"));
+
+        let by_since =
+            registry.task_inbox_with_query(&s4_query(Some("session-a"), None, None, Some(1_500)));
+        let mut ids = by_since["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["receipt_id"].as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["t-blocked", "t-failed"], "{by_since}");
+
+        // The bounded wait honors the same receipt filter: only this receipt
+        // can wake it, even though the scope has other pending terminals.
+        let woke = registry.task_inbox_waiting(
+            &s4_query(Some("session-a"), Some("t-blocked"), None, None),
+            10,
+        );
+        assert_eq!(woke["wait"]["woke"], json!("terminal_task"), "{woke}");
+        assert_eq!(woke["tasks"].as_array().unwrap().len(), 1, "{woke}");
+        assert_eq!(woke["tasks"][0]["receipt_id"], json!("t-blocked"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 archive: a terminal receipt past retention leaves the default query,
+    /// stays out of the delete path, and remains queryable through the archive.
+    #[test]
+    fn archived_terminal_receipts_leave_default_queries_but_stay_queryable() {
+        let root = spawn_project_root("inbox-archive");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-live",
+            "w1:p9",
+            Some("session-a"),
+            PromptTaskLifecycle::Completed,
+            5_000,
+            None,
+        );
+        // Retention deadline already elapsed.
+        seed_task_row(
+            &registry,
+            &store,
+            "t-old",
+            "w1:p9",
+            Some("session-a"),
+            PromptTaskLifecycle::Completed,
+            1_000,
+            Some(1),
+        );
+
+        let default =
+            registry.task_inbox_with_query(&s4_query(Some("session-a"), None, None, None));
+        let ids = default["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["receipt_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["t-live"], "{default}");
+
+        let archive = registry.archive_payload(&s4_query(Some("session-a"), None, None, None));
+        assert_eq!(archive["ok"], true, "{archive}");
+        assert_eq!(archive["archive"], json!(true), "{archive}");
+        let archived = archive["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|task| task["receipt_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(archived, vec!["t-old"], "{archive}");
+        assert_eq!(
+            archive["tasks"][0]["receipt_id"],
+            json!("t-old"),
+            "the archived row keeps its receipt id"
+        );
+        // S4 review P2-4: the embedded stats describe the live scope too, not
+        // only the archived count.
+        assert_eq!(archive["stats"]["completed"], json!(1), "{archive}");
+        assert_eq!(archive["stats"]["terminal"], json!(1), "{archive}");
+        assert_eq!(archive["stats"]["archived"], json!(1), "{archive}");
+
+        // Retention never deletes the row: it is still physically present.
+        let still_stored = store
+            .lock()
+            .unwrap()
+            .operation_ledger("t-old")
+            .unwrap()
+            .expect("archived rows are retained, not deleted");
+        assert_eq!(still_stored.kind, PROMPT_TASK_OPERATION_KIND);
+
+        // Archive filters compose with the same receipt/status filters.
+        let by_receipt =
+            registry.archive_payload(&s4_query(Some("session-a"), Some("t-live"), None, None));
+        assert_eq!(
+            by_receipt["tasks"].as_array().unwrap().len(),
+            0,
+            "{by_receipt}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 stats: read-only counters, no task bodies.
+    #[test]
+    fn inbox_stats_are_read_only_counters() {
+        let root = spawn_project_root("inbox-stats");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        for (task_id, lifecycle, expires) in [
+            ("t-a", PromptTaskLifecycle::Completed, None),
+            ("t-b", PromptTaskLifecycle::Failed, None),
+            ("t-c", PromptTaskLifecycle::DeliveryUncertain, None),
+            ("t-old", PromptTaskLifecycle::Completed, Some(1)),
+        ] {
+            seed_task_row(
+                &registry,
+                &store,
+                task_id,
+                "w1:p9",
+                Some("session-a"),
+                lifecycle,
+                1_000,
+                expires,
+            );
+        }
+        let stats = registry.stats_payload(&s4_query(Some("session-a"), None, None, None));
+        assert_eq!(stats["ok"], true, "{stats}");
+        assert!(
+            stats.get("tasks").is_none(),
+            "stats returns no task rows: {stats}"
+        );
+        let counters = &stats["stats"];
+        assert_eq!(counters["read_only"], json!(true));
+        // Counters describe the rows the default queries still serve; the
+        // archived receipt is counted separately and never inflates them.
+        assert_eq!(counters["completed"], json!(1), "{stats}");
+        assert_eq!(counters["failed"], json!(1), "{stats}");
+        assert_eq!(counters["delivery_uncertain"], json!(1), "{stats}");
+        assert_eq!(counters["archived"], json!(1), "{stats}");
+        assert_eq!(counters["terminal"], json!(3), "{stats}");
+        assert_eq!(counters["retention_ms"], json!(prompt_task_ttl_ms()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 review P1-1: a repair dispatch that fails parameter validation must
+    /// not spend a repair attempt, so invalid input cannot burn a receipt lane.
+    #[test]
+    fn invalid_repair_dispatch_does_not_spend_the_budget() {
+        let root = spawn_project_root("repair-invalid");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+        let client = HerdrClient::new(temp_socket());
+
+        // Missing text, invalid stall_after_ms and an invalid wait each reject
+        // the request before admission.
+        for (label, args) in [
+            (
+                "missing text",
+                json!({"target": "w1:p9", "repair_of": "t-repair"}),
+            ),
+            (
+                "invalid stall_after_ms",
+                json!({
+                    "target": "w1:p9",
+                    "text": "repair",
+                    "repair_of": "t-repair",
+                    "stall_after_ms": 1,
+                }),
+            ),
+            (
+                "invalid wait",
+                json!({
+                    "target": "w1:p9",
+                    "text": "repair",
+                    "repair_of": "t-repair",
+                    "wait": {"timeout_ms": 0},
+                }),
+            ),
+        ] {
+            for _ in 0..REPAIR_BUDGET_ATTEMPTS {
+                let rejected = run(&client, &registry, &args);
+                assert_eq!(rejected["ok"], false, "{label}: {rejected}");
+                assert_eq!(rejected["code"], "invalid_params", "{label}: {rejected}");
+            }
+        }
+
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert!(
+            receipt.get("repair").is_none(),
+            "invalid requests must not spend a repair attempt: {receipt}"
+        );
+        // The lane is still fully available.
+        for attempt in 1..=REPAIR_BUDGET_ATTEMPTS {
+            let spent = registry.record_repair_attempt("t-repair");
+            assert_eq!(spent["ok"], true, "attempt {attempt}: {spent}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 review P1-2: concurrent repairs must never exceed the per-receipt
+    /// budget. The count/check/increment runs in one store transaction.
+    #[test]
+    fn concurrent_repairs_cannot_exceed_the_receipt_budget() {
+        let root = spawn_project_root("repair-concurrent");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let registry = Arc::new(registry);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let registry = Arc::clone(&registry);
+            handles.push(std::thread::spawn(move || {
+                registry.record_repair_attempt("t-repair")
+            }));
+        }
+        let mut accepted = 0_u32;
+        let mut exhausted = 0_u32;
+        for handle in handles {
+            let outcome = handle.join().expect("repair thread");
+            if outcome["ok"] == json!(true) {
+                accepted += 1;
+            } else {
+                assert_eq!(
+                    outcome["code"],
+                    json!("repair_budget_exhausted"),
+                    "{outcome}"
+                );
+                exhausted += 1;
+            }
+        }
+        assert_eq!(accepted, REPAIR_BUDGET_ATTEMPTS, "budget overspent");
+        assert_eq!(accepted + exhausted, 12);
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert_eq!(receipt["repair"]["attempts"], json!(REPAIR_BUDGET_ATTEMPTS));
+        assert_eq!(receipt["repair"]["exhausted"], json!(true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// S4 repair budget: three repairs per receipt, then the lane is terminal and
+    /// the next repair is refused before any delivery attempt.
+    #[test]
+    fn repair_budget_is_per_receipt_and_terminal_on_exhaustion() {
+        let root = spawn_project_root("repair-budget");
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, _watch_off) = spawn_registry_with(store, &root, 80);
+        let store = registry.inner.store.clone().unwrap();
+        seed_task_row(
+            &registry,
+            &store,
+            "t-repair",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Failed,
+            1_000,
+            None,
+        );
+
+        for attempt in 1..=REPAIR_BUDGET_ATTEMPTS {
+            let spent = registry.record_repair_attempt("t-repair");
+            assert_eq!(spent["ok"], true, "attempt {attempt}: {spent}");
+            assert_eq!(spent["attempts"], json!(attempt), "{spent}");
+        }
+        let exhausted = registry.record_repair_attempt("t-repair");
+        assert_eq!(exhausted["ok"], false, "{exhausted}");
+        assert_eq!(
+            exhausted["code"],
+            json!("repair_budget_exhausted"),
+            "{exhausted}"
+        );
+        assert_eq!(exhausted["terminal"], json!(true), "{exhausted}");
+        assert_eq!(
+            exhausted["delivery_state"],
+            json!("not_delivered"),
+            "an exhausted budget never attempts delivery: {exhausted}"
+        );
+        assert_eq!(exhausted["retryable"], json!(false), "{exhausted}");
+
+        let receipt = registry.task_status("t-repair")["task"].clone();
+        assert_eq!(receipt["repair"]["attempts"], json!(REPAIR_BUDGET_ATTEMPTS));
+        assert_eq!(receipt["repair"]["exhausted"], json!(true));
+
+        // A running receipt cannot be repaired at all.
+        seed_task_row(
+            &registry,
+            &store,
+            "t-running",
+            "w1:p9",
+            None,
+            PromptTaskLifecycle::Running,
+            2_000,
+            None,
+        );
+        let rejected = registry.record_repair_attempt("t-running");
+        assert_eq!(
+            rejected["code"],
+            json!("repair_target_not_terminal"),
+            "{rejected}"
+        );
+        assert_eq!(rejected["delivery_state"], json!("not_delivered"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn spawn_agent_started(ready: bool) -> Value {
@@ -5961,7 +7788,7 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let args = json!({
             "spawn": {
                 "kind": "pi",
@@ -5984,6 +7811,15 @@ mod tests {
         assert_eq!(
             spawn_step_names(&result["spawn"]),
             vec!["pane_create", "agent_start", "agent_ready", "prompt"]
+        );
+        // S4: one call, one receipt - the spawn chain and its delivery share the
+        // single durable receipt id.
+        assert_eq!(result["receipt_id"], result["task_id"], "{result}");
+        assert!(
+            result["receipt_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{result}"
         );
         let recorded = requests.lock().unwrap();
         let methods = recorded
@@ -6023,7 +7859,7 @@ mod tests {
             requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let (registry, watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1"},
             "text": "implement the task",
@@ -6033,7 +7869,10 @@ mod tests {
         let first = run(&client, &registry, &args);
         server.join().unwrap();
         assert_eq!(first["ok"], true, "{first}");
-        let reloaded = spawn_registry_with(store, &root, 80);
+        // The watch-off guard owns the crate env lock for its lifetime: it must
+        // be dropped before a second registry takes the lock again.
+        drop(watch_off);
+        let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["idempotent_replay"], true, "{replay}");
         assert_eq!(replay["spawn"]["pane_id"], "w1:p9");
@@ -6063,7 +7902,7 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 120);
+        let (registry, _watch_off) = spawn_registry(&root, 120);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -6096,7 +7935,7 @@ mod tests {
         let root = spawn_project_root("narrow");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        let registry = spawn_registry(&root, 20);
+        let (registry, _watch_off) = spawn_registry(&root, 20);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "split_from": "w1:p1"},
             "text": "work",
@@ -6138,7 +7977,7 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1"},
             "text": "work",
@@ -6205,7 +8044,7 @@ mod tests {
             first_requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let client = HerdrClient::new(&socket);
         let mut args = json!({
             "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 1},
@@ -6230,7 +8069,10 @@ mod tests {
         );
 
         // Replaying the SAME key with a larger chain continues in that pane.
-        args["spawn"]["startup_timeout_ms"] = json!(5_000);
+        // The resume budget must also leave the prompt reserve after the
+        // bounded early-exit watch (1.2 S5), so it is larger than the old
+        // start-only floor.
+        args["spawn"]["startup_timeout_ms"] = json!(20_000);
         fs::remove_file(&socket).unwrap();
         let resume_requests = Arc::new(Mutex::new(Vec::new()));
         let resume_server = scripted_spawn_server(
@@ -6295,7 +8137,7 @@ mod tests {
             first_requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let (registry, _watch_off) = spawn_registry_with(store.clone(), &root, 80);
         let client = HerdrClient::new(&socket);
         // 4.2s: enough to create the pane and start the agent, not enough to
         // finish readiness, so the chain must pause instead of holding the key.
@@ -6310,8 +8152,19 @@ mod tests {
         assert_eq!(paused["ok"], false, "{paused}");
         assert_eq!(paused["failed_step"], "agent_ready", "{paused}");
         assert_eq!(paused["resumable"], true, "{paused}");
-        assert_eq!(paused["code"], "agent_ready_timeout", "{paused}");
-        assert_eq!(paused["delivery_state"], "not_delivered");
+        // S4: a readiness timeout names the cause and is definitely not
+        // delivered - never the uncertain-delivery bucket.
+        assert_eq!(paused["code"], "agent_not_ready", "{paused}");
+        assert_eq!(paused["delivery_state"], "not_delivered", "{paused}");
+        assert_eq!(paused["submitted"], false, "{paused}");
+        assert!(
+            paused.get("delivery_uncertain").is_none(),
+            "a readiness timeout must never be uncertain: {paused}"
+        );
+        assert_eq!(
+            paused["receipt_id"], paused["task_id"],
+            "the failed spawn still returns its single receipt: {paused}"
+        );
         assert_eq!(paused["spawn"]["pane_id"], "w1:p9");
         assert_eq!(paused["spawn"]["agent_started"], true);
         assert_eq!(paused["reclaim"]["pane_id"], "w1:p9");
@@ -6415,7 +8268,7 @@ mod tests {
             vec![json!({"agent": {"pane_id": "w1:p2", "agent_status": "working"}})],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         register_running_task(
             &registry,
             "supervisor-task",
@@ -6476,7 +8329,7 @@ mod tests {
             requests.clone(),
         );
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
-        let registry = spawn_registry_with(store.clone(), &root, 80);
+        let (registry, watch_off) = spawn_registry_with(store.clone(), &root, 80);
         register_running_task(
             &registry,
             "supervisor-task",
@@ -6513,7 +8366,10 @@ mod tests {
 
         // A fresh registry over the same durable store proves the refusal was
         // persisted for the key rather than remembered inside one process.
-        let reloaded = spawn_registry_with(store, &root, 80);
+        // The watch-off guard owns the crate env lock for its lifetime: drop it
+        // before the second registry takes the lock again.
+        drop(watch_off);
+        let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
         let replay = run(&client, &reloaded, &args);
         assert_eq!(replay["ok"], false, "{replay}");
         assert_eq!(replay["code"], "delegation_depth_exceeded", "{replay}");
@@ -6546,7 +8402,7 @@ mod tests {
             ],
             requests.clone(),
         );
-        let registry = spawn_registry(&root, 80);
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let result = run(
             &HerdrClient::new(&socket),
             &registry,
@@ -6582,7 +8438,7 @@ mod tests {
         let root = spawn_project_root("validate");
         let socket = temp_socket();
         let listener = refused_spawn_server(&socket);
-        let registry = spawn_registry(&root, 80);
+        let (registry, _watch_off) = spawn_registry(&root, 80);
         let client = HerdrClient::new(&socket);
         for (args, expected) in [
             (
@@ -6871,18 +8727,18 @@ mod tests {
             if let Some(parent) = parent {
                 args["parent_target"] = json!(parent);
             }
-            let result = run_with_parent_session(&client, &registry, &args, session);
+            let result = run_with_parent_session(&client, &registry, &args, session, None);
             assert_eq!(result["code"], "concurrency_limit_reached", "{result}");
             assert_eq!(result["delivery_state"], "not_delivered");
             assert_eq!(result["submitted"], false);
             assert_eq!(
-                run_with_parent_session(&client, &registry, &args, Some("other-session"))["code"],
+                run_with_parent_session(&client, &registry, &args, Some("other-session"), None)["code"],
                 "role_target_unavailable"
             );
             if session.is_some() {
                 args["parent_target"] = json!("another-pane-same-session");
                 assert_eq!(
-                    run_with_parent_session(&client, &registry, &args, session)["code"],
+                    run_with_parent_session(&client, &registry, &args, session, None)["code"],
                     "concurrency_limit_reached"
                 );
             } else if parent.is_some() {
@@ -6908,7 +8764,7 @@ mod tests {
                 original["parent_target"] = json!(parent);
             }
             assert_eq!(
-                run_with_parent_session(&client, &registry, &original, session)["code"],
+                run_with_parent_session(&client, &registry, &original, session, None)["code"],
                 "concurrency_limit_reached"
             );
             assert_eq!(
@@ -6925,7 +8781,7 @@ mod tests {
                 original["parent_target"] = json!(parent);
             }
             assert_eq!(
-                run_with_parent_session(&client, &registry, &original, session)["code"],
+                run_with_parent_session(&client, &registry, &original, session, None)["code"],
                 "role_target_unavailable"
             );
         }
@@ -7051,6 +8907,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -7366,6 +9223,9 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -7561,6 +9421,9 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -7677,6 +9540,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -7710,6 +9574,9 @@ mod tests {
                 parent_target: Some("parent"),
                 parent_session_ref: None,
                 stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -7808,6 +9675,7 @@ mod tests {
             prior_settle_observed: false,
             lifecycle: lifecycle.clone(),
             turn_id: None,
+            turn_seq: None,
             exact_native_turn: false,
             terminal_status: terminal.then(|| lifecycle.as_str().to_owned()),
             terminal_cursor: None,
@@ -7816,6 +9684,10 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            request_id: None,
+            max_runtime_ms: None,
+            on_budget: None,
+            budget_events: Vec::new(),
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -7833,6 +9705,8 @@ mod tests {
             acknowledged_at_ms: None,
             created_at_ms: now.saturating_sub(age_ms),
             updated_at_ms: now.saturating_sub(age_ms),
+            repair_attempts: 0,
+            repair_exhausted_at_ms: None,
         }
     }
 
@@ -8278,6 +10152,7 @@ mod tests {
             assert_eq!(result["ok"], true, "{result}");
             assert_eq!(result["wait"]["completed"], false);
             assert_eq!(result["wait"]["outcome"], "checkpoint");
+            assert_eq!(result["wait"]["still_running"], true);
             assert!(result.get("failure").is_none());
             assert_eq!(result["task"]["lifecycle"], "running");
             assert_eq!(result["task"]["liveness"], "active");
@@ -8662,6 +10537,7 @@ mod tests {
         let plain = registry.task_inbox(None, Some("parent"), None, false, false, 50);
 
         assert_eq!(inbox["wait"]["woke"], "timeout");
+        assert_eq!(inbox["wait"]["still_running"], true);
         assert!(inbox["wait"]["waited_ms"].as_u64().unwrap() >= 120);
         assert_eq!(inbox["summary"], plain["summary"]);
         assert_eq!(inbox["tasks"], plain["tasks"]);
@@ -8700,6 +10576,59 @@ mod tests {
         }
     }
 
+    /// user parent session | Given a session-scoped running child task | When
+    /// the child reports worker_done | Then a session inbox wait wakes inside
+    /// the poll budget and the row carries the receipt vocabulary.
+    #[test]
+    fn worker_done_wakes_session_scoped_inbox_wait_with_receipt_linkage() {
+        let (db_path, registry) = task_registry("wait-session");
+        let mut task = escalation_task(
+            "dispatch:prompt:session-child",
+            "child",
+            PromptTaskLifecycle::Running,
+            0,
+        );
+        task.parent_session_ref = Some("session:web".to_owned());
+        task.request_id = Some("edge-req-99".to_owned());
+        registry.save_task(&task, None).unwrap();
+
+        let reporter = registry.clone();
+        let report = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            reporter.task_report(&json!({
+                "task_id": "dispatch:prompt:session-child",
+                "dispatch_id": "dispatch:prompt:session-child",
+                "kind": "worker_done",
+            }))
+        });
+
+        let started = std::time::Instant::now();
+        let inbox = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_INBOX_METHOD,
+            &json!({"parent_session_ref": "session:web", "wait_ms": 5_000}),
+            Some("session:web"),
+        );
+        let elapsed = started.elapsed();
+        report.join().unwrap();
+
+        assert_eq!(inbox["wait"]["woke"], "terminal_task", "{inbox}");
+        assert_eq!(inbox["wait"]["still_running"], false);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "worker_done must wake the parent's session inbox promptly: {elapsed:?}"
+        );
+        let row = &inbox["tasks"][0];
+        assert_eq!(row["task_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["receipt_id"], "dispatch:prompt:session-child");
+        assert_eq!(row["request_id"], "edge-req-99");
+        assert_eq!(row["parent_session_ref"], "session:web");
+        assert_eq!(row["terminal_status"], "worker_done");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
     /// user parent | Given a terminal task | When the inbox is read with
     /// `view: compact` | Then each task keeps only the projection fields, never
     /// the raw parent session reference, while the full view is unchanged.
@@ -8734,6 +10663,7 @@ mod tests {
                 "lifecycle",
                 "liveness",
                 "pane_id",
+                "receipt_id",
                 "target",
                 "task_id",
                 "terminal",
@@ -8979,6 +10909,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -9103,6 +11034,11 @@ mod tests {
             worker_done_at_ms: None,
             worker_done_summary: None,
             stall_after_ms: None,
+            request_id: None,
+            max_runtime_ms: None,
+            turn_seq: None,
+            on_budget: None,
+            budget_events: Vec::new(),
             gate: None,
             final_excerpt: None,
             awaiting_children: None,
@@ -9116,6 +11052,8 @@ mod tests {
             acknowledged_at_ms: None,
             created_at_ms: 1,
             updated_at_ms: 1,
+            repair_attempts: 0,
+            repair_exhausted_at_ms: None,
         }
     }
 
@@ -10099,6 +12037,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -10282,6 +12221,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -10348,6 +12288,9 @@ mod tests {
                 parent_target,
                 parent_session_ref,
                 stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
             })
             .unwrap()
             .unwrap();
@@ -10567,6 +12510,7 @@ mod tests {
                 "idempotency_key": "guard-self-1",
             }),
             None,
+            None,
         );
         server.join().unwrap();
 
@@ -10630,6 +12574,7 @@ mod tests {
                 "idempotency_key": "guard-depth-1",
             }),
             None,
+            None,
         );
         assert_eq!(rejected["ok"], false);
         assert_eq!(rejected["code"], "delegation_depth_exceeded");
@@ -10670,6 +12615,7 @@ mod tests {
                 "parent_target": "supervisor",
                 "idempotency_key": "guard-depth-2",
             }),
+            None,
             None,
         );
         server.join().unwrap();
@@ -10789,6 +12735,7 @@ mod tests {
                 task_mutations: Mutex::new(()),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
                 records: Mutex::new(HashMap::new()),
@@ -10886,5 +12833,871 @@ mod tests {
             }
         }
         fs::remove_dir_all(&semantic_config_dir).ok();
+    }
+
+    // ---- 1.2 S5: model alias validation, early-exit detection, run bounds ----
+
+    /// Write a fake `pi` whose `--list-models` is the authoritative registry
+    /// (S5 review P1-1). Caller holds test_env::lock and restores.
+    fn s5_pi_registry(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "herdr-mcp-s5-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("pi");
+        fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\ncat <<'EOF'\nprovider                model\nopenai                  gpt-4\nopenai                  gpt-5.1-codex\nmagpie                  aliyun/auto/deepseek-v4.1-flash\nanthropic               claude-opus-4-5\nEOF\nelse\nexit 1\nfi\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// The fake schema document injected on-thread for model-delivery tests:
+    /// agent.start advertises an `args` passthrough (the live shape today).
+    /// Thread-local injection keeps these tests independent of the shared
+    /// 60-second schema cache (S5 review P1-3).
+    fn s5_schema_with_args() -> serde_json::Value {
+        json!({"schemas":{"request":{"oneOf":[{"properties":{"method":{"const":"agent.start"},"params":{"type":"object","properties":{"name":{"type":"string"},"kind":{"type":"string"},"pane_id":{"type":"string"},"args":{"type":"array","items":{"type":"string"}}},"required":["name","kind","pane_id"]}}}],"$defs":{}}}})
+    }
+
+    struct S5Env {
+        prev_pi: Option<std::ffi::OsString>,
+        prev_pi_bin: Option<std::ffi::OsString>,
+        dirs: Vec<PathBuf>,
+    }
+
+    impl S5Env {
+        fn set(tag: &str) -> Self {
+            let prev_pi = env::var_os("PI_CODING_AGENT_DIR");
+            let prev_pi_bin = env::var_os("HERDR_PI_BIN");
+            let registry_dir = s5_pi_registry(tag);
+            unsafe {
+                env::set_var("HERDR_PI_BIN", registry_dir.join("pi"));
+                env::remove_var("PI_CODING_AGENT_DIR");
+            }
+            Self {
+                prev_pi,
+                prev_pi_bin,
+                dirs: vec![registry_dir],
+            }
+        }
+    }
+
+    impl Drop for S5Env {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev_pi.take() {
+                    Some(value) => env::set_var("PI_CODING_AGENT_DIR", value),
+                    None => env::remove_var("PI_CODING_AGENT_DIR"),
+                }
+                match self.prev_pi_bin.take() {
+                    Some(value) => env::set_var("HERDR_PI_BIN", value),
+                    None => env::remove_var("HERDR_PI_BIN"),
+                }
+            }
+            for dir in &self.dirs {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// user planner | Given a spawn with an unknown model alias | When the
+    /// dispatch is admitted | Then it fails at validate with the available
+    /// list, creates nothing, and a replay returns the same refusal.
+    #[test]
+    fn spawn_unknown_model_alias_fails_before_any_mutation() {
+        let root = spawn_project_root("s5-unknown");
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        // The watch-off guard owns the crate env lock for its lifetime; all
+        // other env mutations in this test run after it is taken.
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let _env = S5Env::set("unknown-alias");
+        let args = json!({
+            "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-99"},
+            "text": "work",
+            "idempotency_key": "s5-unknown",
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["failed_step"], "validate");
+        assert_eq!(first["code"], "model_alias_unknown");
+        assert_eq!(first["delivery_state"], "not_delivered");
+        assert_eq!(first["fallback_allowed"], false);
+        assert_eq!(first["model_validation"]["validated"], false);
+        assert_eq!(
+            first["available_models"],
+            json!([
+                "openai/gpt-4",
+                "openai/gpt-5.1-codex",
+                "magpie/aliyun/auto/deepseek-v4.1-flash",
+                "anthropic/claude-opus-4-5",
+            ])
+        );
+        // Validation happens before key reservation (same as every spawn
+        // validate failure): a retry re-validates and refuses identically,
+        // still without any mutation.
+        let replay = run(&client, &registry, &args);
+        assert_eq!(replay["code"], "model_alias_unknown");
+        assert_eq!(replay["failed_step"], "validate");
+        assert!(registry.list_tasks(10).unwrap().is_empty());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a spawn kind without an obtainable model list |
+    /// When a model is requested | Then validated:false and no spawn happens.
+    #[test]
+    fn spawn_model_on_kind_without_list_is_unvalidatable() {
+        let root = spawn_project_root("s5-nolist");
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        // The watch-off guard owns the crate env lock for its lifetime.
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let _env = S5Env::set("no-list");
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "claude", "workspace_id": "w1", "model": "sonnet"},
+                "text": "work",
+                "idempotency_key": "s5-nolist",
+            }),
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "model_alias_unknown");
+        assert_eq!(result["model_validation"]["validated"], false);
+        assert_eq!(result["available_models"], json!([]));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a validated pi alias and a live schema with args |
+    /// When the spawn starts the agent | Then --model travels in agent.start
+    /// args and the prompt is submitted exactly once.
+    #[test]
+    fn spawn_validated_model_delivers_model_flag() {
+        let root = spawn_project_root("s5-modelflag");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("tab.create", spawn_tab_created()["result"].clone()),
+                ("agent.start", spawn_agent_started(true)["result"].clone()),
+                (
+                    "agent.get",
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "idle", "interactive_ready": true, "state_change_seq": 1}}),
+                ),
+                ("agent.prompt", spawn_prompt_submitted()["result"].clone()),
+            ],
+            requests.clone(),
+        );
+        // The watch-off guard owns the crate env lock for its lifetime.
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let _env = S5Env::set("model-flag");
+        let result = crate::schema::with_test_schema_document(s5_schema_with_args(), || {
+            run(
+                &HerdrClient::new(&socket),
+                &registry,
+                &json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4", "startup_timeout_ms": 40_000},
+                    "text": "work",
+                    "idempotency_key": "s5-modelflag",
+                }),
+            )
+        });
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        let recorded = requests.lock().unwrap();
+        let start = recorded
+            .iter()
+            .find(|request| request["method"] == "agent.start")
+            .expect("agent.start must be called");
+        assert_eq!(start["params"]["args"], json!(["--model", "openai/gpt-4"]));
+        assert!(start["params"].get("model").is_none());
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r["method"] == "agent.prompt")
+                .count(),
+            1
+        );
+        drop(recorded);
+        // S5 review P1-2: a replay under the same key must return the
+        // recorded outcome without re-running live admission. The fake
+        // server is already stopped and the PI env points nowhere, so any
+        // probe would fail; the replay must still answer ok:true.
+        let replay = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4"},
+                "text": "work",
+                "idempotency_key": "s5-modelflag",
+            }),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "agent.prompt")
+                .count(),
+            1,
+            "a replay must never re-prompt"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given the live schema cannot carry a model | When a
+    /// validated alias is spawned | Then model_delivery_unsupported before
+    /// agent.start, never a silent drop.
+    #[test]
+    fn spawn_model_without_schema_delivery_fails_closed() {
+        let root = spawn_project_root("s5-nodelivery");
+        let socket = temp_socket();
+        // The refusal now happens in parse_spawn, before any socket contact:
+        // no pane is ever created for a schema that cannot carry a model.
+        let listener = refused_spawn_server(&socket);
+        // The watch-off guard owns the crate env lock for its lifetime; the
+        // HERDR_BIN / catalog overrides below run after it is taken.
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        // Force the schema unavailable **on this thread** instead of relying
+        // on a failing HERDR_BIN plus the process-level schema cache: the cache
+        // is shared (TTL 60s), so an earlier test's fake herdr could answer for
+        // this one and the refusal would never be reached (S5 review P1-3).
+        let _env = S5Env::set("no-delivery");
+        let result = crate::schema::with_test_schema_unavailable(|| {
+            run(
+                &HerdrClient::new(&socket),
+                &registry,
+                &json!({
+                    "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4"},
+                    "text": "work",
+                    "idempotency_key": "s5-nodelivery",
+                }),
+            )
+        });
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "model_delivery_unsupported");
+        assert_eq!(result["failed_step"], "validate");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["model_validation"]["validated"], true);
+        assert!(result.get("reclaim").is_none(), "{result}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a started agent that dies before readiness | When
+    /// the spawn chain probes it | Then agent_start_failed with a redacted
+    /// pane tail, no prompt, and the pane kept for reclaim.
+    #[test]
+    fn spawn_dead_on_start_reports_agent_start_failed_with_redacted_tail() {
+        let root = spawn_project_root("s5-deadstart");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("tab.create", spawn_tab_created()["result"].clone()),
+                ("agent.start", spawn_agent_started(false)["result"].clone()),
+                (
+                    "agent.get",
+                    json!({"error": {"code": "agent_not_found", "message": "no agent"}}),
+                ),
+                (
+                    "pane.read",
+                    json!({"read": {"content": "model `gpt-99` not found\napi_key=sk-secret-1234567890abcdef\n$ "}}),
+                ),
+            ],
+            requests.clone(),
+        );
+        let (registry, _watch_off) = spawn_registry(&root, 80);
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1"},
+                "text": "work",
+                "idempotency_key": "s5-deadstart",
+            }),
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["failed_step"], "agent_start");
+        assert_eq!(result["code"], "agent_start_failed");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["submitted"], false);
+        assert_eq!(result["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(result["reclaim"]["pane_id"], "w1:p9");
+        let tail = result["pane_tail"].as_str().expect("pane tail");
+        assert!(tail.contains("model `gpt-99` not found"), "{tail}");
+        assert!(
+            !tail.contains("sk-secret-1234567890abcdef"),
+            "secret must be redacted: {tail}"
+        );
+        assert_eq!(result["pane_tail_redacted"], true);
+        let recorded = requests.lock().unwrap();
+        assert!(
+            recorded.iter().all(|r| r["method"] != "agent.prompt"),
+            "a dead agent must never be prompted: {recorded:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given an agent that starts ready but exits inside the
+    /// early-exit window | When the chain watches it | Then agent_start_failed
+    /// and no prompt is submitted.
+    #[test]
+    fn spawn_early_exit_after_ready_reports_agent_start_failed() {
+        // Hold the shared test-env lock for the whole dispatch: spawn_registry
+        // helpers briefly set HERDR_MCP_SPAWN_EARLY_EXIT_MS=0, and this test
+        // needs the default watch window to stay in effect throughout.
+        let _guard = crate::test_env::lock();
+        let root = spawn_project_root("s5-earlyexit");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // agent.get answers ready for the first probe (readiness), then reports
+        // the agent gone. The watch window is left at its default; the fake
+        // answers every probe, so no env override (and no cross-test race) is
+        // needed. The chain budget is large enough that the default 10s watch
+        // (capped to chain/4) fits with the prompt reserve.
+        let get_calls = Arc::new(AtomicU64::new(0));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = {
+            let requests = requests.clone();
+            let stop = stop.clone();
+            let get_calls = get_calls.clone();
+            thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                while !stop.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut line = String::new();
+                    match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                        Ok(0) => continue,
+                        Ok(_) => {}
+                        Err(error) if fake_peer_gone(&error) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(error) => panic!("fake read failed: {error}"),
+                    }
+                    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    requests.lock().unwrap().push(request.clone());
+                    let method = request["method"].as_str().unwrap_or_default();
+                    let response = match method {
+                        "tab.create" => spawn_tab_created()["result"].clone(),
+                        "agent.start" => spawn_agent_started(true)["result"].clone(),
+                        "agent.get" => {
+                            let n = get_calls.fetch_add(1, Ordering::SeqCst);
+                            if n == 0 {
+                                json!({"agent": {"pane_id": "w1:p9", "agent_status": "idle", "interactive_ready": true, "state_change_seq": 1}})
+                            } else {
+                                json!({"error": {"code": "agent_not_found", "message": "exited"}})
+                            }
+                        }
+                        "pane.read" => json!({"read": {"content": "fatal: bad model\n$ "}}),
+                        _ => json!({"error": {"code": "unscripted_method", "message": method}}),
+                    };
+                    let envelope = if let Some(error) = response.get("error") {
+                        json!({"id": request["id"], "error": error})
+                    } else {
+                        json!({"id": request["id"], "result": response})
+                    };
+                    if !write_fake_reply(&mut stream, &envelope.to_string()) {
+                        continue;
+                    }
+                }
+            })
+        };
+        // Build the registry directly (not via spawn_registry, which disables
+        // the watch for scripted fakes) so the default watch window applies.
+        let mut registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(
+            EventCache::from_snapshot_for_test(spawn_snapshot(&root, 80)),
+        ));
+        let result = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "startup_timeout_ms": 60_000},
+                "text": "work",
+                "idempotency_key": "s5-earlyexit",
+            }),
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "agent_start_failed", "{result}");
+        assert_eq!(result["failed_step"], "agent_start");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        let recorded = requests.lock().unwrap();
+        assert!(
+            recorded.iter().all(|r| r["method"] != "agent.prompt"),
+            "early-exit must prevent the prompt: {recorded:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user planner | Given a task with an explicit run cap | When the cap
+    /// expires | Then one agent_budget_exceeded event notifies the parent,
+    /// the task stays non-terminal, and a second sweep never re-notifies.
+    #[test]
+    fn budget_expiry_notifies_parent_once_without_terminating() {
+        let (path, mut registry, clock) = worker_registry("s5-budget");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![("agent.prompt", json!({"prompt": {"status": "submitted"}}))],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-budget-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.max_runtime_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        // Before the cap: nothing.
+        registry.sweep_task_budgets();
+        assert!(
+            registry
+                .load_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .budget_events
+                .is_empty()
+        );
+        // Past the cap: exactly one event, notify-only, task still running.
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(!stored.is_terminal());
+        assert_eq!(stored.lifecycle, PromptTaskLifecycle::Running);
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["event"], "agent_budget_exceeded");
+        assert_eq!(stored.budget_events[0]["notification_state"], "delivered");
+        assert_eq!(stored.budget_events[0]["interrupt_state"], "not_requested");
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["method"], "agent.prompt");
+        assert_eq!(recorded[0]["params"]["target"], "w1:p1");
+        assert!(
+            recorded[0]["params"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("agent_budget_exceeded")
+        );
+        drop(recorded);
+        // A second sweep must not re-notify.
+        registry.sweep_task_budgets();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            registry
+                .load_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .budget_events
+                .len(),
+            1
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user parent | Given a budget event persisted as pending (the process
+    /// died between the durable write and delivery) | When the next sweep runs
+    /// | Then the pending event is delivered instead of being skipped forever.
+    #[test]
+    fn pending_budget_event_is_redelivered_after_a_crash_window() {
+        let (path, mut registry, clock) = worker_registry("s5-budget-crash");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![("agent.prompt", json!({"prompt": {"status": "submitted"}}))],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-crash-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.max_runtime_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        // Simulate the crash window: the event row exists but is still pending.
+        task.budget_events.push(json!({
+            "event": "agent_budget_exceeded",
+            "at_ms": clock.load(Ordering::SeqCst),
+            "notification_state": "pending",
+            "interrupt_state": "not_requested",
+        }));
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 1, "no duplicate event row");
+        assert_eq!(
+            stored.budget_events[0]["notification_state"], "delivered",
+            "the pending event must be delivered by the sweep"
+        );
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["method"], "agent.prompt");
+        assert_eq!(recorded[0]["params"]["target"], "w1:p1");
+        assert!(
+            recorded[0]["params"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("agent_budget_exceeded")
+        );
+        drop(recorded);
+        // Delivered rows are not re-sent.
+        registry.sweep_task_budgets();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given on_budget interrupt | When the cap expires while
+    /// the agent works | Then one C-c goes to the task's own pane and the
+    /// event records it; a second sweep sends nothing more.
+    #[test]
+    fn budget_interrupt_sends_one_cc_to_the_task_pane() {
+        let (path, mut registry, clock) = worker_registry("s5-interrupt");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("agent.prompt", json!({"prompt": {"status": "submitted"}})),
+                (
+                    "agent.get",
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 3}}),
+                ),
+                ("pane.send_keys", json!({"ok": true})),
+            ],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-int-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.pane_id = Some("w1:p9".to_owned());
+        // The task's live turn is pinned to the same seq the pane reports
+        // below; the interrupt fence re-checks it at send time (S5 review
+        // P1-4).
+        task.turn_seq = Some(3);
+        task.max_runtime_ms = Some(60_000);
+        task.on_budget = Some("interrupt".to_owned());
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(!stored.is_terminal());
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["interrupt_state"], "sent");
+        let recorded = requests.lock().unwrap();
+        let cc: Vec<_> = recorded
+            .iter()
+            .filter(|r| r["method"] == "pane.send_keys")
+            .collect();
+        assert_eq!(cc.len(), 1, "{recorded:?}");
+        assert_eq!(cc[0]["params"]["pane_id"], "w1:p9");
+        assert_eq!(cc[0]["params"]["keys"], json!(["C-c"]));
+        drop(recorded);
+        registry.sweep_task_budgets();
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "pane.send_keys")
+                .count(),
+            1
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given on_budget interrupt and both stall + runtime caps
+    /// expiring in one sweep | Then the parent gets both notifications but the
+    /// pane receives exactly one C-c (S5 review P1-3).
+    #[test]
+    fn budget_interrupt_sends_at_most_one_cc_across_two_due_events() {
+        let (path, mut registry, clock) = worker_registry("s5-interrupt-once");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("agent.prompt", json!({"prompt": {"status": "submitted"}})),
+                (
+                    "agent.get",
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 3}}),
+                ),
+                ("pane.send_keys", json!({"ok": true})),
+            ],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-int2-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.pane_id = Some("w1:p9".to_owned());
+        task.turn_seq = Some(3);
+        task.stall_after_ms = Some(60_000);
+        task.max_runtime_ms = Some(60_000);
+        task.on_budget = Some("interrupt".to_owned());
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 2, "{:?}", stored.budget_events);
+        let interrupts: Vec<_> = stored
+            .budget_events
+            .iter()
+            .map(|row| row["interrupt_state"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            interrupts.iter().filter(|state| **state == "sent").count(),
+            1,
+            "exactly one event may send the C-c: {interrupts:?}"
+        );
+        let cc = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "pane.send_keys")
+            .count();
+        assert_eq!(cc, 1);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given the pane moved past the task's pinned turn |
+    /// When the interrupt fires | Then the C-c is refused rather than
+    /// interrupting unrelated new work (S5 review P1-4).
+    #[test]
+    fn budget_interrupt_refuses_when_the_pane_moved_to_a_new_turn() {
+        let (path, mut registry, clock) = worker_registry("s5-interrupt-turn");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("agent.prompt", json!({"prompt": {"status": "submitted"}})),
+                (
+                    "agent.get",
+                    // A later turn than the task's pinned seq 3.
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 7}}),
+                ),
+                ("pane.send_keys", json!({"ok": true})),
+            ],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-int3-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.pane_id = Some("w1:p9".to_owned());
+        task.turn_seq = Some(3);
+        task.max_runtime_ms = Some(60_000);
+        task.on_budget = Some("interrupt".to_owned());
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["interrupt_state"], "turn_mismatch");
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r["method"] != "pane.send_keys"),
+            "no C-c may reach a pane serving a different turn"
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given an active task older than a full page of terminal
+    /// history | When the budget sweep runs | Then the old task's cap still
+    /// emits (S5 review P1-5).
+    #[test]
+    fn budget_sweep_sees_active_tasks_beyond_the_recent_window() {
+        let (path, registry, clock) = worker_registry("s5-sweep-window");
+        // An old active task whose cap expired long ago.
+        let mut task = escalation_task("s5-old-active", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.max_runtime_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        // Fill the recent window with terminal tasks so a bounded updated_at
+        // query could never reach the active one.
+        for index in 0..520 {
+            let terminal = escalation_task(
+                &format!("s5-terminal-{index}"),
+                "w1:p8",
+                PromptTaskLifecycle::Completed,
+                0,
+            );
+            registry.save_task(&terminal, None).unwrap();
+        }
+        clock.fetch_add(120_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(
+            stored.budget_events.len(),
+            1,
+            "an old active task must still emit its cap: {:?}",
+            stored.budget_events
+        );
+        assert_eq!(stored.budget_events[0]["event"], "agent_budget_exceeded");
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given an explicit stall threshold | When it expires |
+    /// Then one agent_stalled event notifies the parent and the stall clock
+    /// is not reset by the event itself.
+    #[test]
+    fn explicit_stall_expiry_emits_agent_stalled_once() {
+        let (path, mut registry, clock) = worker_registry("s5-stall");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![("agent.prompt", json!({"prompt": {"status": "submitted"}}))],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-stall-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.stall_after_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["event"], "agent_stalled");
+        assert_eq!(
+            stored.updated_at_ms, task.updated_at_ms,
+            "stall event must not reset the stall clock"
+        );
+        assert!(!stored.is_terminal());
+        registry.sweep_task_budgets();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given a task without caps | When time passes | Then no
+    /// budget event is emitted and behavior is unchanged.
+    #[test]
+    fn no_caps_means_no_budget_events() {
+        let (path, registry, clock) = worker_registry("s5-nocaps");
+        let task = escalation_task("s5-nocaps-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(60 * 60_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert!(stored.budget_events.is_empty());
+        assert!(!stored.is_terminal());
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given invalid budget params | When dispatch parses them |
+    /// Then invalid_params before any mutation.
+    #[test]
+    fn budget_params_are_validated() {
+        let socket = temp_socket();
+        let listener = refused_spawn_server(&socket);
+        let registry = PromptRegistry::new();
+        let client = HerdrClient::new(&socket);
+        for (key, value) in [
+            ("max_runtime_ms", json!(1000)),
+            ("max_runtime_ms", json!(86_400_001u64)),
+            ("max_runtime_ms", json!("soon")),
+            ("on_budget", json!("kill")),
+        ] {
+            let mut args = json!({"target": "w1:p1", "text": "work"});
+            args[key] = value;
+            let result = run(&client, &registry, &args);
+            assert_eq!(result["code"], "invalid_params", "{key}: {result}");
+        }
+        // on_budget without any cap is rejected.
+        let result = run(
+            &client,
+            &registry,
+            &json!({"target": "w1:p1", "text": "work", "on_budget": "interrupt"}),
+        );
+        assert_eq!(result["code"], "invalid_params");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

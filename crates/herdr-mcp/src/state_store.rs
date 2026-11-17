@@ -817,6 +817,10 @@ pub struct StateStore {
     /// evidence for one `parent_session.reason`, never binding authority, and
     /// it resets with the process.
     unregistered_source_turns: Vec<UnregisteredSourceTurn>,
+    /// 1.2/S2: bounded in-memory `client_request_id` ledger. Deliberately not
+    /// persisted — a restart makes resubmission a fresh request and makes
+    /// `request.status` answer `unknown`, which the design doc prescribes.
+    request_ledger: crate::request_ledger::RequestLedger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -850,6 +854,7 @@ impl StateStore {
                 path: None,
                 conn,
                 unregistered_source_turns: Vec::new(),
+                request_ledger: crate::request_ledger::RequestLedger::default(),
             });
         }
 
@@ -870,7 +875,82 @@ impl StateStore {
             path: Some(path.to_path_buf()),
             conn,
             unregistered_source_turns: Vec::new(),
+            request_ledger: crate::request_ledger::RequestLedger::default(),
         })
+    }
+
+    // --- 1.2/S2 request ledger (in-memory only; never persisted to state.db) ---
+
+    /// Atomic dedupe + reserve under one lock: two concurrent submissions of
+    /// the same key can never both execute.
+    pub fn request_ledger_begin_or_replay(
+        &mut self,
+        client_request_id: &str,
+        method: &str,
+        identity: &crate::request_ledger::LedgerIdentity,
+        preferred_request_id: Option<&str>,
+        now_ms: i64,
+    ) -> crate::request_ledger::LedgerBegin {
+        self.request_ledger.begin_or_replay(
+            client_request_id,
+            method,
+            identity,
+            preferred_request_id,
+            now_ms,
+        )
+    }
+    /// Dedupe/status lookup for a `client_request_id` inside one caller
+    /// scope; expired entries are dropped first so a resubmission past the
+    /// TTL is a fresh request.
+    pub fn request_ledger_lookup(
+        &mut self,
+        client_request_id: &str,
+        caller_scope: &str,
+        now_ms: i64,
+    ) -> crate::request_ledger::LedgerReplay {
+        self.request_ledger
+            .lookup(client_request_id, caller_scope, now_ms)
+    }
+
+    /// Reserve a pending record for one `client_request_id`; returns the
+    /// request id used (wire correlation id when one was supplied).
+    pub fn request_ledger_begin(
+        &mut self,
+        client_request_id: &str,
+        method: &str,
+        identity: &crate::request_ledger::LedgerIdentity,
+        preferred_request_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<String, serde_json::Value> {
+        self.request_ledger.begin(
+            client_request_id,
+            method,
+            identity,
+            preferred_request_id,
+            now_ms,
+        )
+    }
+
+    /// Settle a pending record with the execution result.
+    pub fn request_ledger_settle(
+        &mut self,
+        client_request_id: &str,
+        result: &serde_json::Value,
+        now_ms: i64,
+    ) {
+        self.request_ledger
+            .settle(client_request_id, result, now_ms)
+    }
+
+    /// `herdr_mcp.request.status` projection by `client_request_id` or runtime
+    /// `request_id`.
+    pub fn request_ledger_status(
+        &mut self,
+        key: &str,
+        caller_scope: &str,
+        now_ms: i64,
+    ) -> serde_json::Value {
+        self.request_ledger.status(key, caller_scope, now_ms)
     }
 
     /// Open a database file named `name` inside a state directory, creating and
@@ -901,6 +981,7 @@ impl StateStore {
             path: Some(path),
             conn,
             unregistered_source_turns: Vec::new(),
+            request_ledger: crate::request_ledger::RequestLedger::default(),
         })
     }
 
@@ -1090,11 +1171,30 @@ impl StateStore {
             "DELETE FROM operations WHERE expires_at IS NOT NULL AND expires_at <= ?1
              AND NOT (kind = 'browser_page.action'
                       AND state IN ('pending', 'unknown'))
+             -- S4: agent task rows are archived, never deleted. Default inbox
+             -- queries hide them past retention; `operation_ledgers_archived`
+             -- keeps them queryable.
+             AND kind <> 'herdr_prompt_task'
              AND NOT EXISTS (SELECT 1 FROM task_decision_gates
                              WHERE task_id = operations.op_id AND status = 'open')",
             params![now_ms],
         )
         .map_err(|error| format!("cannot prune expired operations: {error}"))?;
+        // Archived prompt tasks keep their durable row, so their resolved gates
+        // would otherwise accumulate forever. Open gates stay protected (they
+        // are still the human boundary), resolved ones are cleared with the
+        // receipt they belonged to.
+        tx.execute(
+            "DELETE FROM task_decision_gates
+             WHERE status <> 'open'
+               AND task_id IN (
+                   SELECT op_id FROM operations
+                   WHERE kind = 'herdr_prompt_task'
+                     AND expires_at IS NOT NULL AND expires_at <= ?1
+               )",
+            params![now_ms],
+        )
+        .map_err(|error| format!("cannot prune resolved gates of archived tasks: {error}"))?;
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO operations (
@@ -1759,6 +1859,101 @@ impl StateStore {
             .map_err(|error| format!("cannot count active role tasks: {error}"))
     }
 
+    /// Atomically read-modify-write one ledger row's `result_json` inside an
+    /// `IMMEDIATE` transaction, so a concurrent caller can never observe and
+    /// rewrite the same intermediate state (S4 repair budget, droid P1-2).
+    ///
+    /// The closure decides the new payload: `None` writes nothing. Returns
+    /// `Ok(None)` when the row does not exist or belongs to another `kind`, so
+    /// callers never mutate an unrelated operation.
+    pub fn update_operation_result<R>(
+        &mut self,
+        op_id: &str,
+        kind: &str,
+        update: impl FnOnce(&str) -> Result<(Option<String>, R), String>,
+    ) -> Result<Option<R>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin ledger update: {error}"))?;
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind, result_json FROM operations WHERE op_id = ?1",
+                params![op_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("cannot read ledger row: {error}"))?;
+        let Some((stored_kind, result_json)) = existing else {
+            return Ok(None);
+        };
+        if stored_kind != kind {
+            return Ok(None);
+        }
+        let (payload, value) = update(&result_json)?;
+        if let Some(payload) = payload {
+            tx.execute(
+                // Only the payload changes: the receipt's own `updated_at` and
+                // retention deadline stay anchored to its delivery outcome, so a
+                // late repair attempt never rescues an archived receipt.
+                "UPDATE operations SET result_json = ?2 WHERE op_id = ?1",
+                params![op_id, payload],
+            )
+            .map_err(|error| format!("cannot write ledger row: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit ledger update: {error}"))?;
+        Ok(Some(value))
+    }
+
+    /// S4 archive read: rows of `kind` whose retention window has already
+    /// elapsed. Default ledger queries hide them; the runtime never deletes them
+    /// (see the prune carve-out), so a terminal receipt stays queryable here.
+    pub fn operation_ledgers_archived(
+        &self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<Vec<OperationLedgerRecord>, String> {
+        let limit = i64::try_from(limit.clamp(1, 1024)).unwrap_or(1024);
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id, kind, idempotency_key, request_hash, phase, state,
+                        result_json, created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1
+                   AND expires_at IS NOT NULL AND expires_at <= ?2
+                 ORDER BY updated_at DESC, op_id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| format!("cannot prepare archived operation list: {error}"))?;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![kind, now_ms, limit], |row| {
+                Ok(OperationLedgerRecord {
+                    op_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    request_hash: row.get(3)?,
+                    phase: row.get(4)?,
+                    state: row.get(5)?,
+                    result_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                })
+            })
+            .map_err(|error| format!("cannot list archived operations: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot read archived operation row: {error}"))
+    }
+
     pub fn operation_ledgers(
         &self,
         kind: &str,
@@ -1802,6 +1997,53 @@ impl StateStore {
             .map_err(|error| format!("cannot query operation ledger list: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("cannot decode operation ledger list: {error}"))
+    }
+
+    /// All live ledgers of one kind in one phase, unbounded: the agent-task
+    /// budget sweep needs every still-active task, not just the most recent
+    /// window (S5 review P1-5).
+    pub fn operation_ledgers_by_phase(
+        &self,
+        kind: &str,
+        phase: &str,
+    ) -> Result<Vec<OperationLedgerRecord>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT op_id, kind, idempotency_key, request_hash, phase, state,
+                        result_json, created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1
+                   AND phase = ?2
+                   AND (expires_at IS NULL OR expires_at > ?3)
+                 ORDER BY updated_at DESC, op_id DESC",
+            )
+            .map_err(|error| format!("cannot prepare operation ledger phase query: {error}"))?;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![kind, phase, now_ms], |row| {
+                Ok(OperationLedgerRecord {
+                    op_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    idempotency_key: row.get(2)?,
+                    request_hash: row.get(3)?,
+                    phase: row.get(4)?,
+                    state: row.get(5)?,
+                    result_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    expires_at: row.get(9)?,
+                })
+            })
+            .map_err(|error| format!("cannot query operation ledger phase list: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode operation ledger phase list: {error}"))
     }
 
     pub fn append_continuity_turn(

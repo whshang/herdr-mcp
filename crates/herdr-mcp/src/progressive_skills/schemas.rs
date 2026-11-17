@@ -18,7 +18,7 @@ use super::{
     EXEC_WAIT_METHOD, GITHUB_STATUS_METHOD, LOCAL_DESCRIBE_METHOD, LOCAL_LIST_METHOD,
     LOCAL_LOAD_METHOD, ORCHESTRATION_LEASE_ACQUIRE_METHOD, ORCHESTRATION_LEASE_LIST_METHOD,
     ORCHESTRATION_LEASE_RELEASE_METHOD, ORCHESTRATION_LEASE_RENEW_METHOD, PLANNING_ADVISE_METHOD,
-    TEXT_READ_METHOD, TEXT_WRITE_METHOD, VALIDATION_ADVISE_METHOD,
+    REQUEST_STATUS_METHOD, TEXT_READ_METHOD, TEXT_WRITE_METHOD, VALIDATION_ADVISE_METHOD,
     WORK_MEMORY_APPEND_EVIDENCE_METHOD, WORK_MEMORY_APPEND_TURN_METHOD, WORK_MEMORY_BIND_METHOD,
     WORK_MEMORY_CHECKPOINT_PUT_METHOD, WORK_MEMORY_RESUME_METHOD, WORK_MEMORY_SEARCH_METHOD,
     WORK_PICKUP_METHOD, WORKSTATION_PREFLIGHT_METHOD, X_SEARCH_POSTS_METHOD, X_THREAD_READ_METHOD,
@@ -149,15 +149,24 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                             "split_from": {"type": "string", "maxLength": 256, "description": "Optional parent pane id for pane.split. Without it the pane is created as a new tab so the agent gets the full tab width. A horizontal split still respects the readable-width floor and fails with pane_split_too_narrow."},
                             "direction": {"type": "string", "enum": ["right", "down"], "description": "Split direction; requires split_from and defaults to right."},
                             "startup_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Budget for the WHOLE one-call chain (pane create + agent.start + readiness + prompt submission), not just readiness. Defaults to 25000 so it fits a WebChat herdr_call without timeout_ms (Edge cuts at 30s; the link never exceeds 60s); the local CLI waits chain + 10s and never exceeds 120s. Every step gets only what is left, and a chain that cannot reach the prompt pauses in a resumable checkpoint instead of holding an in-flight key."}
+                            ,
+                            "model": {"type": "string", "maxLength": 256, "description": "Optional model alias (provider/id, bare id, optional :thinking). Validated against the kind's obtainable model list before any mutation; unknown aliases and kinds without a list fail with model_alias_unknown (validated:false) and no fallback. Delivered via the agent's documented model flag; a live schema that cannot carry it fails with model_delivery_unsupported."}
                         },
                         "required": ["kind"],
                     },
                     "workspace_id": {"type": "string", "maxLength": 256, "description": "Optional workspace scope for role resolution. Not applicable with spawn (use spawn.workspace_id)."},
                     "max_concurrent": {"type": "integer", "minimum": 1, "maximum": 16, "description": "Role selectors only: cap non-terminal tasks for this exact requested_target in the bound parent session, else parent_target, else caller-less global scope. Limit rejection is not_delivered."},
                     "text": {"type": "string", "maxLength": 65536},
+                    "repair_of": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Optional terminal receipt id this dispatch repairs. Each accepted repair spends one of that receipt's three repair attempts (repair.attempts on the receipt); an exhausted lane is terminal and further repairs are refused as repair_budget_exhausted / not_delivered before anything is submitted. Cannot be combined with spawn.",
+                    },
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
                     "stall_after_ms": {"type": "integer", "minimum": 60000, "maximum": 7200000, "description": "Liveness stall threshold; defaults to 20 minutes. Stalled is non-terminal and never redispatched automatically."},
+                    "max_runtime_ms": {"type": "integer", "minimum": 60000, "maximum": 86400000, "description": "Optional wall-clock run cap from task creation. Expiry emits agent_budget_exceeded to the parent (notify-only by default; on_budget interrupt sends one explicit C-c). Never terminates the task; recorded once in task.budget_events."},
+                    "on_budget": {"type": "string", "enum": ["notify", "interrupt"], "description": "Budget expiry action; requires max_runtime_ms or stall_after_ms. Default notify. interrupt additionally sends one C-c to the task's own working pane."},
                     "inject_task_identity": {
                         "type": "boolean",
                         "default": false,
@@ -248,6 +257,20 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             },
         }),
         json!({
+            "method": REQUEST_STATUS_METHOD,
+            "source": "herdr_mcp_local",
+            "access": "read_only",
+            "description": "1.2/S2: query the bounded request ledger by client_request_id or runtime request_id. State vocabulary: pending | applied | rejected | not_delivered | unknown; a missing or expired key reports state=unknown with found=false.",
+            "params": {
+                "properties": {
+                    "request_id": {"type": "string", "maxLength": 64},
+                    "client_request_id": {"type": "string", "maxLength": 256},
+                },
+                "required": [],
+                "empty": false,
+            },
+        }),
+        json!({
             "method": AGENT_TASK_INBOX_METHOD,
             "source": "herdr_mcp_local",
             "access": "read_only",
@@ -265,9 +288,24 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         "maximum": 60000,
                         "description": "Optional bounded long-poll budget. Returns as soon as an unacknowledged terminal task is in scope; deterministic task facts only, no advisory or semantic work."
                     },
+                    "receipt_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Optional exact receipt id (aliases task_id). Applies to the default list, the bounded wait, the archive and the stats view."
+                    },
+                    "status": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "Optional lifecycle or terminal status filter (completed, failed, blocked, delivery_uncertain, running, ...)."
+                    },
+                    "since_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional unix-millisecond lower bound on the receipt's updated_at_ms."
+                    },
                     "view": {
                         "type": "string",
-                        "enum": ["full", "compact"],
+                        "enum": ["full", "compact", "archive", "stats"],
                         "description": "Optional task projection; compact keeps ids, target, pane, lifecycle, liveness, terminal/acknowledged flags, timestamps, the awaiting_children hold fact and the bounded final_excerpt when captured. final_excerpt is omitted, not degraded, when the child pane is narrower than 40 columns: a TUI agent hard-wraps its own layout there, so the only readable options are reading the pane or giving the agent a wider pane (a new tab, a reused wide pane, or a down split)."
                     },
                 },
@@ -1191,4 +1229,51 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                 .is_some_and(|method| method.to_ascii_lowercase().contains(&query))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn method_schema(method: &str) -> Value {
+        local_method_schemas("")
+            .into_iter()
+            .find(|schema| schema["method"] == json!(method))
+            .unwrap_or_else(|| panic!("missing schema for {method}"))
+    }
+
+    /// S4 review P2: the public schema is what `herdr_methods` advertises and
+    /// what mutation validation enforces, so the new dispatch/inbox parameters
+    /// must appear there or the public surface rejects them.
+    #[test]
+    fn s4_dispatch_and_inbox_parameters_are_advertised() {
+        let dispatch = method_schema(AGENT_TASK_DISPATCH_METHOD);
+        let properties = &dispatch["params"]["properties"];
+        assert_eq!(
+            properties["repair_of"]["type"],
+            json!("string"),
+            "{dispatch}"
+        );
+        assert_eq!(
+            properties["repair_of"]["maxLength"],
+            json!(128),
+            "{dispatch}"
+        );
+
+        let inbox = method_schema(AGENT_TASK_INBOX_METHOD);
+        let properties = &inbox["params"]["properties"];
+        for filter in ["receipt_id", "status", "since_ms"] {
+            assert!(
+                properties.get(filter).is_some(),
+                "inbox schema is missing {filter}: {inbox}"
+            );
+        }
+        let view = properties["view"]["enum"].as_array().unwrap();
+        for expected in ["full", "compact", "archive", "stats"] {
+            assert!(
+                view.iter().any(|value| value == expected),
+                "inbox view enum is missing {expected}: {inbox}"
+            );
+        }
+    }
 }

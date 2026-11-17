@@ -83,7 +83,7 @@ struct Scenario {
 
 /// Contract identity and state schema of a fixture release plus the identity the
 /// installed runtime reports. The default shape is the adjacent forward
-/// migration (local epoch 4 / schema 16 → target epoch 5).
+/// migration (local epoch 5 / schema 16 → target epoch 6).
 struct FixtureShape {
     local: ContractIdentity,
     manifest_contract: ContractIdentity,
@@ -95,8 +95,8 @@ impl FixtureShape {
     fn forward_migration() -> Self {
         let local = crate::contract::previous_identity().unwrap();
         let target = crate::contract::identity().unwrap();
-        assert_eq!(local.epoch, 4);
-        assert_eq!(target.epoch, 5);
+        assert_eq!(local.epoch, 5);
+        assert_eq!(target.epoch, 6);
         Self {
             local,
             manifest_contract: target,
@@ -108,8 +108,8 @@ impl FixtureShape {
     fn older_stable() -> Self {
         let local = crate::contract::identity().unwrap();
         let stable = crate::contract::previous_identity().unwrap();
-        assert_eq!(local.epoch, 5);
-        assert_eq!(stable.epoch, 4);
+        assert_eq!(local.epoch, 6);
+        assert_eq!(stable.epoch, 5);
         Self {
             local,
             manifest_contract: stable,
@@ -360,7 +360,7 @@ fn auto_refuses_skipped_epoch_missing_declaration_and_predecessor_mismatch_witho
     for case in ["skip", "missing", "from"] {
         let scenario = Scenario::new(
             |manifest| match case {
-                "skip" => manifest["contract"]["epoch"] = json!(6),
+                "skip" => manifest["contract"]["epoch"] = json!(7),
                 "missing" => {
                     manifest
                         .as_object_mut()
@@ -376,7 +376,7 @@ fn auto_refuses_skipped_epoch_missing_declaration_and_predecessor_mismatch_witho
             false,
         );
         let error = auto().unwrap_err();
-        assert!(error.contains("local epoch 4"), "{case}: {error}");
+        assert!(error.contains("local epoch 5"), "{case}: {error}");
         assert!(!scenario.root.join("update").exists());
         assert!(!scenario.root.join("worker-argv").exists());
         let paths = RuntimePaths::discover().unwrap();

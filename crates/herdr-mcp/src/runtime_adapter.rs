@@ -606,6 +606,8 @@ pub struct HerdrCoreClient {
     // This hello identity is advisory: a same-UID process can impersonate it.
     admitted_hello: Option<HerdrCoreHello>,
     admitted_peer_pid: Option<i32>,
+    // Applies only to a conditional public server.status request.
+    pre_hello_expected_target: Option<(std::num::NonZeroI32, u64, u64)>,
 }
 
 impl HerdrCoreClient {
@@ -615,6 +617,7 @@ impl HerdrCoreClient {
             timeout: HC_HANDSHAKE_TIMEOUT,
             admitted_hello: None,
             admitted_peer_pid: None,
+            pre_hello_expected_target: None,
         }
     }
 
@@ -625,6 +628,7 @@ impl HerdrCoreClient {
             timeout: timeout.min(HC_EXEC_MAX_TIMEOUT),
             admitted_hello: None,
             admitted_peer_pid: None,
+            pre_hello_expected_target: None,
         }
     }
 
@@ -637,18 +641,13 @@ impl HerdrCoreClient {
     pub fn advisory_target_ref(&self, core_id: Option<&str>) -> Option<String> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-            let metadata = std::fs::symlink_metadata(&self.socket_path).ok()?;
-            if !metadata.file_type().is_socket() {
-                return None;
-            }
+            let (dev, ino) = self.listener_node_fingerprint()?;
             let pid = self.admitted_peer_pid?;
             Some(format!(
                 "unix:{}:{}:{}:{}",
                 pid,
-                metadata.dev(),
-                metadata.ino(),
+                dev,
+                ino,
                 core_id.unwrap_or("")
             ))
         }
@@ -657,6 +656,26 @@ impl HerdrCoreClient {
             let _ = core_id;
             None
         }
+    }
+
+    /// Listener socket-node fingerprint `(dev, ino)` read from the configured
+    /// socket path.
+    ///
+    /// This is the same source [`Self::advisory_target_ref`] records, so the
+    /// fingerprint is comparable *before* the admission `hello`: unlike the
+    /// connected fd (a local endpoint whose `fstat` cannot attest the listener
+    /// inode) and unlike the self-reported `core.id` (only observable from the
+    /// hello reply). It remains a pathname fingerprint: a same-UID process can
+    /// still race the path and an inode number can be reused (#768/#935).
+    #[cfg(unix)]
+    fn listener_node_fingerprint(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let metadata = std::fs::symlink_metadata(&self.socket_path).ok()?;
+        if !metadata.file_type().is_socket() {
+            return None;
+        }
+        Some((metadata.dev(), metadata.ino()))
     }
 
     pub fn admitted_target_ref(&self) -> Option<String> {
@@ -1371,7 +1390,34 @@ impl HerdrCoreClient {
         call_timeout: Duration,
         op: impl FnOnce(HerdrCoreHello, &mut HcSocketStream) -> Result<T, HerdrCoreError>,
     ) -> Result<T, HerdrCoreError> {
+        // The pathname fingerprint is advisory and can be replaced between
+        // this stat and connect. Compare it before attempting connect; the
+        // kernel peer PID can only be checked on the connected socket.
+        #[cfg(unix)]
+        let expected_peer_pid = if let Some((pid, dev, ino)) = self.pre_hello_expected_target {
+            if self.listener_node_fingerprint() != Some((dev, ino)) {
+                return Err(HerdrCoreError {
+                    code: "herdr_core_target_changed".to_owned(),
+                    kind: Some("core_target_changed".to_owned()),
+                    message: "the configured Core listener socket node changed before connect"
+                        .to_owned(),
+                });
+            }
+            Some(pid)
+        } else {
+            None
+        };
         let mut stream = connect_hc_socket(&self.socket_path, call_timeout)?;
+        #[cfg(unix)]
+        if let Some(expected_pid) = expected_peer_pid
+            && hc_peer_pid(&stream, &self.socket_path)? != expected_pid.get()
+        {
+            return Err(HerdrCoreError {
+                code: "herdr_core_target_changed".to_owned(),
+                kind: Some("core_target_changed".to_owned()),
+                message: "the connected Core peer PID differs from the expected target before admission hello".to_owned(),
+            });
+        }
         #[cfg(unix)]
         if let Some(admitted_pid) = self.admitted_peer_pid
             && hc_peer_pid(&stream, &self.socket_path)? != admitted_pid
@@ -1864,11 +1910,25 @@ impl PublicToolRoute {
 pub fn public_tool_route(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
+    expected_target: Option<&Value>,
 ) -> Result<PublicToolRoute, Value> {
-    let selection = verify_admitted_backend(admitted).map_err(|error| {
-        invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
-    })?;
-    public_tool_route_for_selection(tool_name, &selection)
+    // 1.2 S0: this admission is the `connect` phase of the request envelope.
+    // For `herdr-core` it covers the socket connect, peer-UID check and hello;
+    // for `tui` it is the local admission only (typically sub-millisecond).
+    let admission_started = std::time::Instant::now();
+    let result = (|| {
+        let selection = verify_admitted_backend(admitted).map_err(|error| {
+            invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
+        })?;
+        public_tool_route_for_selection(tool_name, &selection, expected_target)
+    })();
+    crate::observability::add_connect_ms(
+        admission_started
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64,
+    );
+    result
 }
 
 /// One admitted-backend comparison for every request path (#768).
@@ -1964,9 +2024,33 @@ fn admission_drift(
     Ok(())
 }
 
+/// Parse the Unix target fields observable before admission hello.
+/// The optional core ID is opaque and stays checked after hello.
+fn hc_expected_unix_target(value: &str) -> Option<(std::num::NonZeroI32, u64, u64)> {
+    let mut parts = value.splitn(5, ':');
+    if parts.next()? != "unix" {
+        return None;
+    }
+    let decimal = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let pid_text = parts.next()?;
+    let dev_text = parts.next()?;
+    let ino_text = parts.next()?;
+    if !decimal(pid_text) || !decimal(dev_text) || !decimal(ino_text) {
+        return None;
+    }
+    let pid = pid_text
+        .parse::<i32>()
+        .ok()
+        .and_then(std::num::NonZeroI32::new)?;
+    let dev = dev_text.parse::<u64>().ok()?;
+    let ino = ino_text.parse::<u64>().ok()?;
+    Some((pid, dev, ino))
+}
+
 fn public_tool_route_for_selection(
     tool_name: &str,
     selection: &RuntimeBackendSelection,
+    expected_target: Option<&Value>,
 ) -> Result<PublicToolRoute, Value> {
     match selection.backend {
         RuntimeBackend::Tui => Ok(PublicToolRoute::Tui(selection.clone())),
@@ -1996,7 +2080,21 @@ fn public_tool_route_for_selection(
                     "message": "herdr-core backend selected without a resolved socket path",
                 }));
             };
+            let pre_hello_target = expected_target
+                .and_then(Value::as_str)
+                .and_then(hc_expected_unix_target);
+            if expected_target.is_some() && pre_hello_target.is_none() {
+                return Err(json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "expected_core_target must be a valid Unix target reference",
+                    "delivery_state": "not_delivered",
+                    "fallback_allowed": false,
+                    "retryable": false,
+                }));
+            }
             let mut client = HerdrCoreClient::new(socket_path);
+            client.pre_hello_expected_target = pre_hello_target;
             let capability_check = client.admit_public_tool(tool_name).map_err(|mut rejection| {
                 if let Some(object) = rejection.as_object_mut() {
                     object.insert("operation".to_owned(), json!(tool_name));
@@ -2304,6 +2402,23 @@ pub fn herdr_core_prompt(_client: &HerdrCoreClient, _args: &Value) -> Value {
     herdr_core_prompt_refusal()
 }
 
+/// Rejection for an `expected_core_target` on any method other than the
+/// read-only `server.status` route (#944/#946).
+///
+/// Shared with the pre-admission check in `mcp::tool_call` so the public result
+/// cannot drift depending on which phase catches the request, and so the same
+/// result is returned whether `params` arrived as an object or as a JSON string.
+pub fn herdr_core_expected_target_unsupported() -> Value {
+    json!({
+        "ok": false,
+        "code": "invalid_params",
+        "message": "expected_core_target is only supported for read-only server.status",
+        "delivery_state": "not_delivered",
+        "fallback_allowed": false,
+        "retryable": false,
+    })
+}
+
 /// `herdr_call` forwarding under `herdr-core`.
 ///
 /// Local `herdr_mcp.*` methods never reach here. The method name is trimmed
@@ -2334,14 +2449,7 @@ pub fn herdr_core_call(client: &HerdrCoreClient, method: &str, params: Value) ->
     let expected_target = params.get("expected_core_target");
     let expected_target = if let Some(value) = expected_target {
         if !method.eq_ignore_ascii_case("server.status") {
-            return json!({
-                "ok": false,
-                "code": "invalid_params",
-                "message": "expected_core_target is only supported for read-only server.status",
-                "delivery_state": "not_delivered",
-                "fallback_allowed": false,
-                "retryable": false,
-            });
+            return herdr_core_expected_target_unsupported();
         }
         let Some(expected) = value.as_str().filter(|value| !value.is_empty()) else {
             return json!({
@@ -3269,7 +3377,7 @@ mod tests {
             "herdr_fs_edit",
             "herdr_exec",
         ] {
-            let rejection = match public_tool_route_for_selection(tool, &core) {
+            let rejection = match public_tool_route_for_selection(tool, &core, None) {
                 Err(rejection) => rejection,
                 Ok(_) => panic!("{tool} was admitted on herdr-core"),
             };
@@ -3284,11 +3392,11 @@ mod tests {
             assert_eq!(rejection["retryable"], false);
             assert_eq!(rejection["fallback_allowed"], false);
             assert!(matches!(
-                public_tool_route_for_selection(tool, &tui),
+                public_tool_route_for_selection(tool, &tui, None),
                 Ok(PublicToolRoute::Tui(_))
             ));
         }
-        let prompt_rejection = match public_tool_route_for_selection("herdr_prompt", &core) {
+        let prompt_rejection = match public_tool_route_for_selection("herdr_prompt", &core, None) {
             Err(rejection) => rejection,
             Ok(_) => panic!("herdr_prompt was admitted on herdr-core"),
         };
@@ -3300,7 +3408,7 @@ mod tests {
         );
         assert_eq!(prompt_rejection["delivery_state"], "not_delivered");
         assert!(matches!(
-            public_tool_route_for_selection("herdr_prompt", &tui),
+            public_tool_route_for_selection("herdr_prompt", &tui, None),
             Ok(PublicToolRoute::Tui(_))
         ));
         assert_eq!(

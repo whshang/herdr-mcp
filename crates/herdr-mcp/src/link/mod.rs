@@ -40,6 +40,7 @@ pub mod runtime_control;
 pub mod runtime_generation;
 pub mod seal;
 pub mod socket_driver;
+pub mod telemetry;
 pub mod transport;
 
 pub use cutover::{CutoverMode, run as run_link_cutover};

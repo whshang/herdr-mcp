@@ -31,6 +31,8 @@ pub enum Command {
     Doctor {
         verbose: bool,
         json: bool,
+        /// 1.2 S7: print the read-only local diagnostic snapshot instead.
+        local: bool,
     },
     Network(NetworkCommand),
     Uninstall,
@@ -330,6 +332,8 @@ pub enum AgentCommand {
         idempotency_key: String,
         inject_task_identity: bool,
         stall_after_ms: Option<u64>,
+        max_runtime_ms: Option<u64>,
+        on_budget: Option<String>,
         max_concurrent: Option<u64>,
         workspace_id: Option<String>,
         parent_session_ref: Option<String>,
@@ -368,6 +372,7 @@ pub struct AgentDispatchSpawn {
     pub split_from: Option<String>,
     pub direction: Option<String>,
     pub startup_timeout_ms: Option<u64>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -738,16 +743,24 @@ fn parse_doctor(args: &[String]) -> Result<Command, String> {
         [] => Ok(Command::Doctor {
             verbose: false,
             json: false,
+            local: false,
         }),
         [flag] if flag == "--verbose" => Ok(Command::Doctor {
             verbose: true,
             json: false,
+            local: false,
         }),
         [flag] if flag == "--json" => Ok(Command::Doctor {
             verbose: false,
             json: true,
+            local: false,
         }),
-        _ => Err("usage: herdr-mcp doctor [--verbose|--json]".to_owned()),
+        [flag] if flag == "--local" => Ok(Command::Doctor {
+            verbose: false,
+            json: false,
+            local: true,
+        }),
+        _ => Err("usage: herdr-mcp doctor [--verbose|--json|--local]".to_owned()),
     }
 }
 
@@ -990,11 +1003,13 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             // Two call shapes share one method name: reuse an existing agent
             // (`target`) or spawn one from `--spawn-*` facts. A spawn dispatch
             // has no target, so the first positional is the task text.
-            const USAGE: &str = "agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N] | agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity] [--stall-after-ms N] [--wait] [--timeout-ms N]";
+            const USAGE: &str = "agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-runtime-ms N] [--on-budget notify|interrupt] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N] | agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-model ALIAS] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity] [--stall-after-ms N] [--max-runtime-ms N] [--on-budget notify|interrupt] [--wait] [--timeout-ms N]";
             let mut target = None;
             let mut positionals: Vec<String> = Vec::new();
             let mut inject_task_identity = false;
             let mut stall_after_ms = None;
+            let mut max_runtime_ms = None;
+            let mut on_budget = None;
             let mut max_concurrent = None;
             let mut workspace_id = None;
             let mut parent_session_ref = None;
@@ -1010,6 +1025,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             let mut spawn_split_from = None;
             let mut spawn_direction = None;
             let mut spawn_startup_timeout_ms = None;
+            let mut spawn_model = None;
             let mut index = 1;
             while index < args.len() {
                 let flag = args[index].as_str();
@@ -1047,6 +1063,27 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                                     "--stall-after-ms must be in 60000..=7200000".to_owned()
                                 })?,
                         );
+                        index += 2;
+                    }
+                    "--max-runtime-ms" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        max_runtime_ms = Some(
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|value| (60_000..=86_400_000).contains(value))
+                                .ok_or_else(|| {
+                                    "--max-runtime-ms must be in 60000..=86400000".to_owned()
+                                })?,
+                        );
+                        index += 2;
+                    }
+                    "--on-budget" => {
+                        let value = dispatch_flag_value(args, index, flag)?;
+                        if value != "notify" && value != "interrupt" {
+                            return Err("--on-budget must be notify or interrupt".to_owned());
+                        }
+                        on_budget = Some(value);
                         index += 2;
                     }
                     "--inject-task-identity" => {
@@ -1126,6 +1163,10 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                         );
                         index += 2;
                     }
+                    "--spawn-model" => {
+                        spawn_model = Some(dispatch_flag_value(args, index, flag)?);
+                        index += 2;
+                    }
                     flag => return Err(format!("unknown agent dispatch option '{flag}'")),
                 }
             }
@@ -1139,6 +1180,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                     split_from: spawn_split_from,
                     direction: spawn_direction,
                     startup_timeout_ms: spawn_startup_timeout_ms,
+                    model: spawn_model,
                 })),
                 None => {
                     if spawn_workspace.is_some()
@@ -1148,6 +1190,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                         || spawn_split_from.is_some()
                         || spawn_direction.is_some()
                         || spawn_startup_timeout_ms.is_some()
+                        || spawn_model.is_some()
                     {
                         return Err(
                             "agent dispatch --spawn-* options require --spawn-kind KIND".to_owned()
@@ -1204,6 +1247,8 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                     .ok_or_else(|| "--idempotency-key is required".to_owned())?,
                 inject_task_identity,
                 stall_after_ms,
+                max_runtime_ms,
+                on_budget,
                 max_concurrent,
                 workspace_id,
                 parent_session_ref,
@@ -3214,14 +3259,15 @@ pub fn help() -> &'static str {
 User path:\n\
   herdr-mcp install\n\
   herdr-mcp status [--verbose]\n\
-  herdr-mcp doctor [--verbose|--json]  (default is concise; exit 0 = no known failure in probed layers)\n\
+  herdr-mcp doctor [--verbose|--json|--local]  (default is concise; exit 0 = no known failure in probed layers)\n\
+  --local prints a read-only local snapshot: allow-listed processes, loopback ports and config file mtimes; metadata only - never file contents, environment values or secrets\n\
   herdr-mcp semantic <status|setup|remove|decide|choose|score> ...  (optional fast semantic decisions; provider-neutral)\n\
   herdr-mcp permissions <status|setup [--upgrade-broker]|verify>\n\
   herdr-mcp scan [--json] [--refresh] [--probe]\n\
   herdr-mcp agent-skill <status|sync>  (repo-fetched user-global local-agent Skill; exact runtime source identity)\n\
   herdr-mcp continuity <search|resume> ...  (durable prior-work discovery for local coding agents)\n\
-  herdr-mcp agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]\n\
-  herdr-mcp agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity]\n\
+  herdr-mcp agent dispatch (<target> | --target <target>) <text> --parent <target> --idempotency-key <key> [--inject-task-identity] [--parent-session-ref REF] [--stall-after-ms N] [--max-runtime-ms N] [--on-budget notify|interrupt] [--max-concurrent 1..16] [--workspace-id ID] [--wait] [--timeout-ms N]\n\
+  herdr-mcp agent dispatch --spawn-kind KIND [--spawn-workspace W] [--spawn-cwd P] [--spawn-name N] [--spawn-model ALIAS] [--spawn-tab-label L] [--spawn-split-from PANE] [--spawn-direction right|down] [--spawn-startup-timeout-ms N] <text> --idempotency-key <key> [--parent <target>] [--inject-task-identity]\n\
       Roles: @idle, @kind, @kind:idle; first idle pane only, @all rejected. --max-concurrent caps role tasks in the parent scope.\n\
       Wait timeout returns ok:true + wait.outcome:checkpoint; re-check status/inbox.\n\
   herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
@@ -3615,6 +3661,8 @@ mod tests {
                     idempotency_key: "key".to_owned(),
                     inject_task_identity: enabled,
                     stall_after_ms: None,
+                    max_runtime_ms: None,
+                    on_budget: None,
                     max_concurrent: None,
                     workspace_id: None,
                     parent_session_ref: enabled.then(|| "br_session".to_owned()),
@@ -3707,11 +3755,14 @@ mod tests {
                     split_from: Some("wVE:p1".to_owned()),
                     direction: Some("down".to_owned()),
                     startup_timeout_ms: Some(90_000),
+                    model: None,
                 })),
                 parent_target: None,
                 idempotency_key: "spawn-key".to_owned(),
                 inject_task_identity: false,
                 stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
                 max_concurrent: None,
                 workspace_id: None,
                 parent_session_ref: None,
@@ -4466,6 +4517,7 @@ mod tests {
             Command::Doctor {
                 verbose: false,
                 json: false,
+                local: false,
             }
         );
         assert_eq!(
@@ -4473,6 +4525,7 @@ mod tests {
             Command::Doctor {
                 verbose: true,
                 json: false,
+                local: false,
             }
         );
         assert_eq!(
@@ -4480,9 +4533,19 @@ mod tests {
             Command::Doctor {
                 verbose: false,
                 json: true,
+                local: false,
+            }
+        );
+        assert_eq!(
+            parse(args(&["doctor", "--local"])).unwrap().command,
+            Command::Doctor {
+                verbose: false,
+                json: false,
+                local: true,
             }
         );
         assert!(parse(args(&["doctor", "--json", "--verbose"])).is_err());
+        assert!(parse(args(&["doctor", "--local", "--json"])).is_err());
         assert_eq!(
             parse(args(&["semantic", "status"])).unwrap().command,
             Command::Semantic(SemanticCommand::Status { json: false })
@@ -5996,6 +6059,7 @@ mod tests {
             Command::Doctor {
                 verbose: false,
                 json: false,
+                local: false,
             }
         );
         assert!(parse(args(&["--instance", "server", "status"])).is_err());
@@ -6079,8 +6143,14 @@ mod tests {
             );
         }
         assert!(text.contains("herdr-mcp status [--verbose]"));
-        assert!(text.contains("herdr-mcp doctor [--verbose|--json]"));
+        assert!(text.contains("herdr-mcp doctor [--verbose|--json|--local]"));
         assert!(text.contains("default is concise"));
+        assert!(text.contains(
+            "--local prints a read-only local snapshot: allow-listed processes, loopback ports and config file mtimes"
+        ));
+        assert!(
+            text.contains("metadata only - never file contents, environment values or secrets")
+        );
         assert!(text.contains("worker bootstrap  (macOS/Linux/Windows first device"));
         assert!(
             text.contains("worker connect <pairing-address> [--name NAME]  (macOS/Linux/Windows")

@@ -13,6 +13,47 @@ const SCHEMA_LOAD_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_SCHEMA_BYTES: usize = 8 * 1024 * 1024;
 
 static CACHE: OnceLock<Mutex<Option<CachedSchema>>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only schema source for this thread: `Some(None)` forces
+    /// "unavailable", `Some(Some(registry))` forces that registry, `None`
+    /// defers to the live cache. Thread-local so a test can prove a schema
+    /// path without depending on the process-level cache or on what a
+    /// concurrently running test happened to load (S5 review P1-3).
+    static TEST_REGISTRY: std::cell::RefCell<Option<Option<Arc<SchemaRegistry>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with a forced schema source on this thread, restoring after.
+#[cfg(test)]
+fn with_forced_test_schema<T>(forced: Option<Arc<SchemaRegistry>>, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_REGISTRY.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    TEST_REGISTRY.with(|slot| *slot.borrow_mut() = Some(forced));
+    let _reset = Reset;
+    f()
+}
+
+/// Run `f` with the live schema forced unavailable on this thread.
+#[cfg(test)]
+pub(crate) fn with_test_schema_unavailable<T>(f: impl FnOnce() -> T) -> T {
+    with_forced_test_schema(None, f)
+}
+
+/// Run `f` with `document` as this thread's schema source. Used by tests that
+/// must prove a delivery path without the shared cache answering for them.
+#[cfg(test)]
+pub(crate) fn with_test_schema_document<T>(document: Value, f: impl FnOnce() -> T) -> T {
+    let registry = registry_from_document(&document)
+        .unwrap_or_else(|error| panic!("test schema must parse: {error}"));
+    with_forced_test_schema(Some(Arc::new(registry)), f)
+}
+
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
@@ -62,6 +103,19 @@ pub fn list_methods(query: &str) -> Result<Vec<MethodSchema>, String> {
 pub fn validate_method_params(method: &str, params: &Value) -> Result<ValidationResult, String> {
     let registry = load_registry(false)?;
     Ok(validate_with_registry(&registry, method, params))
+}
+
+/// The live `agent.start` parameter properties, when the schema is available.
+/// Used by model-alias admission to decide whether a validated alias can be
+/// delivered at all (`model` property or `args` passthrough). `Err` means the
+/// schema could not be loaded; `Ok(None)` means the method is not represented.
+pub fn agent_start_param_properties() -> Result<Option<Map<String, Value>>, String> {
+    let registry = load_registry(false)?;
+    Ok(registry
+        .methods
+        .iter()
+        .find(|method| method.method == "agent.start")
+        .map(|method| method.properties.clone()))
 }
 
 /// Warm the live Herdr schema without delaying server startup.
@@ -300,6 +354,13 @@ fn value_type(value: &Value) -> &'static str {
 }
 
 fn load_registry(force: bool) -> Result<Arc<SchemaRegistry>, String> {
+    #[cfg(test)]
+    if let Some(forced) = TEST_REGISTRY.with(|slot| slot.borrow().clone()) {
+        return match forced {
+            Some(registry) => Ok(registry),
+            None => Err("herdr schema unavailable (test override)".to_owned()),
+        };
+    }
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache

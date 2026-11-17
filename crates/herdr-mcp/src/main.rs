@@ -43,6 +43,7 @@ mod link;
 mod linux_service_manager;
 mod local_agent_cli;
 mod local_agent_skill;
+mod local_diagnostics;
 mod local_skills;
 mod locale;
 mod macos_credential_helper;
@@ -51,6 +52,7 @@ mod macos_permissions;
 mod macos_privacy;
 mod mcp;
 mod mcp_http;
+mod model_alias;
 mod mutation;
 mod native_host;
 mod native_host_install;
@@ -60,6 +62,7 @@ mod native_host_log;
 #[cfg(any(unix, test))]
 mod native_host_origin_check;
 mod native_tools;
+mod observability;
 mod pane_width;
 mod patch;
 mod paths;
@@ -70,6 +73,7 @@ mod prompt;
 mod qualification;
 mod relay;
 mod release_trust;
+mod request_ledger;
 mod residue;
 mod runtime_adapter;
 mod runtime_meta;
@@ -189,8 +193,23 @@ fn run() -> Result<ExitCode, String> {
             status::print_status(&paths, &config, language, verbose);
             Ok(ExitCode::SUCCESS)
         }
-        cli::Command::Doctor { verbose, json } => {
+        cli::Command::Doctor {
+            verbose,
+            json,
+            local,
+        } => {
             let paths = paths::RuntimePaths::discover()?;
+            // 1.2 S7: a local diagnostic snapshot only needs the instance config
+            // directory, so it never depends on a readable/valid config file.
+            if local {
+                return Ok(
+                    if local_diagnostics::print_local_snapshot(&paths.config_dir) {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(2)
+                    },
+                );
+            }
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
             Ok(
                 if status::print_doctor(&paths, &config, language, verbose, json) {

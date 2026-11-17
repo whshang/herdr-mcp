@@ -1449,6 +1449,72 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn text_transfer_denies_credential_directories_and_aliases() {
+        use std::os::unix::fs::symlink;
+
+        // A neutral HOME name: the deny list matches path components, so a tag
+        // containing "credential" would deny every path in this test.
+        let home = Home::new("denylist");
+        let fence = fence();
+        for relative in [
+            ".ssh/credentials",
+            ".aws/credentials",
+            ".gnupg/secring.gpg",
+            ".kube/config",
+            ".docker/config.json",
+            ".azure/msal_token_cache.json",
+            ".password-store/work/mail.gpg",
+            ".config/gh/hosts.yml",
+            ".config/gcloud/application_default_credentials.json",
+        ] {
+            let secret = home.path(relative);
+            fs::create_dir_all(secret.parent().unwrap()).unwrap();
+            fs::write(&secret, "fixture-value\n").unwrap();
+            let read_result = read(&json!({"path": relative}));
+            assert_eq!(
+                read_result["code"], "secret_path_denied",
+                "{relative}: {read_result}"
+            );
+            assert!(
+                read_result.get("content").is_none(),
+                "{relative}: {read_result}"
+            );
+            let write_result = write_params(relative, "replacement\n", true, &fence);
+            assert_eq!(
+                write_result["code"], "secret_path_denied",
+                "{relative}: {write_result}"
+            );
+            assert_text(&secret, "fixture-value\n");
+        }
+
+        // A symlink alias, a case variant and a `..` spelling must not bypass
+        // the credential check on either the lexical or the canonical path.
+        symlink(home.path(".ssh"), home.path("alias-ssh")).unwrap();
+        for relative in [
+            ".SSH/credentials",
+            "project/../.aws/credentials",
+            "alias-ssh/credentials",
+        ] {
+            let read_result = read(&json!({"path": relative}));
+            assert_eq!(
+                read_result["code"], "secret_path_denied",
+                "{relative}: {read_result}"
+            );
+        }
+
+        // Unrelated configuration below HOME stays readable.
+        fs::create_dir_all(home.path(".config/herdr-mcp")).unwrap();
+        fs::write(
+            home.path(".config/herdr-mcp/config.json"),
+            "fixture-value\n",
+        )
+        .unwrap();
+        let allowed = read(&json!({"path": ".config/herdr-mcp/config.json"}));
+        assert_eq!(allowed["ok"], true, "{allowed}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn text_transfer_rejects_final_symlink_inside_home() {
         use std::os::unix::fs::symlink;
 

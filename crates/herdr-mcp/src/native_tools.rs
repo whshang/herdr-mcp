@@ -103,6 +103,19 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
         });
     }
 
+    // One admission, one fact: the alias is validated and rewritten before the
+    // live schema check (the rewrite is what the schema must validate), and the
+    // `model_validation` fact is carried to the success envelope. Admitting a
+    // second time here would see no `model` key left and silently drop the fact
+    // for the `args` passthrough form (S5 review P1-3).
+    let (params, model_fact) = if method == "agent.start" {
+        match admit_agent_start_model(params) {
+            Ok((params, fact)) => (params, fact),
+            Err(refusal) => return refusal,
+        }
+    } else {
+        (params, None)
+    };
     let validation = match schema::validate_method_params(method, &params) {
         Ok(validation) => validation,
         Err(error) => {
@@ -114,7 +127,6 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
             });
         }
     };
-
     if !validation.ok {
         return json!({
             "ok": false,
@@ -132,11 +144,15 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
                 .iter()
                 .map(issue_json)
                 .collect::<Vec<_>>();
-            if warnings.is_empty() {
+            let mut envelope = if warnings.is_empty() {
                 json!({"ok": true, "result": result})
             } else {
                 json!({"ok": true, "result": result, "warnings": warnings})
+            };
+            if let Some(fact) = model_fact {
+                envelope["model_validation"] = fact;
             }
+            envelope
         }
         Err(error) => json!({
             "ok": false,
@@ -145,6 +161,111 @@ pub fn call(client: &HerdrClient, method: &str, params: Value) -> Value {
             "method": method,
         }),
     }
+}
+
+/// Validate an explicit `model` alias on `agent.start` and translate it into
+/// a wire form the live herdr schema can carry. Returns the (possibly
+/// rewritten) params plus the `model_validation` fact for the success
+/// envelope, or a fail-closed refusal. No model key means unchanged params.
+fn admit_agent_start_model(mut params: Value) -> Result<(Value, Option<Value>), Value> {
+    let Some(alias) = params.get("model").and_then(Value::as_str) else {
+        return Ok((params, None));
+    };
+    let alias = alias.trim().to_owned();
+    let kind = params
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let check = crate::model_alias::validate_model_alias(&kind, &alias);
+    let fact = crate::model_alias::validation_fact(&kind, &alias, &check);
+    let crate::model_alias::ModelAliasCheck::Validated { ref canonical } = check else {
+        let mut refusal = crate::model_alias::model_alias_refusal(&kind, &alias, &check);
+        refusal["method"] = json!("agent.start");
+        return Err(refusal);
+    };
+    // The live schema decides how the validated canonical form is delivered.
+    // A native `model` property passes it through; otherwise the `args`
+    // passthrough carries `--model <canonical>` (pi's documented flag).
+    // Neither means the alias cannot be delivered provably: refuse instead of
+    // dropping it.
+    let properties = match schema::agent_start_param_properties() {
+        Ok(Some(properties)) => properties,
+        Ok(None) => {
+            return Err(model_delivery_unsupported(
+                &kind,
+                &alias,
+                &fact,
+                "agent.start is not represented in the live herdr schema",
+            ));
+        }
+        Err(error) => {
+            return Err(model_delivery_unsupported(
+                &kind,
+                &alias,
+                &fact,
+                &format!("live herdr schema unavailable: {error}"),
+            ));
+        }
+    };
+    if properties.contains_key("model") {
+        params["model"] = json!(canonical);
+        return Ok((params, Some(fact)));
+    }
+    if properties.contains_key("args") {
+        if kind != "pi" {
+            return Err(model_delivery_unsupported(
+                &kind,
+                &alias,
+                &fact,
+                "only pi has a documented --model passthrough",
+            ));
+        }
+        let existing_args = params.get("args").and_then(Value::as_array);
+        if existing_args.is_some_and(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .any(|arg| arg == "--model" || arg.starts_with("--model="))
+        }) {
+            let mut refusal = crate::model_alias::model_alias_refusal(&kind, &alias, &check);
+            refusal["method"] = json!("agent.start");
+            refusal["code"] = json!("invalid_params");
+            refusal["message"] = json!(
+                "agent.start args already carry --model; pass the model only via the model field"
+            );
+            return Err(refusal);
+        }
+        let mut args: Vec<Value> = existing_args.cloned().unwrap_or_default();
+        args.push(json!("--model"));
+        args.push(json!(canonical));
+        params["args"] = Value::Array(args);
+        if let Some(object) = params.as_object_mut() {
+            object.remove("model");
+        }
+        return Ok((params, Some(fact)));
+    }
+    Err(model_delivery_unsupported(
+        &kind,
+        &alias,
+        &fact,
+        "the live herdr agent.start schema declares neither model nor args",
+    ))
+}
+
+fn model_delivery_unsupported(kind: &str, alias: &str, fact: &Value, reason: &str) -> Value {
+    json!({
+        "ok": false,
+        "code": "model_delivery_unsupported",
+        "method": "agent.start",
+        "kind": kind,
+        "requested_model": alias,
+        "delivery_state": "not_delivered",
+        "submitted": false,
+        "fallback_allowed": false,
+        "retryable": false,
+        "model_validation": fact,
+        "message": format!("validated model alias '{alias}' cannot be delivered to agent.start: {reason}; the model was not silently dropped"),
+    })
 }
 
 pub fn call_with_local(
@@ -776,5 +897,79 @@ mod tests {
                 None => std::env::remove_var("HERDR_MCP_RUNTIME_GENERATION"),
             }
         }
+    }
+
+    /// 1.2 S5: an explicit model on agent.start for a kind without an
+    /// obtainable list is refused before any socket contact, with
+    /// validated:false and no fallback.
+    #[test]
+    fn agent_start_model_without_obtainable_list_fails_closed() {
+        let client = HerdrClient::new("/path/that/does/not/exist");
+        let result = call(
+            &client,
+            "agent.start",
+            json!({"name": "a", "kind": "claude", "pane_id": "w1:p1", "model": "some-model"}),
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "model_alias_unknown");
+        assert_eq!(result["delivery_state"], "not_delivered");
+        assert_eq!(result["submitted"], false);
+        assert_eq!(result["fallback_allowed"], false);
+        assert_eq!(result["model_validation"]["validated"], false);
+        assert_eq!(result["available_models"], json!([]));
+    }
+
+    /// 1.2 S5: an unknown pi alias is refused with the obtainable list, taken
+    /// from `pi --list-models` (S5 review P1-1), not the provider cache.
+    #[test]
+    #[cfg(unix)]
+    fn agent_start_unknown_pi_alias_reports_available_models() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HERDR_PI_BIN");
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-native-model-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("pi");
+        fs::write(
+            &bin,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\necho 'provider model'\necho 'openai gpt-4'\nelse\nexit 1\nfi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe { std::env::set_var("HERDR_PI_BIN", &bin) };
+        let client = HerdrClient::new("/path/that/does/not/exist");
+        let result = call(
+            &client,
+            "agent.start",
+            json!({"name": "a", "kind": "pi", "pane_id": "w1:p1", "model": "openai/gpt-99"}),
+        );
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "model_alias_unknown");
+        assert_eq!(result["model_validation"]["validated"], false);
+        assert_eq!(result["available_models"], json!(["openai/gpt-4"]));
+        assert_eq!(result["delivery_state"], "not_delivered");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 1.2 S5: no model key means the params pass through unchanged.
+    #[test]
+    fn agent_start_without_model_is_unchanged() {
+        let params = json!({"name": "a", "kind": "pi", "pane_id": "w1:p1"});
+        let (out, fact) = admit_agent_start_model(params.clone()).unwrap();
+        assert_eq!(out, params);
+        assert!(fact.is_none());
     }
 }

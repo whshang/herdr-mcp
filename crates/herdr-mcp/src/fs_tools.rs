@@ -1702,6 +1702,30 @@ mod tests {
 
         let secret_result = read(&snapshot, &json!({"path": root.join(".env")}));
         assert_eq!(secret_result["reason"], "secret_path_denied");
+
+        // Credential *directories* are denied as whole subtrees, not only their
+        // secret-looking files (#938): a read is refused and a listing/grep must
+        // not disclose the credential file names either.
+        fs::create_dir_all(root.join(".ssh")).unwrap();
+        fs::write(root.join(".ssh/config"), "Host example\n").unwrap();
+        fs::create_dir_all(root.join(".config/gh")).unwrap();
+        fs::write(root.join(".config/gh/hosts.yml"), "github.com:\n").unwrap();
+        for relative in [".ssh/config", ".config/gh/hosts.yml"] {
+            let denied = read(&snapshot, &json!({"path": root.join(relative)}));
+            assert_eq!(denied["ok"], false, "{relative}: {denied}");
+            assert_eq!(
+                denied["reason"], "secret_path_denied",
+                "{relative}: {denied}"
+            );
+        }
+        let listed = list(&snapshot, &json!({"path": root, "recursive": true}));
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert!(
+            !listed.to_string().contains(".ssh") && !listed.to_string().contains("hosts.yml"),
+            "credential directories must not be listed: {listed}"
+        );
+        let grepped = grep(&snapshot, &json!({"root": root, "pattern": "Host"}));
+        assert_eq!(grepped["count"], 0, "{grepped}");
         fs::remove_dir_all(root).unwrap();
     }
 

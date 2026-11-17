@@ -4,19 +4,19 @@ import { HerdrLink } from "./client.js";
 import { RuntimeControlLoop } from "./runtime-control.js";
 import { RuntimeGenerationManager } from "./runtime-generation.js";
 
-/// Current runtime execution contract epoch 5, shaped from the frozen epoch-2
-/// catalog by `contracts/runtime-exec-v5.json`. Must stay equal to
+/// Current runtime execution contract epoch 6, shaped from the frozen epoch-2
+/// catalog by `contracts/runtime-exec-v6.json`. Must stay equal to
 /// `LOCAL_MCP_CONTRACT_EPOCH` (mirrors the Rust `PUBLIC_CONTRACT_EPOCH` /
 /// `LOCAL_MCP_CONTRACT_EPOCH` pairing).
-export const PUBLIC_CONTRACT_EPOCH = 5;
+export const PUBLIC_CONTRACT_EPOCH = 6;
 export const PUBLIC_CONTRACT_HASH =
-  "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030";
-/// Previous runtime execution contract epoch 4 (neutral `herdr_exec`
-/// metadata). Only the Edge/Relay acceptance window uses it; the current
-/// daemon stays strict.
-export const PREVIOUS_PUBLIC_CONTRACT_EPOCH = 4;
+  "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e";
+/// Previous runtime execution contract epoch 5 (`herdr_exec` opt-in
+/// idempotency metadata). Only the Edge/Relay acceptance window uses it; the
+/// current daemon stays strict.
+export const PREVIOUS_PUBLIC_CONTRACT_EPOCH = 5;
 export const PREVIOUS_PUBLIC_CONTRACT_HASH =
-  "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135";
+  "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030";
 /**
  * Frozen epoch-1 rollback baseline. Edge/Relay keep accepting it during a
  * rollout window, but this build only *runs* the current runtime execution
