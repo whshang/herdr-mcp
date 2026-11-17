@@ -1295,6 +1295,7 @@ fn connect_existing_worker(
         activate_connected_runtime_after_pairing,
         |_paths| crate::windows_service_manager::reconcile_link(),
         consume_pairing,
+        false,
     )
 }
 
@@ -1328,6 +1329,7 @@ fn connect_existing_worker(
                 activate_connected_runtime_after_pairing,
                 |_paths| crate::linux_service_manager::reconcile_link(),
                 consume_pairing,
+                false,
             )
         },
     )
@@ -1363,6 +1365,7 @@ fn connect_existing_worker(
                 activate_connected_runtime_after_pairing,
                 crate::link::reconcile_after_service_generation_change,
                 consume_pairing,
+                false,
             )
         },
     )
@@ -1439,6 +1442,61 @@ where
     connect_new(paths, &edge_origin, &pairing_id, &code, name)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn stored_bootstrap_credential(
+    paths: &RuntimePaths,
+    expected_origin: &str,
+    expected_device: &str,
+) -> Result<EnrolledCredential, String> {
+    let config = Config::load_for_instance(&paths.config_file, &paths.instance)?;
+    if config
+        .edge_public_origin
+        .as_deref()
+        .map(normalize_edge_origin)
+        .transpose()?
+        != Some(normalize_edge_origin(expected_origin)?)
+        || config.edge_device_id.as_deref() != Some(expected_device)
+    {
+        return Err("bootstrap journal does not match the local device and origin".to_owned());
+    }
+    let device_id = crate::config::normalize_device_id(expected_device)?;
+    let account = current_account()?;
+    let service = format!("herdr-edge-link-{device_id}");
+    let device_secret = crate::credential_store::load(&service, &account).map_err(|_| {
+        "bootstrap device credential is unavailable; refusing enrollment or activation".to_owned()
+    })?;
+    validate_device_secret(&device_secret)?;
+    Ok(EnrolledCredential {
+        workstation_id: device_id.clone(),
+        device_id,
+        device_secret,
+        recovered_existing: false,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn resume_bootstrap_activation(
+    paths: &RuntimePaths,
+    device_id: &str,
+) -> Result<(), String> {
+    let service = format!("herdr-edge-link-{device_id}");
+    activate_connected_runtime_after_pairing(paths, false, device_id, &service)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn stored_bootstrap_credential(
+    _: &RuntimePaths,
+    _: &str,
+    _: &str,
+) -> Result<EnrolledCredential, String> {
+    Err("bootstrap recovery is unsupported on this platform".to_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub(crate) fn resume_bootstrap_activation(_: &RuntimePaths, _: &str) -> Result<(), String> {
+    Err("bootstrap recovery is unsupported on this platform".to_owned())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn adopt_bootstrap_enrollment(
     paths: &RuntimePaths,
@@ -1459,6 +1517,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         activate_connected_runtime_after_pairing,
         |_paths| crate::linux_service_manager::reconcile_link(),
         move |_, _, _, _| Ok(enrolled.clone()),
+        true,
     )
 }
 
@@ -1482,6 +1541,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         activate_connected_runtime_after_pairing,
         |_paths| crate::windows_service_manager::reconcile_link(),
         move |_, _, _, _| Ok(enrolled.clone()),
+        true,
     )
 }
 
@@ -1505,6 +1565,7 @@ pub(crate) fn adopt_bootstrap_enrollment(
         activate_connected_runtime_after_pairing,
         crate::link::reconcile_after_service_generation_change,
         move |_, _, _, _| Ok(enrolled.clone()),
+        true,
     )
 }
 
@@ -3021,6 +3082,7 @@ fn connect_macos_inner<F, G, H, I, J, K, L, M>(
     activate: K,
     reconcile_restore: L,
     consume: M,
+    preserve_bootstrap_binding: bool,
 ) -> Result<ExitCode, String>
 where
     F: Fn(&str, &str, &str) -> Result<(), String>,
@@ -3178,6 +3240,11 @@ where
     }
 
     if let Err(error) = activate(paths, recovered_existing, &device_id, &keychain_service) {
+        if preserve_bootstrap_binding {
+            return Err(format!(
+                "first-Worker device {device_id} was persisted, but local activation failed: {error}; credential and config were preserved; retry worker bootstrap on this device"
+            ));
+        }
         if recovered_existing {
             return Err(format!(
                 "existing device {device_id} credential recovery was persisted, but the local runtime could not be activated: {error}; the device was not revoked and the recovered credential/config were preserved for repair"
@@ -5204,6 +5271,74 @@ mod tests {
     }
 
     #[test]
+    fn first_bootstrap_activation_failure_preserves_new_binding() {
+        use std::cell::RefCell;
+        const DEVICE: &str = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        const SECRET: &str =
+            "devsec_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let dir = env::temp_dir().join(format!(
+            "herdr-bootstrap-preserve-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let paths = RuntimePaths {
+            config_dir: dir.clone(),
+            config_file: dir.join("config.json"),
+            dev_state_dir: dir.join("dev"),
+            herdr_socket: None,
+            instance: InstanceId::default_instance(),
+        };
+        let previous = Config {
+            edge_public_origin: Some("https://old.example".into()),
+            ..Config::default()
+        };
+        let written = RefCell::new(None::<Config>);
+        let stored = RefCell::new(None::<String>);
+        let error = connect_macos_inner(
+            &paths,
+            "https://edge.example",
+            "bootstrap-enrollment",
+            "000000",
+            None,
+            |_, _, secret| {
+                *stored.borrow_mut() = Some(secret.to_owned());
+                Ok(())
+            },
+            |_, _| Ok(previous.clone()),
+            |_, config| {
+                *written.borrow_mut() = Some(config.clone());
+                Ok(())
+            },
+            |_, _, _| panic!("bootstrap must not revoke after activation failure"),
+            |_, _| panic!("bootstrap must not delete credential"),
+            |_, _, _, _| Err("access denied".into()),
+            |_| panic!("bootstrap must not restore previous Link"),
+            |_, _, _, _| {
+                Ok(EnrolledCredential {
+                    device_id: DEVICE.into(),
+                    workstation_id: DEVICE.into(),
+                    device_secret: SECRET.into(),
+                    recovered_existing: false,
+                })
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("access denied"));
+        assert!(!error.contains(SECRET));
+        assert_eq!(stored.borrow().as_deref(), Some(SECRET));
+        let binding = written.borrow();
+        let binding = binding.as_ref().unwrap();
+        assert_eq!(binding.edge_device_id.as_deref(), Some(DEVICE));
+        assert_eq!(
+            binding.edge_public_origin.as_deref(),
+            Some("https://edge.example")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn connect_macos_inner_rolls_back_whole_transaction_on_reconcile_failure() {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -5320,6 +5455,7 @@ mod tests {
             activate,
             reconcile,
             consume,
+            false,
         );
 
         // The transaction must fail closed with rollback evidence.
@@ -5425,6 +5561,7 @@ mod tests {
             activate,
             reconcile,
             consume,
+            false,
         )
         .unwrap_err();
 
@@ -5526,6 +5663,7 @@ mod tests {
             activate,
             reconcile,
             consume,
+            false,
         )
         .unwrap_err();
 
@@ -5618,6 +5756,7 @@ mod tests {
             activate,
             reconcile,
             consume,
+            false,
         );
 
         assert!(result.is_ok());

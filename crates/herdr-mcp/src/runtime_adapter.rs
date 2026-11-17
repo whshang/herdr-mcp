@@ -2057,15 +2057,26 @@ fn public_tool_route_for_selection(
         RuntimeBackend::HerdrCore => {
             // These routes lack the TUI's access and mutation policies and result contract.
             // Reject before even negotiating with hc, regardless of its capabilities.
-            if CORE_POLICY_RESTRICTED_PUBLIC_TOOLS.contains(&tool_name) {
-                return Err(herdr_core_unsupported(
-                    tool_name,
-                    "public_tool_policy_parity",
-                    "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
-                ));
-            }
-            if tool_name == "herdr_prompt" {
-                return Err(herdr_core_prompt_refusal());
+            // Phase 2 slice 1: the pre-connect refusals come from the single
+            // route table, never from ad-hoc membership tests.
+            match core_public_route(tool_name) {
+                Some(CorePublicRoute {
+                    kind: CorePublicRouteKind::PolicyBlockedParity,
+                    ..
+                }) => {
+                    return Err(herdr_core_unsupported(
+                        tool_name,
+                        "public_tool_policy_parity",
+                        "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
+                    ));
+                }
+                Some(CorePublicRoute {
+                    kind: CorePublicRouteKind::PromptTrackingUnsupported,
+                    ..
+                }) => {
+                    return Err(herdr_core_prompt_refusal());
+                }
+                _ => {}
             }
             let Some(socket_path) = selection.herdr_core_socket.as_deref() else {
                 return Err(json!({
@@ -2115,14 +2126,20 @@ fn public_tool_route_for_selection(
             // #936: an advertised `terminal.run` is necessary but never
             // sufficient for the `herdr_exec_*` session contract; see
             // `EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS`.
-            if EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS.contains(&tool_name) {
+            if matches!(
+                core_public_route(tool_name).map(|route| route.kind),
+                Some(CorePublicRouteKind::SessionOwnershipUnsupported)
+            ) {
                 return Err(herdr_core_exec_session_unsupported(tool_name));
             }
             // A capability name in `hello` is necessary, never sufficient: the
             // in-process implementation of these tools still reads the live TUI
             // snapshot/socket, so admitting them would silently run on the TUI
             // runtime the operator did not select (#922).
-            if TUI_ROUTED_PUBLIC_TOOLS.contains(&tool_name) {
+            if matches!(
+                core_public_route(tool_name).map(|route| route.kind),
+                Some(CorePublicRouteKind::TuiRouted)
+            ) {
                 return Err(json!({
                     "ok": false,
                     "code": "runtime_capability_unsupported",
@@ -2148,15 +2165,6 @@ fn public_tool_route_for_selection(
 /// These six have no `hc` primitive at all (no listing, search, image, patch,
 /// git or event-cursor surface), so `herdr-core` keeps failing them closed with
 /// `runtime_capability_unsupported` (#935).
-const TUI_ROUTED_PUBLIC_TOOLS: &[&str] = &[
-    "herdr_fs_list",
-    "herdr_fs_grep",
-    "herdr_fs_image",
-    "herdr_fs_patch",
-    "herdr_git",
-    "herdr_since",
-];
-
 /// Public tools whose `herdr-core` semantics cannot be preserved safely (#936).
 ///
 /// `hc terminal.run` creates a pty terminal (`t7`, a name, or `machine/t7`) in a
@@ -2172,21 +2180,106 @@ const TUI_ROUTED_PUBLIC_TOOLS: &[&str] = &[
 /// All three fail closed instead of inventing an identity that `hc`
 /// does not provide. One-shot `herdr_exec` is separately blocked until its
 /// public access and mutation policy can be enforced.
-const CORE_POLICY_RESTRICTED_PUBLIC_TOOLS: &[&str] = &[
-    "herdr_fs_read",
-    "herdr_fs_write",
-    "herdr_fs_edit",
-    "herdr_exec",
-];
-const EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS: &[&str] =
-    &["herdr_exec_start", "herdr_exec_read", "herdr_exec_kill"];
+/// Phase 2 slice 1 (#768 / #950): the complete `herdr-core` public route table
+/// for the frozen 18-tool catalog.
+///
+/// Exactly three read-only tools are servable on Core; every other tool is
+/// enumerated here with the reason it stays closed, so a new tool can never
+/// become servable by falling through a lookup. The refusal reason and the
+/// mutation attribute are deliberately separate fields: a read-only tool can be
+/// refused (for now) without being classified as mutating, and a mutating tool
+/// can be TUI-routed without changing the capability projected by the existing
+/// admission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorePublicRouteKind {
+    /// Served by the same admitted Core client; read-only.
+    ServableReadOnly,
+    /// Access/mutation policy parity cannot be proven on Core (#936).
+    PolicyBlockedParity,
+    /// `herdr_prompt` task tracking and identity cannot be preserved.
+    PromptTrackingUnsupported,
+    /// `hc` terminals have no runtime-owned session identity, cursor or cleanup.
+    SessionOwnershipUnsupported,
+    /// Implemented on the TUI snapshot/socket only (list/grep/image/patch/git/since).
+    TuiRouted,
+    /// Local skill documents: refused by the local-method gate in `mcp.rs`.
+    LocalMethodUnsupported,
+}
 
+/// One classified Core route: the refusal reason plus whether the TUI
+/// implementation can mutate state. `requires_root_lease()` is true only for
+/// routes that really mutate, so slice 4's future read-only file route is not
+/// pre-classified as a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorePublicRoute {
+    pub kind: CorePublicRouteKind,
+    mutates: bool,
+}
+
+impl CorePublicRoute {
+    const fn new(kind: CorePublicRouteKind, mutates: bool) -> Self {
+        Self { kind, mutates }
+    }
+
+    /// Whether the TUI implementation of this tool can mutate state. Used by
+    /// the slice-1 invariant test; there is no production gate here (the
+    /// existing admission order still produces every refusal envelope).
+    #[cfg(test)]
+    pub const fn mutates(self) -> bool {
+        self.mutates
+    }
+
+    /// Routes that would need a Core-side root lease before executing. Only
+    /// genuinely mutating routes; today every such route is refused, so this is
+    /// a documented precondition, not an implemented gate.
+    #[cfg(test)]
+    pub const fn requires_root_lease(self) -> bool {
+        self.mutates
+    }
+}
+
+/// Classify one public tool for the `herdr-core` backend. `None` means the name
+/// is outside the frozen catalog, so no Core route is claimed for it.
+pub fn core_public_route(tool_name: &str) -> Option<CorePublicRoute> {
+    use CorePublicRouteKind as Kind;
+    let (kind, mutates) = match tool_name {
+        // Servable: same admitted client, read-only.
+        "herdr_methods" | "herdr_inspect" | "herdr_call" => (Kind::ServableReadOnly, false),
+        // Access/mutation policy parity is missing (#936). `fs_read` is
+        // read-only; it is refused for now because Core cannot couple the
+        // authorization to the object it actually opens (design slice 4).
+        "herdr_fs_read" => (Kind::PolicyBlockedParity, false),
+        "herdr_fs_write" | "herdr_fs_edit" | "herdr_exec" => (Kind::PolicyBlockedParity, true),
+        "herdr_prompt" => (Kind::PromptTrackingUnsupported, true),
+        "herdr_exec_start" | "herdr_exec_kill" => (Kind::SessionOwnershipUnsupported, true),
+        "herdr_exec_read" => (Kind::SessionOwnershipUnsupported, false),
+        // TUI snapshot/socket only. `fs_patch` and `git` can mutate; the other
+        // four are read-only.
+        "herdr_fs_list" | "herdr_fs_grep" | "herdr_fs_image" | "herdr_since" => {
+            (Kind::TuiRouted, false)
+        }
+        "herdr_fs_patch" | "herdr_git" => (Kind::TuiRouted, true),
+        "herdr_skill" => (Kind::LocalMethodUnsupported, false),
+        _ => return None,
+    };
+    Some(CorePublicRoute::new(kind, mutates))
+}
+
+/// Tools whose twenty-tool catalog projection is refused on `herdr-core`,
+/// derived from the single route table so the two can never drift.
 fn herdr_core_policy_blocked_tools() -> Vec<&'static str> {
-    CORE_POLICY_RESTRICTED_PUBLIC_TOOLS
-        .iter()
-        .chain(EXEC_SESSION_UNSUPPORTED_PUBLIC_TOOLS.iter())
-        .copied()
-        .chain(std::iter::once("herdr_prompt"))
+    crate::contract::tool_names()
+        .into_iter()
+        .filter(|tool| {
+            core_public_route(tool).is_some_and(|route| {
+                matches!(
+                    route.kind,
+                    CorePublicRouteKind::PolicyBlockedParity
+                        | CorePublicRouteKind::PromptTrackingUnsupported
+                        | CorePublicRouteKind::SessionOwnershipUnsupported
+                )
+            })
+        })
         .collect()
 }
 
@@ -5177,5 +5270,69 @@ mod tests {
             assert_eq!(refused.code, "herdr_core_framed_unsupported");
             server.finish();
         }
+    }
+    /// #768 Phase 2 slice 1: the route table is total over the frozen catalog,
+    /// servable only for the three read-only tools, and the mutation attribute is
+    /// independent of the refusal reason (a read-only tool may be refused without
+    /// being classified as mutating). Nothing here adds a gate: the existing
+    /// admission order still produces every envelope.
+    #[test]
+    fn core_public_route_table_is_total_and_never_serves_a_mutating_tool() {
+        let catalog = crate::contract::tool_names();
+        assert_eq!(catalog.len(), 18, "frozen catalog size");
+        let mut servable = Vec::new();
+        for tool in &catalog {
+            let route = core_public_route(tool).unwrap_or_else(|| {
+                panic!("frozen tool {tool} has no herdr-core route classification")
+            });
+            if route.kind == CorePublicRouteKind::ServableReadOnly {
+                servable.push(*tool);
+            }
+            if route.requires_root_lease() {
+                assert!(
+                    route.mutates(),
+                    "{tool}: requires_root_lease implies mutates"
+                );
+                assert_ne!(
+                    route.kind,
+                    CorePublicRouteKind::ServableReadOnly,
+                    "a mutating tool must never be servable on herdr-core: {tool}"
+                );
+            }
+        }
+        servable.sort_unstable();
+        assert_eq!(
+            servable,
+            vec!["herdr_call", "herdr_inspect", "herdr_methods"],
+            "only the three read-only Core routes are servable"
+        );
+        // Read-only refusals stay read-only: the future slice-4 file read is not
+        // pre-classified as a write, and TUI-routed read tools are not either.
+        for tool in [
+            "herdr_fs_read",
+            "herdr_fs_list",
+            "herdr_fs_grep",
+            "herdr_fs_image",
+            "herdr_since",
+            "herdr_skill",
+        ] {
+            let route = core_public_route(tool).unwrap();
+            assert!(!route.mutates(), "{tool} must not be classified mutating");
+            assert!(!route.requires_root_lease(), "{tool}");
+        }
+        for tool in [
+            "herdr_fs_write",
+            "herdr_fs_edit",
+            "herdr_exec",
+            "herdr_fs_patch",
+            "herdr_git",
+        ] {
+            assert!(
+                core_public_route(tool).unwrap().requires_root_lease(),
+                "{tool} mutates and needs the root-lease precondition"
+            );
+        }
+        // Outside the catalog no Core route is claimed, so nothing falls through.
+        assert!(core_public_route("herdr_unknown").is_none());
     }
 }

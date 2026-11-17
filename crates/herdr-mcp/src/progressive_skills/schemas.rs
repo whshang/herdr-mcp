@@ -149,6 +149,8 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                             "split_from": {"type": "string", "maxLength": 256, "description": "Optional parent pane id for pane.split. Without it the pane is created as a new tab so the agent gets the full tab width. A horizontal split still respects the readable-width floor and fails with pane_split_too_narrow."},
                             "direction": {"type": "string", "enum": ["right", "down"], "description": "Split direction; requires split_from and defaults to right."},
                             "startup_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Budget for the WHOLE one-call chain (pane create + agent.start + readiness + prompt submission), not just readiness. Defaults to 25000 so it fits a WebChat herdr_call without timeout_ms (Edge cuts at 30s; the link never exceeds 60s); the local CLI waits chain + 10s and never exceeds 120s. Every step gets only what is left, and a chain that cannot reach the prompt pauses in a resumable checkpoint instead of holding an in-flight key."}
+                            ,
+                            "model": {"type": "string", "maxLength": 256, "description": "Optional model alias (provider/id, bare id, optional :thinking). Validated against the kind's obtainable model list before any mutation; unknown aliases and kinds without a list fail with model_alias_unknown (validated:false) and no fallback. Delivered via the agent's documented model flag; a live schema that cannot carry it fails with model_delivery_unsupported."}
                         },
                         "required": ["kind"],
                     },
@@ -163,6 +165,8 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "parent_target": {"type": "string", "maxLength": 256},
                     "idempotency_key": {"type": "string", "maxLength": 256},
                     "stall_after_ms": {"type": "integer", "minimum": 60000, "maximum": 7200000, "description": "Liveness stall threshold; defaults to 20 minutes. Stalled is non-terminal and never redispatched automatically."},
+                    "max_runtime_ms": {"type": "integer", "minimum": 60000, "maximum": 86400000, "description": "Optional wall-clock run cap from task creation. Expiry emits agent_budget_exceeded to the parent (notify-only by default; on_budget interrupt sends one explicit C-c). Never terminates the task; recorded once in task.budget_events."},
+                    "on_budget": {"type": "string", "enum": ["notify", "interrupt"], "description": "Budget expiry action; requires max_runtime_ms or stall_after_ms. Default notify. interrupt additionally sends one C-c to the task's own working pane."},
                     "inject_task_identity": {
                         "type": "boolean",
                         "default": false,

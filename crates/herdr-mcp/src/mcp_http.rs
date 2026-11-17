@@ -5097,6 +5097,127 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// #768 Phase 2 slice 1: a caller-held root mutation lease never changes a
+    /// `herdr-core` refusal. The refusal comes from the existing admission order
+    /// (backend fence → policy → socket/target → capability → session/TUI
+    /// route) and the route table, so neither the lease nor `hello.methods` can
+    /// widen it and no request byte reaches Core.
+    #[cfg(unix)]
+    #[test]
+    fn herdr_core_mutation_routes_ignore_a_held_root_lease() {
+        use crate::state_store::mutation_leases::MutationLeaseAcquireInput;
+
+        let _guard = crate::test_env::lock();
+        let root = test_root("herdr-core-lease-bypass");
+        let project = root.join("project");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let core_socket = std::path::PathBuf::from(format!(
+            "/tmp/herdr-lease-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let recorded = spawn_recording_core_fixture(&core_socket, None);
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let store = state.state_store.clone();
+        let app = candidate_router(state);
+        // Hold a real root mutation lease (`lane_key = "*"`) on the project.
+        {
+            let mut store = store.lock().unwrap();
+            store
+                .acquire_mutation_lease(MutationLeaseAcquireInput {
+                    project_root: &project.to_string_lossy(),
+                    lane_key: Some("*"),
+                    holder_id: "caller-holder",
+                    lease_token: None,
+                    ttl_seconds: Some(600),
+                    workspace_id: None,
+                    pane_id: None,
+                    branch: None,
+                    now_ms: 1_000,
+                })
+                .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (tool, arguments) in [
+                ("herdr_fs_write", json!({"path": project.join("a.txt").to_string_lossy(), "content": "x"})),
+                ("herdr_fs_edit", json!({"path": project.join("a.txt").to_string_lossy(), "old_string": "a", "new_string": "b"})),
+                ("herdr_fs_patch", json!({"path": project.join("a.txt").to_string_lossy(), "patch": "x"})),
+                ("herdr_exec", json!({"root": project.to_string_lossy(), "command": "true", "steps": []})),
+                ("herdr_exec_start", json!({"root": project.to_string_lossy(), "command": "true"})),
+            ] {
+                let result = call_public_tool(&app, tool, arguments).await;
+                assert_eq!(result["ok"], false, "{tool}: {result}");
+                assert_eq!(result["fallback_allowed"], false, "{tool}: {result}");
+                assert_eq!(result["delivery_state"], "not_delivered", "{tool}: {result}");
+                // The existing admission order (backend fence → policy →
+                // socket/target → capability → session/TUI) supplies the code;
+                // a held lease must not rewrite it.
+                if matches!(tool, "herdr_fs_write" | "herdr_fs_edit" | "herdr_exec") {
+                    assert_eq!(
+                        result["required_capability"], "public_tool_policy_parity",
+                        "{tool}: {result}"
+                    );
+                }
+            }
+            for method in ["file.write", "file.edit", "machine.exec"] {
+                let result = call_public_tool(
+                    &app,
+                    "herdr_call",
+                    json!({"method": method, "params": {"path": project.join("a.txt").to_string_lossy()}}),
+                )
+                .await;
+                assert_eq!(
+                    result["code"], "herdr_core_method_prohibited",
+                    "{method}: {result}"
+                );
+                assert_eq!(result["fallback_allowed"], false, "{method}: {result}");
+            }
+        });
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "a held lease must not let a mutation route reach herdr-core"
+        );
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_file(&core_socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
     // A real OS child serves the Core protocol; separate launches have
     // distinct kernel peer PIDs even when the socket path is reused.
     #[cfg(unix)]
@@ -10245,6 +10366,10 @@ mod tests {
             }),
         );
         state.trusted_extension_ipc = true;
+        // The scripted herdr fake answers one fixed sequence regardless of
+        // method; without this the S5 early-exit probe would eat the scripted
+        // agent.prompt reply.
+        state.prompt.disable_spawn_early_exit_watch();
         let app = candidate_router(state);
         let (app, seed, endpoint, account) = register_chatgpt_endpoint(app, "spawnbind", now).await;
         let user_text = "把这条任务派给一个新的 pi";
@@ -10282,6 +10407,10 @@ mod tests {
                 json!([{"endpoint_ref": endpoint, "provider": "chatgpt"}]).to_string(),
             ),
         ];
+        // The scripted herdr fake answers exactly tab.create/agent.start/
+        // agent.prompt; the S5 post-readiness early-exit watch was disabled on
+        // this registry above, so it adds no unscripted agent.get probe that
+        // would consume the scripted prompt reply.
         let result = webchat_tool_call(
             app,
             &headers,
