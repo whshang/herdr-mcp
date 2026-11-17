@@ -24,10 +24,10 @@ The required gates are:
 ## 1.2 Node Link and Server retirement
 
 Starting with 1.2, the production Node Link and Node Server are retired. The
-retired source surfaces `src/server.ts`, `src/link/**`, `src/relay/**`, and
-`bin/herdr-link` were removed in N2 PR-b together with their Node-only tests.
-Within the legacy Node runtime surface, only `bin/herdr-extension-host` remains
-retained.
+retired source surfaces are `src/server.ts`, `src/link/**`, `src/relay/**`, and
+`bin/herdr-link`; PR-a records the boundary and ports the Node-only assertions,
+while PR-b and PR-c remove the source and compatibility entrypoints. Within the
+legacy Node runtime surface, only `bin/herdr-extension-host` remains retained.
 Rust keeps the recognition and cleanup state machine for historical Node
 production plists and `ServiceRollbackRecord` entries so old installation state
 can be handled safely.
