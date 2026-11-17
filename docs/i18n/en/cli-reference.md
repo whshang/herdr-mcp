@@ -119,7 +119,7 @@ Static evidence is kept in a bounded capability inventory under the herdr-mcp co
 
 ### Dynamic planning advice for the Web planner
 
-The current workstation Runtime Execution Contract is epoch 5 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 8 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+The current workstation Runtime Execution Contract is epoch 6 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 8 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
 
 ```text
 herdr_call(
@@ -211,11 +211,11 @@ A local HTTP `200` or `401` proves that the runtime is listening. A connection e
 
 ## Watchdog
 
-On macOS the service install manages the periodic `dev.herdr-mcp.health-watchdog` LaunchAgent, which runs `watchdog.sh` from the release checkout. Manual control:
+macOS also supports an opt-in periodic health watchdog: the `dev.herdr-mcp.health-watchdog` LaunchAgent. `service install` does not install it; it is managed only by the `bin/watchdog.sh` helper in a source checkout (release binaries ship no such script) and by `service status`/`service uninstall`, which report and clean it up. `install` copies the script into `~/.config/herdr-mcp/health-watchdog.sh` and points the LaunchAgent at that managed path, never at a checkout:
 
 ```bash
-bin/watchdog.sh status      # one-shot health probe + state file
-bin/watchdog.sh once        # probe once without launchd
+bin/watchdog.sh once        # run one /health probe now + update state file
+bin/watchdog.sh status      # read the saved state file; no new probe
 bin/watchdog.sh install     # install/reload the LaunchAgent
 bin/watchdog.sh uninstall   # unload and remove the LaunchAgent
 ```

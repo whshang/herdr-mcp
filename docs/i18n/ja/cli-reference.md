@@ -211,11 +211,11 @@ tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link (macOS
 
 ## Watchdog
 
-macOS では service install が周期的な `dev.herdr-mcp.health-watchdog` LaunchAgent を管理し、release checkout の `watchdog.sh` を実行します。手動制御:
+macOS には opt-in の周期的 health watchdog として `dev.herdr-mcp.health-watchdog` LaunchAgent もあります。`service install` はこれをインストールしません。管理するのはソース checkout の `bin/watchdog.sh` だけ（release バイナリには同梱されません）で、`service status` / `service uninstall` は報告とクリーンアップだけを行います。`install` はスクリプトを `~/.config/herdr-mcp/health-watchdog.sh` にコピーし、LaunchAgent はその管理パスを指します。checkout を指すことはありません:
 
 ```bash
-bin/watchdog.sh status      # one-shot health probe + state file
-bin/watchdog.sh once        # probe once without launchd
+bin/watchdog.sh once        # run one /health probe now + update state file
+bin/watchdog.sh status      # read the saved state file; no new probe
 bin/watchdog.sh install     # install/reload the LaunchAgent
 bin/watchdog.sh uninstall   # unload and remove the LaunchAgent
 ```

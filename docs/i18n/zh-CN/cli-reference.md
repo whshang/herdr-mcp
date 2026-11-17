@@ -201,8 +201,8 @@ runtime 日志是 `~/.config/herdr-mcp/` 下的文件，不是 `herdr-mcp logs` 
 
 ```bash
 tail -f ~/.config/herdr-mcp/server.log                  # runtime server
-tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog 探测
-tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link(macOS)
+tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog probes
+tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link (macOS)
 ```
 
 排障时最好先记录状态再重启。
@@ -220,18 +220,16 @@ herdr-mcp status
 
 ## Watchdog
 
-macOS 上 service install 会管理周期性的 `dev.herdr-mcp.health-watchdog` LaunchAgent,执行 release checkout 里的 `watchdog.sh`。手动控制:
+macOS 还支持一个可选的周期性 health watchdog：`dev.herdr-mcp.health-watchdog` LaunchAgent。`service install` 不会安装它；它只由源码 checkout 里的 `bin/watchdog.sh` 管理（release 二进制不带此脚本），`service status` / `service uninstall` 只做报告与清理。`install` 会把脚本复制到 `~/.config/herdr-mcp/health-watchdog.sh`，LaunchAgent 指向这个受管路径，绝不指向 checkout：
 
 ```bash
-bin/watchdog.sh status      # 一次性健康探测 + 状态文件
-bin/watchdog.sh once        # 不走 launchd 探测一次
-bin/watchdog.sh install     # 安装/重载 LaunchAgent
-bin/watchdog.sh uninstall   # 卸载并移除 LaunchAgent
+bin/watchdog.sh once        # run one /health probe now + update state file
+bin/watchdog.sh status      # read the saved state file; no new probe
+bin/watchdog.sh install     # install/reload the LaunchAgent
+bin/watchdog.sh uninstall   # unload and remove the LaunchAgent
 ```
 
 它用于发现 herdr-mcp runtime 自身失联并按受控策略恢复，不把每一次 Herdr TaskGroup/ExceptionGroup 控制面毛刺都当成 daemon 必须重启。
-
-因此 watchdog 是 runtime 可用性保护，不是“看到任何错误就全家桶重启”。
 
 ## UI 语言
 

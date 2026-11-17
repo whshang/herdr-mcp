@@ -80,7 +80,7 @@ ChatGPT       :显式指定 device,或让 Edge 以 device_ambiguous 拒绝猜测
 ```text
 发现      herdr-mcp webchat endpoints → resources → inspect(拿到观察到的 ref 与 observation_generation)
 创建      herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY
-发送      herdr-mcp webchat send   → dispatch_id + delivery_state
+发送      herdr-mcp webchat send   --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY → dispatch_id + delivery_state
 观察      herdr-mcp webchat dispatch-status <dispatch_id>
 打开/归档 herdr-mcp webchat open | archive | archive-status
 handoff  herdr-mcp webchat handoff --continuity-id hc:... --source-url URL
@@ -102,11 +102,11 @@ handoff  herdr-mcp webchat handoff --continuity-id hc:... --source-url URL
 按请求实际经过的顺序诊断——不要重启一个健康层去修上面的坏层:
 
 ```bash
-herdr-mcp status            # runtime、Herdr、TCC,一行健康结论
-herdr-mcp doctor            # 分层证据;默认输出是简洁摘要
-herdr-mcp doctor --local    # 只读本机快照:白名单进程、
-                            # 回环端口 8772、配置文件元数据
-herdr-mcp link status       # Link 传输与 Edge 路由状态
+herdr-mcp status            # runtime, Herdr, TCC, one-line health
+herdr-mcp doctor            # per-layer evidence; default output is concise
+herdr-mcp doctor --local    # read-only local snapshot: allow-listed processes,
+                            # loopback port 8772, config-file metadata only
+herdr-mcp link status       # Link transport and Edge routing state
 ```
 
 `doctor --local` 绝不读取文件内容、环境变量或 `state.db`;使用非默认端口的命名实例在 8772 上显示 `listening:false` 是设计行为。完整故障词汇表与恢复路径见 [故障排查](troubleshooting.md)。

@@ -80,7 +80,7 @@ ChatGPT    :デバイスを明示するか、Edge が device_ambiguous で推測
 ```text
 発見      herdr-mcp webchat endpoints → resources → inspect(観測された ref と observation_generation)
 作成      herdr-mcp webchat create --source-url URL --message MESSAGE --idempotency-key KEY
-送信      herdr-mcp webchat send   → dispatch_id + delivery_state
+送信      herdr-mcp webchat send   --session-ref REF --message MESSAGE --expected-generation N --idempotency-key KEY → dispatch_id + delivery_state
 観測      herdr-mcp webchat dispatch-status <dispatch_id>
 開く/閉じる herdr-mcp webchat open | archive | archive-status
 handoff  herdr-mcp webchat handoff --continuity-id hc:... --source-url URL
