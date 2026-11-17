@@ -2,7 +2,7 @@
 
 状态：设计待批准，未改 schema，未改 Rust，未改变 Runtime Execution Contract。
 
-基线：`origin/main` `5d6a35c4b00a52ce30eeb9ded473b5057872d691`。
+基线：`origin/main` `2ffb90b9ba535f04c8bc610e784cce81c631883c`。
 
 关联：issue #332，差距分析评论 `6937170052`。
 
