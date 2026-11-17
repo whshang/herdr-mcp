@@ -20,7 +20,7 @@ D-1 只解决“调用者带着同一个键重试时，重启后的 Runtime 仍�
 - 账本记录了调用范围、请求摘要、状态、时间和结果摘要，但结果只保留 digest、字节数和错误码投影，避免把正文、输出或文件内容放回 `request.status`，见 `request_ledger.rs:130-239`。
 - 账本的 key 是 `HashMap` 内存项，容量为 1024，空闲 30 分钟后淘汰，见 `request_ledger.rs:19-22`、`:271-279`。`StateStore::open` 每次都会构造新的空账本，见 `state_store.rs:839-879`。
 - 当前 `request_ledger.rs:184-190` 的 `DefaultHasher` 只适合进程内摘要。D-1 的持久化 key 必须改用跨进程稳定的域隔离 SHA-256，不能把这个摘要直接写成跨重启协议。
-- `operations` 表从 schema 1 起就有 `kind`、`idempotency_key`、`request_hash`、`phase`、`state`、`result_json`、`runtime_generation`、`boot_id`、时间和过期字段，见 `state_store/schema.rs:46-93`。`SCHEMA_VERSION` 当前为 16，且代码要求高于已知 migration 的数据库直接拒绝，见 `state_store.rs:64-83`。
+- `operations` 表在 schema 1 起就有 `kind`、`idempotency_key`、`request_hash`、`phase`、`state`、`runtime_generation`、`boot_id`、时间和过期字段；`result_json` 由 migration 2 追加，见 `state_store/schema.rs:46-93`。`SCHEMA_VERSION` 当前为 16，且代码要求高于已知 migration 的数据库直接拒绝，见 `state_store.rs:64-83`。
 - 现有 `herdr_exec` 预留使用 `expires_at = NULL`，所以 pending 记录不会因为时间经过而释放；明确终态才使用 `EXEC_RECORD_TTL_MS = 60` 分钟，见 `utility_exec.rs:31-40`、`:291-294`、`:424-439`。
 - 当前 runtime contract 已是 epoch 6，epoch 5 是上一版带 `intent` 与 `idempotency_key` 的 `herdr_exec` 契约，见 `contract.rs:22-42`。D-1 文档不直接修改 frozen 18 工具目录或契约描述。
 
@@ -55,7 +55,7 @@ key_digest = SHA-256(
 )
 ```
 
-`caller_scope_digest` 至少包含当前调用者的稳定会话或设备范围。租约 token、cookie、bearer 等秘密不得进入明文或摘要之外的结果。请求摘要绑定以下内容：
+`caller_scope_digest` 必须来自重启后仍可解析的持久身份，不能直接使用只存在于当前请求的 opaque session 字符串。浏览器调用者先用持久的 `browser_caller_sessions` 或 `browser_cross_device_caller_sessions` 绑定，将 `session_ref` 与 `owning_device_id` 作为 scope 来源；这两张表通过 caller session 的哈希查找，见 `state_store.rs:4804-4868`、`:5112-5144`。本地或 trusted caller 使用当前实例 `config.json` 中持久的 `edge_device_id` 和已认证的 caller 类型；没有持久设备身份时，D-1 必须拒绝提供重启后 replay，而不能继续沿用当前空 scope。已验证的 lease holder 可以作为额外绑定字段，但不能单独作为身份权威。租约 token、cookie、bearer 等秘密不得进入明文或摘要之外的结果。请求摘要绑定以下内容：
 
 ```text
 request_hash = SHA-256(canonical JSON {
@@ -91,7 +91,7 @@ request_hash = SHA-256(canonical JSON {
 | `runtime_generation` | 可选写入执行时 generation，便于诊断和回滚审计；不参与 replay 许可判断 |
 | `boot_id` | 可选写入执行时 boot，区分重启前后的观察 |
 | `created_at`、`updated_at` | 预留、送达、结算和清理时间 |
-| `expires_at` | 终态摘要的过期时间；pending 和 unknown 必须为 NULL |
+| `expires_at` | 完整终态摘要的过期时间；pending、unknown 和 hash-only tombstone 必须为 NULL |
 
 `result_json` 至少包含：
 
@@ -149,10 +149,10 @@ reserved/pending
 建议的 D-1 保留政策：
 
 - `complete` 终态的完整摘要保留 24 小时。这个窗口覆盖常见的重启、网络恢复和人工重试间隔，比当前内存账本 30 分钟和现有 `herdr_exec` 终态 60 分钟更能满足“重启后同键返回第一次摘要”的目标。
-- 对 `idempotent_write` 和 `non_idempotent_write`，24 小时后把结果正文投影压缩成只含 key digest、request hash、intent、终态和 `expired=true` 的 hash-only tombstone，不删除键占位。旧键在 tombstone 存在时返回 `idempotency_key_expired` 或等价的不可重试冲突，不得再次执行。这样可以缩短敏感摘要保留期，同时保持写入键不会因为清理而重新获得执行资格。
+- 对 `idempotent_write` 和 `non_idempotent_write`，24 小时后把结果正文投影压缩成只含 key digest、request hash、intent、终态和 `expired=true` 的 hash-only tombstone；tombstone 的 `expires_at` 恒为 NULL，不删除键占位。旧键在 tombstone 存在时返回 `idempotency_key_expired` 或等价的不可重试冲突，不得再次执行。这样可以缩短敏感摘要保留期，同时保持写入键不会因为清理而重新获得执行资格，也不会被旧二进制的通用 prune 删除。
 - `pending` 和 `unknown` 的 `expires_at` 永远为 NULL，不参与自动清理。清除它们会重新打开重复副作用的窗口。
 - `read_only` 终态可使用 30 分钟较短保留；过期后可以删除整行并重新读取，因为没有写副作用。
-- 清理只能删除 `read_only` 的终态行，或把写入终态压缩为 hash-only tombstone；必须在同一事务中检查 operation kind、state、expires_at 和是否存在待处理的人为 gate。不能通过删除旧行来释放一个尚未结算的键，也不能把写入终态直接删除后当作新请求。
+- 清理只能删除 `read_only` 的终态行，或把写入终态压缩为 hash-only tombstone；写入 kind 的 tombstone 由该 kind 的清理函数保留，不能依赖 `task_decision_gates`。D-1 不为新 kind 创建 task gate，现有 gate 保护只适用于已经与 `herdr_prompt_task` 行关联的任务。新 kind 的清理事务必须检查 operation kind 和 state，并保证 tombstone、pending、unknown 永不进入可删除集合。不能通过删除旧行来释放一个尚未结算的键，也不能把写入终态直接删除后当作新请求。
 - 每个新 kind 设置有限容量，建议先沿用现有 1024 条的上限作为最小值，评估后再提高。达到上限时只能淘汰只读终态或完整摘要已压缩且允许删除的记录；写入 tombstone、pending 和 unknown 都不可淘汰。如果剩下的全是这些不可淘汰记录，返回 `client_request_ledger_full`，不丢记录、不执行新写命令。
 - 清理、容量拒绝和 replay 都必须保留同一个 key digest 的冲突语义，不能因清理路径把相同键当成新请求。
 
@@ -174,7 +174,7 @@ D-1 需要的列已经存在于 schema 16 的 `operations` 表，因此推荐：
 - 旧二进制继续支持已有 `herdr_exec.idempotency_key`，这条路径已在 schema 16 上持久化。
 - 旧二进制不得把 D-1 的 `client_request_id` 当作没有键的新写请求。部署或回滚门禁应在检测到 D-1 请求字段时返回 `unsupported_client_request_id`，或要求先由新二进制完成 reconciliation；绝不静默执行。
 - 回滚到 v1.1.x 前，如果存在 D-1 的 pending/unknown 行，必须停止回滚或要求人工确认。它们代表可能已经发生的副作用，不能因为旧二进制看不懂 kind 就再次投递。
-- 终态摘要行可以留在 schema 16 的 `operations` 中；旧二进制忽略未知 kind，不得删除 pending/unknown。恢复到新二进制后，原记录仍可用于 replay/status。
+- 终态摘要行可以留在 schema 16 的 `operations` 中；旧二进制忽略未知 kind，不得删除 pending/unknown，也不会删除 `expires_at=NULL` 的写入 tombstone。恢复到新二进制后，原记录仍可用于 replay/status。
 
 ### 如果未来必须升到 schema 17
 
