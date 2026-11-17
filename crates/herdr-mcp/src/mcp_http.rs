@@ -3154,6 +3154,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             caller_lease_holder_id: caller_lease_holder_id.as_deref(),
             caller_lease_epoch,
             caller_lease_token: caller_lease_token.as_deref(),
+            local_device_id: blocking_state.local_device_id.as_deref(),
             browser_actuator: Some(&blocking_state.browser_actuation),
             browser_mutation_gate: Some(&blocking_state.browser_mutation_gate),
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
