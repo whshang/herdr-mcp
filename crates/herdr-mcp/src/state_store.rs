@@ -1739,39 +1739,54 @@ impl StateStore {
     }
 
     pub fn put_operation_ledger(&mut self, input: OperationLedgerInput<'_>) -> Result<(), String> {
-        if input.op_id.is_empty() || input.kind.is_empty() {
-            return Err("operation ledger op_id and kind are required".to_owned());
-        }
+        validate_operation_ledger_input(&input)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin operation ledger update: {error}"))?;
-        tx.execute(
-            "INSERT INTO operations (
-                op_id, kind, idempotency_key, request_hash, phase, state,
-                created_at, updated_at, expires_at, result_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
-             ON CONFLICT(op_id) DO UPDATE SET
-                phase = excluded.phase,
-                state = excluded.state,
-                updated_at = excluded.updated_at,
-                expires_at = excluded.expires_at,
-                result_json = excluded.result_json",
-            params![
-                input.op_id,
-                input.kind,
-                input.idempotency_key,
-                input.request_hash,
-                input.phase,
-                input.state,
-                input.now_ms,
-                input.expires_at,
-                input.result_json,
-            ],
-        )
-        .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        upsert_operation_ledger(&tx, &input)
+            .map_err(|error| format!("cannot write operation ledger: {error}"))?;
         tx.commit()
             .map_err(|error| format!("cannot commit operation ledger update: {error}"))
+    }
+
+    /// Write several ledger rows in **one** `IMMEDIATE` transaction.
+    ///
+    /// #332 B-1: a new steering record and the supersede updates of the records
+    /// it replaces must land together. Writing them one row per transaction
+    /// leaves a crash window in which the new row exists while the older
+    /// `submitted|queued|delivered` row is still adoptable after a restart.
+    pub fn put_operation_ledgers_atomic(
+        &mut self,
+        inputs: &[OperationLedgerInput<'_>],
+    ) -> Result<(), String> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        for input in inputs {
+            validate_operation_ledger_input(input)?;
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin operation ledger batch: {error}"))?;
+        #[cfg(test)]
+        for (index, input) in inputs.iter().enumerate() {
+            if test_hooks::ledger_batch_failure_after() == Some(index) {
+                // Return before commit so the caller observes an all-or-nothing
+                // batch, exactly like a crash between the two rows.
+                return Err("injected operation ledger batch failure".to_owned());
+            }
+            upsert_operation_ledger(&tx, input)
+                .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        }
+        #[cfg(not(test))]
+        for input in inputs {
+            upsert_operation_ledger(&tx, input)
+                .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit operation ledger batch: {error}"))
     }
 
     pub fn operation_ledger(&self, op_id: &str) -> Result<Option<OperationLedgerRecord>, String> {
@@ -9548,6 +9563,61 @@ fn list_names(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+fn validate_operation_ledger_input(input: &OperationLedgerInput<'_>) -> Result<(), String> {
+    if input.op_id.is_empty() || input.kind.is_empty() {
+        return Err("operation ledger op_id and kind are required".to_owned());
+    }
+    Ok(())
+}
+
+fn upsert_operation_ledger(
+    tx: &rusqlite::Transaction<'_>,
+    input: &OperationLedgerInput<'_>,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO operations (
+            op_id, kind, idempotency_key, request_hash, phase, state,
+            created_at, updated_at, expires_at, result_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
+         ON CONFLICT(op_id) DO UPDATE SET
+            phase = excluded.phase,
+            state = excluded.state,
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at,
+            result_json = excluded.result_json",
+        params![
+            input.op_id,
+            input.kind,
+            input.idempotency_key,
+            input.request_hash,
+            input.phase,
+            input.state,
+            input.now_ms,
+            input.expires_at,
+            input.result_json,
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LEDGER_BATCH_FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Fail the next `put_operation_ledgers_atomic` at row `after` (pre-commit).
+    pub(crate) fn inject_ledger_batch_failure_after(after: Option<usize>) {
+        LEDGER_BATCH_FAIL_AFTER.with(|slot| slot.set(after));
+    }
+
+    pub(crate) fn ledger_batch_failure_after() -> Option<usize> {
+        LEDGER_BATCH_FAIL_AFTER.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::schema::{MIGRATION_V1, MIGRATION_V2, MIGRATIONS, migrate_to};
@@ -16039,6 +16109,195 @@ mod tests {
     }
 
     #[test]
+    fn mutation_lease_readers_conflicts_renew_and_release() {
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let input = |holder: &'static str, intent: Option<&'static str>, now_ms| {
+            MutationLeaseAcquireInput {
+                project_root: "/read-repo",
+                lane_key: None,
+                holder_id: holder,
+                intent,
+                lease_token: None,
+                ttl_seconds: Some(60),
+                workspace_id: Some("workspace"),
+                pane_id: Some("pane"),
+                branch: Some("branch"),
+                now_ms,
+            }
+        };
+        let (epoch, token_a) = match store
+            .acquire_mutation_lease_for_device(input("a", Some("read"), 1_000), Some("device-a"))
+            .unwrap()
+        {
+            MutationLeaseAcquireOutcome::Acquired {
+                lease, lease_token, ..
+            } => {
+                assert_eq!(lease.intent, "read");
+                assert_eq!(lease.readers.len(), 1);
+                (lease.lease_epoch, lease_token)
+            }
+            other => panic!("expected first reader, got {other:?}"),
+        };
+        let token_b = match store
+            .acquire_mutation_lease_for_device(input("b", Some("read"), 2_000), Some("device-b"))
+            .unwrap()
+        {
+            MutationLeaseAcquireOutcome::Acquired {
+                lease, lease_token, ..
+            } => {
+                assert_eq!(lease.lease_epoch, epoch);
+                assert_eq!(lease.intent, "read");
+                assert_eq!(lease.readers.len(), 2);
+                let reader = lease
+                    .readers
+                    .iter()
+                    .find(|reader| reader.holder_id == "b")
+                    .unwrap();
+                assert_eq!(reader.device_id.as_deref(), Some("device-b"));
+                assert_eq!(reader.workspace_id.as_deref(), Some("workspace"));
+                assert_eq!(reader.pane_id.as_deref(), Some("pane"));
+                assert_eq!(reader.branch.as_deref(), Some("branch"));
+                assert_eq!((reader.acquired_at, reader.expires_at), (2_000, 62_000));
+                let json = serde_json::to_string(&lease).unwrap();
+                assert!(!json.contains(&token_a));
+                assert!(!json.contains(&lease_token));
+                assert!(!json.contains("token_sha256"));
+                lease_token
+            }
+            other => panic!("expected second reader, got {other:?}"),
+        };
+        assert_ne!(token_a, token_b);
+        assert!(
+            matches!(store.acquire_mutation_lease(input("writer", Some("write"), 3_000)).unwrap(),
+            MutationLeaseAcquireOutcome::Conflict { active_lease, .. } if active_lease.intent == "read" && active_lease.readers.len() == 2)
+        );
+        fn renew(token: &str, epoch: i64) -> MutationLeaseRenewInput<'_> {
+            MutationLeaseRenewInput {
+                project_root: "/read-repo",
+                lane_key: None,
+                holder_id: "a",
+                lease_epoch: epoch,
+                lease_token: Some(token),
+                ttl_seconds: Some(120),
+                now_ms: 4_000,
+            }
+        }
+        assert!(matches!(
+            store.renew_mutation_lease(renew(&token_b, epoch)).unwrap(),
+            MutationLeaseRenewOutcome::Conflict {
+                reason: "lease_token_invalid",
+                ..
+            }
+        ));
+        assert!(
+            matches!(store.renew_mutation_lease(renew(&token_a, epoch)).unwrap(),
+            MutationLeaseRenewOutcome::Renewed { lease, lease_token }
+                if lease_token == token_a && lease.readers.iter().any(|r| r.holder_id == "a" && r.expires_at == 124_000)
+                    && lease.readers.iter().any(|r| r.holder_id == "b" && r.expires_at == 62_000))
+        );
+        fn release<'a>(
+            holder: &'a str,
+            token: &'a str,
+            epoch: i64,
+            now_ms: i64,
+        ) -> MutationLeaseReleaseInput<'a> {
+            MutationLeaseReleaseInput {
+                project_root: "/read-repo",
+                lane_key: None,
+                holder_id: holder,
+                lease_epoch: epoch,
+                lease_token: Some(token),
+                now_ms,
+            }
+        }
+        assert!(
+            matches!(store.release_mutation_lease(release("a", &token_a, epoch, 5_000)).unwrap(),
+            MutationLeaseReleaseOutcome::Released { lease, .. } if lease.readers.len() == 1 && lease.readers[0].holder_id == "b")
+        );
+        assert_eq!(
+            store
+                .list_active_mutation_leases(Some("/read-repo"), None, 5_000)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            matches!(store.release_mutation_lease(release("b", &token_b, epoch, 6_000)).unwrap(),
+            MutationLeaseReleaseOutcome::Released { lease, .. } if lease.readers.is_empty())
+        );
+        assert!(
+            store
+                .list_active_mutation_leases(Some("/read-repo"), None, 6_000)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            matches!(store.acquire_mutation_lease(input("writer", Some("write"), 7_000)).unwrap(),
+            MutationLeaseAcquireOutcome::Acquired { lease, .. } if lease.intent == "write" && lease.lease_epoch > epoch)
+        );
+        assert!(
+            matches!(store.acquire_mutation_lease(input("reader", Some("read"), 8_000)).unwrap(),
+            MutationLeaseAcquireOutcome::Conflict { active_lease, .. } if active_lease.intent == "write")
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn mutation_lease_legacy_null_and_writer_trigger_are_conservative() {
+        let path = temp_db_path();
+        let mut store = StateStore::open(&path).unwrap();
+        let input = |root: &'static str, holder: &'static str, now_ms| MutationLeaseAcquireInput {
+            project_root: root,
+            lane_key: None,
+            holder_id: holder,
+            intent: Some("read"),
+            lease_token: None,
+            ttl_seconds: Some(60),
+            workspace_id: None,
+            pane_id: None,
+            branch: None,
+            now_ms,
+        };
+        store.conn.execute(
+            "INSERT INTO mutation_leases (project_root, lane_key, holder_id, lease_epoch, acquired_at, updated_at, expires_at, intent) VALUES ('/legacy-repo', '*', 'legacy', 1, 1000, 1000, 61000, NULL)", [],
+        ).unwrap();
+        assert!(
+            matches!(store.acquire_mutation_lease(input("/legacy-repo", "reader", 2_000)).unwrap(),
+            MutationLeaseAcquireOutcome::Conflict { active_lease, .. } if active_lease.intent == "write" && active_lease.readers.is_empty())
+        );
+        assert!(
+            matches!(store.acquire_mutation_lease(input("/trigger-repo", "reader", 1_000)).unwrap(),
+            MutationLeaseAcquireOutcome::Acquired { lease, .. } if lease.intent == "read")
+        );
+        let legacy_projection: (String, i64, i64) = store.conn.query_row(
+            "SELECT holder_id, lease_epoch, expires_at FROM mutation_leases WHERE project_root = '/trigger-repo' AND lane_key = '*'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(legacy_projection, ("reader".to_owned(), 1, 61_000));
+        store.conn.execute(
+            "UPDATE mutation_leases SET holder_id = 'old-writer', lease_epoch = 2, acquired_at = 2000, updated_at = 2000, expires_at = 62000, released_at = NULL WHERE project_root = '/trigger-repo' AND lane_key = '*'", [],
+        ).unwrap();
+        let legacy_columns: (Option<String>, Option<String>) = store.conn.query_row(
+            "SELECT intent, readers_json FROM mutation_leases WHERE project_root = '/trigger-repo'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(legacy_columns, (None, None));
+        assert!(
+            matches!(store.acquire_mutation_lease(input("/trigger-repo", "reader-b", 3_000)).unwrap(),
+            MutationLeaseAcquireOutcome::Conflict { active_lease, .. }
+                if active_lease.intent == "write" && active_lease.holder_id == "old-writer" && active_lease.readers.is_empty())
+        );
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn mutation_leases_fencing_conflict_expiry_and_v1_1_rollback_compatibility() {
         let path = temp_db_path();
         // Pre-seed a v16 database with the original 11-column mutation_leases table (before lease_token_sha256)
@@ -16080,6 +16339,7 @@ mod tests {
                 workspace_id: Some("w1"),
                 pane_id: Some("w1:p1"),
                 branch: Some("feat/a"),
+                intent: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -16110,6 +16370,7 @@ mod tests {
                 workspace_id: None,
                 pane_id: None,
                 branch: None,
+                intent: None,
                 now_ms: 4_000,
             })
             .unwrap();
@@ -16132,6 +16393,7 @@ mod tests {
                 workspace_id: None,
                 pane_id: None,
                 branch: None,
+                intent: None,
                 now_ms: 5_000,
             })
             .unwrap();
@@ -16161,6 +16423,7 @@ mod tests {
                 workspace_id: Some("w2"),
                 pane_id: None,
                 branch: None,
+                intent: None,
                 now_ms: 10_000,
             })
             .unwrap();
@@ -16244,6 +16507,7 @@ mod tests {
                 workspace_id: Some("w2"),
                 pane_id: Some("w2:p1"),
                 branch: Some("feat/b"),
+                intent: None,
                 now_ms: 160_001,
             })
             .unwrap();
@@ -16409,6 +16673,7 @@ mod tests {
                 workspace_id: None,
                 pane_id: None,
                 branch: None,
+                intent: None,
                 now_ms: 171_000,
             })
             .unwrap();
