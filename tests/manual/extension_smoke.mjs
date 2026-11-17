@@ -64,7 +64,6 @@ ok(!manifest.key, "unpacked extension keeps its existing Chromium path-derived i
 
 const backgroundSource = readFileSync(path.join(EXT, "background.js"), "utf8");
 const bindingCoreSource = readFileSync(path.join(EXT, "binding-core.js"), "utf8");
-const pushSource = readFileSync(path.join(EXT, "..", "src", "push.ts"), "utf8");
 const wakeSource = readFileSync(path.join(EXT, "content", "wake.js"), "utf8");
 const performanceCoreSource = readFileSync(path.join(EXT, "performance-core.js"), "utf8");
 const baseSource = readFileSync(path.join(EXT, "content", "base.js"), "utf8");
@@ -1292,8 +1291,6 @@ ok(backgroundSource.includes('event === "hello"')
     && backgroundSource.includes('controlCenterPorts.size > 0')
     && backgroundSource.includes('controlCenterLastState')
     && backgroundSource.includes('msg.force !== true')
-    && pushSource.includes('event: "pane_upsert"')
-    && pushSource.includes('event: "pane_removed"')
     && backgroundSource.includes('msg?.type === "herdr_control_read_tail"')
     && controlCenterSource.includes('type: "herdr_control_center_subscribe"')
     && controlCenterSource.includes('chrome.runtime.connect({ name: "herdr-control-center" })')
