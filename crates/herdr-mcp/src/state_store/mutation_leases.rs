@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS mutation_leases (
     released_at        INTEGER,
     lease_token_sha256 TEXT,
     device_id          TEXT,
+    intent             TEXT,
+    readers_json       TEXT,
     PRIMARY KEY (project_root, lane_key),
     CHECK (lease_epoch >= 1)
 );
@@ -47,7 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_mutation_leases_active
 pub(super) fn ensure_mutation_leases_auxiliary_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(MUTATION_LEASES_AUXILIARY_SCHEMA)
         .map_err(|error| format!("cannot ensure mutation leases auxiliary schema: {error}"))?;
-    for column in ["lease_token_sha256", "device_id"] {
+    for column in ["lease_token_sha256", "device_id", "intent", "readers_json"] {
         let has_column: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('mutation_leases') WHERE name = ?1",
@@ -82,6 +84,17 @@ pub(super) fn ensure_mutation_leases_auxiliary_schema(conn: &Connection) -> Resu
          END;",
     )
     .map_err(|error| format!("cannot ensure mutation lease device safety trigger: {error}"))?;
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS mutation_leases_clear_old_readers_on_epoch
+         AFTER UPDATE OF lease_epoch ON mutation_leases
+         WHEN NEW.lease_epoch != OLD.lease_epoch AND NEW.intent IS OLD.intent
+              AND NEW.readers_json IS OLD.readers_json
+         BEGIN
+           UPDATE mutation_leases SET intent = NULL, readers_json = NULL
+            WHERE project_root = NEW.project_root AND lane_key = NEW.lane_key;
+         END;",
+    )
+    .map_err(|error| format!("cannot ensure mutation lease intent safety trigger: {error}"))?;
     Ok(())
 }
 
@@ -269,6 +282,28 @@ pub struct MutationLeaseRecord {
     pub acquired_at: i64,
     pub updated_at: i64,
     pub expires_at: i64,
+    pub intent: String,
+    pub readers: Vec<MutationLeaseReader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationLeaseReader {
+    pub holder_id: String,
+    pub device_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub branch: Option<String>,
+    pub acquired_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredReader {
+    #[serde(flatten)]
+    reader: MutationLeaseReader,
+    token_sha256: String,
+    updated_at: i64,
+    epoch: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +311,7 @@ struct StoredMutationLeaseRow {
     record: MutationLeaseRecord,
     released_at: Option<i64>,
     lease_token_sha256: Option<String>,
+    readers: Vec<StoredReader>,
 }
 
 impl StoredMutationLeaseRow {
@@ -288,6 +324,7 @@ impl StoredMutationLeaseRow {
 pub struct MutationLeaseAcquireInput<'a> {
     pub project_root: &'a str,
     pub lane_key: Option<&'a str>,
+    pub intent: Option<&'a str>,
     pub holder_id: &'a str,
     pub lease_token: Option<&'a str>,
     pub ttl_seconds: Option<u64>,
@@ -368,6 +405,49 @@ pub enum MutationLeaseEnforcementVerdict {
 }
 
 fn row_to_stored_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMutationLeaseRow> {
+    let epoch: i64 = row.get(3)?;
+    let intent: Option<String> = row.get(13)?;
+    let intent = if intent.as_deref() == Some("read") {
+        "read"
+    } else {
+        "write"
+    };
+    let json: Option<String> = row.get(14)?;
+    let readers: Vec<StoredReader> = if intent == "read" {
+        serde_json::from_str(json.as_deref().unwrap_or("[]")).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                14,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?
+    } else {
+        Vec::new()
+    };
+    let readers: Vec<_> = readers
+        .into_iter()
+        .filter(|entry| {
+            entry.epoch == epoch
+                && validate_holder_id(&entry.reader.holder_id).as_deref()
+                    == Ok(entry.reader.holder_id.as_str())
+                && [
+                    (&entry.reader.device_id, "device_id"),
+                    (&entry.reader.workspace_id, "workspace_id"),
+                    (&entry.reader.pane_id, "pane_id"),
+                    (&entry.reader.branch, "branch"),
+                ]
+                .into_iter()
+                .all(|(value, name)| {
+                    validate_optional_metadata(name, value.as_deref())
+                        .ok()
+                        .as_ref()
+                        == Some(value)
+                })
+                && entry.token_sha256.len() == 64
+                && entry.token_sha256.chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .take(64)
+        .collect();
     Ok(StoredMutationLeaseRow {
         record: MutationLeaseRecord {
             project_root: row.get(0)?,
@@ -381,9 +461,12 @@ fn row_to_stored_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMutati
             updated_at: row.get(8)?,
             expires_at: row.get(9)?,
             device_id: row.get(10)?,
+            intent: intent.to_owned(),
+            readers: readers.iter().map(|reader| reader.reader.clone()).collect(),
         },
         released_at: row.get(11)?,
         lease_token_sha256: row.get(12)?,
+        readers,
     })
 }
 
@@ -394,7 +477,7 @@ fn load_stored_lease(
 ) -> Result<Option<StoredMutationLeaseRow>, String> {
     conn.query_row(
         "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256
+                acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256, intent, readers_json
            FROM mutation_leases
           WHERE project_root = ?1 AND lane_key = ?2",
         params![project_root, lane_key],
@@ -420,10 +503,12 @@ impl StateStore {
         let project_root = canonicalize_lease_path(input.project_root)?;
         let lane_key = validate_lane_key(input.lane_key)?;
         let holder_id = validate_holder_id(input.holder_id)?;
-        let device_id = device_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
+        let intent = match input.intent.unwrap_or("write") {
+            "read" => "read",
+            "write" => "write",
+            _ => return Err("intent must be 'read' or 'write'".to_owned()),
+        };
+        let device_id = validate_optional_metadata("device_id", device_id)?;
         let ttl_seconds = validate_ttl_seconds(input.ttl_seconds)?;
         let workspace_id = validate_optional_metadata("workspace_id", input.workspace_id)?;
         let pane_id = validate_optional_metadata("pane_id", input.pane_id)?;
@@ -437,6 +522,92 @@ impl StateStore {
             .map_err(|error| format!("cannot begin mutation lease transaction: {error}"))?;
 
         let existing = load_stored_lease(&tx, &project_root, &lane_key)?;
+        if intent == "read" {
+            if let Some(stored) = &existing
+                && stored.is_active(input.now_ms)
+                && stored.record.intent != "read"
+            {
+                return Ok(MutationLeaseAcquireOutcome::Conflict {
+                    reason: "lease_held_by_other",
+                    active_lease: stored.record.clone(),
+                });
+            }
+            let active = existing
+                .as_ref()
+                .is_some_and(|row| row.is_active(input.now_ms));
+            let epoch = existing.as_ref().map_or(1, |row| {
+                if active {
+                    row.record.lease_epoch
+                } else {
+                    row.record.lease_epoch.saturating_add(1)
+                }
+            });
+            let mut readers = if active {
+                existing.as_ref().unwrap().readers.clone()
+            } else {
+                Vec::new()
+            };
+            readers.retain(|reader| reader.reader.expires_at > input.now_ms);
+            let position = readers
+                .iter()
+                .position(|reader| reader.reader.holder_id == holder_id);
+            if position.is_none() && readers.len() >= 64 {
+                return Ok(MutationLeaseAcquireOutcome::Conflict {
+                    reason: "lease_readers_limit",
+                    active_lease: existing.unwrap().record,
+                });
+            }
+            let (token, digest) = generate_lease_token()?;
+            let reader = StoredReader {
+                reader: MutationLeaseReader {
+                    holder_id: holder_id.clone(),
+                    device_id: device_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    pane_id: pane_id.clone(),
+                    branch: branch.clone(),
+                    acquired_at: position
+                        .map_or(input.now_ms, |index| readers[index].reader.acquired_at),
+                    expires_at,
+                },
+                token_sha256: digest,
+                updated_at: input.now_ms,
+                epoch,
+            };
+            if let Some(index) = position {
+                readers[index] = reader;
+            } else {
+                readers.push(reader);
+            }
+            let json = serde_json::to_string(&readers)
+                .map_err(|error| format!("cannot encode lease readers: {error}"))?;
+            let max_expiry = readers
+                .iter()
+                .map(|reader| reader.reader.expires_at)
+                .max()
+                .unwrap();
+            if active {
+                tx.execute("UPDATE mutation_leases SET readers_json = ?1, updated_at = ?2, expires_at = ?3 WHERE project_root = ?4 AND lane_key = ?5", params![json, input.now_ms, max_expiry, project_root, lane_key])
+                    .map_err(|error| format!("cannot append lease reader: {error}"))?;
+            } else if existing.is_some() {
+                tx.execute("UPDATE mutation_leases SET holder_id = ?1, lease_epoch = ?2, device_id = ?3, workspace_id = ?4, pane_id = ?5, branch = ?6, acquired_at = ?7, updated_at = ?7, expires_at = ?8, released_at = NULL, lease_token_sha256 = NULL, intent = 'read', readers_json = ?9 WHERE project_root = ?10 AND lane_key = ?11", params![holder_id, epoch, device_id, workspace_id, pane_id, branch, input.now_ms, max_expiry, json, project_root, lane_key])
+                    .map_err(|error| format!("cannot advance read lease epoch: {error}"))?;
+                // Reattest fields when an old-writer safety trigger sees equal values.
+                tx.execute("UPDATE mutation_leases SET device_id = ?1, intent = 'read', readers_json = ?2 WHERE project_root = ?3 AND lane_key = ?4", params![device_id, json, project_root, lane_key]).map_err(|error| format!("cannot bind read lease: {error}"))?;
+            } else {
+                tx.execute("INSERT INTO mutation_leases (project_root,lane_key,holder_id,lease_epoch,device_id,workspace_id,pane_id,branch,acquired_at,updated_at,expires_at,released_at,lease_token_sha256,intent,readers_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,NULL,NULL,'read',?11)", params![project_root,lane_key,holder_id,epoch,device_id,workspace_id,pane_id,branch,input.now_ms,max_expiry,json])
+                    .map_err(|error| format!("cannot insert read lease: {error}"))?;
+            }
+            let record = load_stored_lease(&tx, &project_root, &lane_key)?
+                .unwrap()
+                .record;
+            tx.commit()
+                .map_err(|error| format!("cannot commit mutation lease acquire: {error}"))?;
+            return Ok(MutationLeaseAcquireOutcome::Acquired {
+                lease: record,
+                lease_token: token,
+                reacquired: position.is_some(),
+            });
+        }
         let outcome = match existing {
             None => {
                 let (lease_token, lease_token_sha256) = generate_lease_token()?;
@@ -452,13 +623,15 @@ impl StateStore {
                     acquired_at: input.now_ms,
                     updated_at: input.now_ms,
                     expires_at,
+                    intent: "write".to_owned(),
+                    readers: Vec::new(),
                 };
                 tx.execute(
                     "INSERT INTO mutation_leases (
                         project_root, lane_key, holder_id, lease_epoch, device_id,
                         workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)",
+                        acquired_at, updated_at, expires_at, released_at, lease_token_sha256, intent, readers_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, 'write', NULL)",
                     params![
                         record.project_root,
                         record.lane_key,
@@ -482,6 +655,12 @@ impl StateStore {
                 }
             }
             Some(stored) if stored.is_active(input.now_ms) => {
+                if stored.record.intent == "read" {
+                    return Ok(MutationLeaseAcquireOutcome::Conflict {
+                        reason: "lease_held_by_other",
+                        active_lease: stored.record,
+                    });
+                }
                 if stored.record.holder_id != holder_id {
                     MutationLeaseAcquireOutcome::Conflict {
                         reason: "lease_held_by_other",
@@ -517,6 +696,8 @@ impl StateStore {
                         acquired_at: stored.record.acquired_at,
                         updated_at: input.now_ms,
                         expires_at,
+                        intent: "write".to_owned(),
+                        readers: Vec::new(),
                     };
                     tx.execute(
                         "UPDATE mutation_leases
@@ -562,6 +743,8 @@ impl StateStore {
                     acquired_at: input.now_ms,
                     updated_at: input.now_ms,
                     expires_at,
+                    intent: "write".to_owned(),
+                    readers: Vec::new(),
                 };
                 tx.execute(
                     "UPDATE mutation_leases
@@ -575,6 +758,7 @@ impl StateStore {
                             updated_at = ?8,
                             expires_at = ?9,
                             lease_token_sha256 = ?10,
+                            intent = 'write', readers_json = NULL,
                             released_at = NULL
                       WHERE project_root = ?11 AND lane_key = ?12",
                     params![
@@ -593,6 +777,7 @@ impl StateStore {
                     ],
                 )
                 .map_err(|error| format!("cannot advance mutation lease epoch: {error}"))?;
+                tx.execute("UPDATE mutation_leases SET intent = 'write', readers_json = NULL WHERE project_root = ?1 AND lane_key = ?2", params![record.project_root, record.lane_key]).map_err(|error| format!("cannot bind write lease intent: {error}"))?;
                 // If the same device acquires the next epoch, the legacy-writer
                 // safety trigger clears it. This write explicitly reattests the
                 // current device inside the same transaction.
@@ -636,6 +821,58 @@ impl StateStore {
             .map_err(|error| format!("cannot begin mutation lease renew transaction: {error}"))?;
 
         let existing = load_stored_lease(&tx, &project_root, &lane_key)?;
+        if let Some(stored) = &existing
+            && stored.is_active(input.now_ms)
+            && stored.record.intent == "read"
+        {
+            let conflict = |reason| MutationLeaseRenewOutcome::Conflict {
+                reason,
+                active_lease: Some(stored.record.clone()),
+            };
+            if stored.record.lease_epoch != input.lease_epoch {
+                return Ok(conflict("lease_epoch_mismatch"));
+            }
+            let Some(index) = stored.readers.iter().position(|reader| {
+                reader.reader.holder_id == holder_id && reader.reader.expires_at > input.now_ms
+            }) else {
+                return Ok(conflict("lease_held_by_other"));
+            };
+            let Some(token) = input
+                .lease_token
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            else {
+                return Ok(conflict("lease_token_required"));
+            };
+            if !verify_lease_token_digest(Some(&stored.readers[index].token_sha256), token) {
+                return Ok(conflict("lease_token_invalid"));
+            }
+            let mut readers = stored.readers.clone();
+            readers.retain(|reader| reader.reader.expires_at > input.now_ms);
+            let reader = readers
+                .iter_mut()
+                .find(|reader| reader.reader.holder_id == holder_id)
+                .unwrap();
+            reader.reader.expires_at = expires_at;
+            reader.updated_at = input.now_ms;
+            let max_expiry = readers
+                .iter()
+                .map(|reader| reader.reader.expires_at)
+                .max()
+                .unwrap();
+            let json = serde_json::to_string(&readers)
+                .map_err(|error| format!("cannot encode lease readers: {error}"))?;
+            tx.execute("UPDATE mutation_leases SET readers_json = ?1, updated_at = ?2, expires_at = ?3 WHERE project_root = ?4 AND lane_key = ?5", params![json, input.now_ms, max_expiry, project_root, lane_key]).map_err(|error| format!("cannot renew lease reader: {error}"))?;
+            let lease = load_stored_lease(&tx, &project_root, &lane_key)?
+                .unwrap()
+                .record;
+            tx.commit()
+                .map_err(|error| format!("cannot commit mutation lease renew: {error}"))?;
+            return Ok(MutationLeaseRenewOutcome::Renewed {
+                lease,
+                lease_token: token.to_owned(),
+            });
+        }
         let outcome = match existing {
             None => MutationLeaseRenewOutcome::Conflict {
                 reason: "lease_not_held",
@@ -731,6 +968,60 @@ impl StateStore {
             .map_err(|error| format!("cannot begin mutation lease release transaction: {error}"))?;
 
         let existing = load_stored_lease(&tx, &project_root, &lane_key)?;
+        if let Some(stored) = &existing
+            && stored.is_active(input.now_ms)
+            && stored.record.intent == "read"
+        {
+            let conflict = |reason| MutationLeaseReleaseOutcome::Conflict {
+                reason,
+                active_lease: Some(stored.record.clone()),
+            };
+            if stored.record.lease_epoch != input.lease_epoch {
+                return Ok(conflict("lease_epoch_mismatch"));
+            }
+            let Some(index) = stored.readers.iter().position(|reader| {
+                reader.reader.holder_id == holder_id && reader.reader.expires_at > input.now_ms
+            }) else {
+                return Ok(conflict("lease_held_by_other"));
+            };
+            let Some(token) = input
+                .lease_token
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            else {
+                return Ok(conflict("lease_token_required"));
+            };
+            if !verify_lease_token_digest(Some(&stored.readers[index].token_sha256), token) {
+                return Ok(conflict("lease_token_invalid"));
+            }
+            let mut readers = stored.readers.clone();
+            readers.retain(|reader| {
+                reader.reader.holder_id != holder_id && reader.reader.expires_at > input.now_ms
+            });
+            let max_expiry = readers
+                .iter()
+                .map(|reader| reader.reader.expires_at)
+                .max()
+                .unwrap_or(input.now_ms);
+            let released_at = if readers.is_empty() {
+                Some(input.now_ms)
+            } else {
+                None
+            };
+            let json = serde_json::to_string(&readers)
+                .map_err(|error| format!("cannot encode lease readers: {error}"))?;
+            tx.execute("UPDATE mutation_leases SET readers_json = ?1, updated_at = ?2, expires_at = ?3, released_at = ?4 WHERE project_root = ?5 AND lane_key = ?6", params![json, input.now_ms, max_expiry, released_at, project_root, lane_key]).map_err(|error| format!("cannot release lease reader: {error}"))?;
+            let lease = load_stored_lease(&tx, &project_root, &lane_key)?
+                .unwrap()
+                .record;
+            tx.commit()
+                .map_err(|error| format!("cannot commit mutation lease release: {error}"))?;
+            return Ok(MutationLeaseReleaseOutcome::Released {
+                lease,
+                released_at: input.now_ms,
+                idempotent_replay: false,
+            });
+        }
         let outcome = match existing {
             None => MutationLeaseReleaseOutcome::Conflict {
                 reason: "lease_not_held",
@@ -869,7 +1160,7 @@ impl StateStore {
             .conn
             .prepare(
                 "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256
+                        acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256, intent, readers_json
                    FROM mutation_leases
                   WHERE released_at IS NULL
                     AND expires_at > ?1
@@ -886,10 +1177,11 @@ impl StateStore {
             .map_err(|error| format!("cannot query active mutation leases: {error}"))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(
-                row.map_err(|error| format!("cannot decode mutation lease row: {error}"))?
-                    .record,
-            );
+            let mut record = row
+                .map_err(|error| format!("cannot decode mutation lease row: {error}"))?
+                .record;
+            record.readers.retain(|reader| reader.expires_at > now_ms);
+            out.push(record);
         }
         Ok(out)
     }
@@ -913,7 +1205,7 @@ impl StateStore {
             .conn
             .prepare(
                 "SELECT project_root, lane_key, holder_id, lease_epoch, workspace_id, pane_id, branch,
-                        acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256
+                        acquired_at, updated_at, expires_at, device_id, released_at, lease_token_sha256, intent, readers_json
                    FROM mutation_leases
                   WHERE lane_key = '*'
                     AND released_at IS NULL
@@ -964,6 +1256,12 @@ impl StateStore {
         };
         let expected_digest = stored.lease_token_sha256.clone();
         let active_lease = stored.record;
+        if active_lease.intent == "read" {
+            return Ok(MutationLeaseEnforcementVerdict::Conflict {
+                reason: "lease_held_by_other",
+                active_lease,
+            });
+        }
 
         let Some(holder_id) = caller_holder_id
             .map(str::trim)
