@@ -2305,6 +2305,52 @@ pub fn herdr_core_exec_session_unsupported(operation: &str) -> Value {
     })
 }
 
+/// Phase 2 slice 2 (#768 / #950): execution-class classification for the
+/// root-lease gate. Exactly the `herdr_exec*` family is execution; everything
+/// else in the frozen catalog is `NotExecution`, and a name outside the catalog
+/// is `Unknown` so the gate can fail closed instead of falling through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreExecutionRoute {
+    /// One-shot execution or session start/kill: mutating.
+    Mutating,
+    /// Read-only session inspection.
+    ReadOnly,
+    /// In the frozen catalog, but not an execution route.
+    NotExecution,
+    /// Outside the frozen catalog.
+    Unknown,
+}
+
+pub fn core_execution_route(tool_name: &str) -> CoreExecutionRoute {
+    match tool_name {
+        "herdr_exec" | "herdr_exec_start" | "herdr_exec_kill" => CoreExecutionRoute::Mutating,
+        "herdr_exec_read" => CoreExecutionRoute::ReadOnly,
+        _ if core_public_route(tool_name).is_some() => CoreExecutionRoute::NotExecution,
+        _ => CoreExecutionRoute::Unknown,
+    }
+}
+
+/// Fail-closed refusal for an execution-class tool outside the frozen catalog.
+pub fn core_execution_unknown_refusal(tool_name: &str) -> Value {
+    herdr_core_unsupported(
+        tool_name,
+        "public_tool_route",
+        "unknown herdr-core execution route; no route is claimed for this name and the request was not delivered",
+    )
+}
+
+/// Tool-level #941 verification usable *before* an execution precondition, so the
+/// admitted backend/socket fence stays the first check and its refusal envelope
+/// is identical to the one `public_tool_route` produces.
+pub fn verify_admitted_backend_for_tool(
+    tool_name: &str,
+    admitted: &RuntimeBackendSelection,
+) -> Result<(), Value> {
+    verify_admitted_backend(admitted)
+        .map(|_| ())
+        .map_err(|error| invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection"))
+}
+
 /// A public tool or forwarded method the selected `herdr-core` backend cannot
 /// serve, reported with the same fail-closed envelope as every other admission
 /// rejection.
@@ -5334,5 +5380,42 @@ mod tests {
         }
         // Outside the catalog no Core route is claimed, so nothing falls through.
         assert!(core_public_route("herdr_unknown").is_none());
+    }
+    /// #768 Phase 2 slice 2: only the `herdr_exec*` family is execution; the
+    /// rest of the frozen catalog is `NotExecution` and an off-catalog name is
+    /// `Unknown` (fail closed at the gate, never "not an execution route").
+    #[test]
+    fn core_execution_route_classification_is_explicit_and_fail_closed() {
+        for tool in ["herdr_exec", "herdr_exec_start", "herdr_exec_kill"] {
+            assert_eq!(
+                core_execution_route(tool),
+                CoreExecutionRoute::Mutating,
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            core_execution_route("herdr_exec_read"),
+            CoreExecutionRoute::ReadOnly
+        );
+        for tool in crate::contract::tool_names()
+            .into_iter()
+            .filter(|tool| !tool.starts_with("herdr_exec"))
+        {
+            assert_eq!(
+                core_execution_route(tool),
+                CoreExecutionRoute::NotExecution,
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            core_execution_route("herdr_unknown"),
+            CoreExecutionRoute::Unknown
+        );
+        let refusal = core_execution_unknown_refusal("herdr_unknown");
+        assert_eq!(refusal["ok"], json!(false));
+        assert_eq!(refusal["code"], json!("runtime_capability_unsupported"));
+        assert_eq!(refusal["required_capability"], json!("public_tool_route"));
+        assert_eq!(refusal["delivery_state"], json!("not_delivered"));
+        assert_eq!(refusal["fallback_allowed"], json!(false));
     }
 }
