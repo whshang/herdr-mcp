@@ -3905,7 +3905,6 @@ fn trim_largest_section(sections: &mut serde_json::Map<String, Value>) -> bool {
 /// shared with the disk writer so file and pickup agree on "markdown".
 fn pickup_markdown(handoff_md: &str) -> &str {
     crate::work_compactor::handoff_markdown(handoff_md)
-
 }
 
 fn pickup_response(
