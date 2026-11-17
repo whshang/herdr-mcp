@@ -24,6 +24,7 @@ export const DOC_ORDER = [
   "existing-worker-connect",
   "multi-machine-control",
   "overview",
+  "how-herdr-works",
   "install",
   "chatgpt-connector",
   "quick-start",
@@ -54,7 +55,7 @@ export const READING_ORDER = DOC_ORDER.filter((slug) => !MAINTAINER_DOCS.include
 
 // Group membership is keyed by logical slug only; labels are translated in UI.
 export const NAV_GROUPS = [
-  { slugs: ["agent-install", "existing-worker-connect", "multi-machine-control", "overview", "install", "chatgpt-connector", "quick-start"] },
+  { slugs: ["agent-install", "existing-worker-connect", "multi-machine-control", "overview", "how-herdr-works", "install", "chatgpt-connector", "quick-start"] },
   { slugs: ["best-practices", "automation", "cli-reference"] },
   { slugs: ["browser-continuity", "extension", "browser-control-center", "browser-json-mcp-bridge", "local-agent-webchat-control", "privacy"] },
   { slugs: ["cloudflare-edge-deployment", "cloudflare-edge-token", "runtime-self-upgrade", "platform-support-matrix", "worker-fallbacks", "troubleshooting"] },
