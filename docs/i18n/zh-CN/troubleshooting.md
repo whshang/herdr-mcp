@@ -350,6 +350,12 @@ Chrome/Chromium 对本机 loopback 网络可能要求单独授权。
 
 不要为了一个 route/DNS 问题扩大长期 Worker token 为账号管理员。
 
+## 症状：首台 device 的 bootstrap 失败，但 Worker `/health` 返回 200
+
+Worker 已部署完成；记录 bootstrap 停在哪一步的只有本机持久化 journal。先跑 `herdr-mcp doctor` 看 `LAYER bootstrap-journal`：它会报告停住的 `phase`、`device=enrolled|none`、`recovery_upgrade`、journal 的 `updated` 时间，以及 journal 属于其他 release 时的 `release_match=false`。journal 位于 `~/.config/herdr-mcp/bootstrap/first-worker-v1.json`，是只读证据——不要编辑或删除它。
+
+journal 显示首台 device 凭据已保存、失败发生在之后的步骤时，修复本机错误并在同一台电脑、同一 OS 账号下重跑 `herdr-mcp worker bootstrap`；重试会直接认证同一设备，不重新配对、不重新下发 fleet 秘密。缺失、吊销或不匹配的凭据 fail closed；已吊销或删除的凭据无法通过此路径恢复。绝不删除 Worker、手动改 Worker secret 或手动创建 pairing。
+
 ## 症状：Runtime 升级后出问题
 
 如果只是同一 contract epoch 内的新 runtime implementation：
