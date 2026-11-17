@@ -1309,16 +1309,6 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
         expected_target = Some(value);
     }
-    // #768 Phase 2 slice 1: a mutating `herdr-core` route is refused from the
-    // route table alone, before any admission or connect. `hello.methods`, an
-    // advertised capability and a caller-held root lease can never unlock it:
-    // Core cannot prove access/mutation policy parity, coupled authorization or
-    // that it would write under the same lease.
-    if context.runtime_backend.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
-        && let Some(refusal) = crate::runtime_adapter::core_mutating_route_refusal(name)
-    {
-        return Ok(tool_result(refusal, true));
-    }
     let route = match crate::runtime_adapter::public_tool_route(
         name,
         context.runtime_backend,
