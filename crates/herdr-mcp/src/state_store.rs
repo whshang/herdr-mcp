@@ -18,7 +18,7 @@
 // available while Reliability Kernel features migrate onto this shared store.
 #![allow(dead_code)]
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -137,6 +137,42 @@ pub enum OperationReservation {
     /// state DB already holds more than the bounded cap of durable unknown
     /// tombstones. No actuation may happen; operator reconciliation is
     /// required before further high-risk mutations are admitted.
+    CapacityExhausted,
+}
+/// #332 D-2: durable `client_request_id` ledger record in `operations`. Kept
+/// separate from `OperationRecord` because the D-1 replay rules need
+/// `boot_id` and the reservation payload — fields the generic path does not
+/// select — without disturbing `herdr_exec`/`herdr_prompt` callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRequestRecord {
+    pub op_id: String,
+    pub request_hash: String,
+    pub phase: Option<String>,
+    pub state: Option<String>,
+    pub result_json: Option<String>,
+    pub boot_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+impl ClientRequestRecord {
+    /// Parsed `result_json`; absent or malformed JSON reads as null.
+    pub fn result(&self) -> serde_json::Value {
+        self.result_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// Outcome of atomically reserving a `client_request_id` slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRequestReservation {
+    Reserved,
+    Existing(ClientRequestRecord),
+    /// The durable ledger is at its row cap and no expired read-only terminal
+    /// row was evictable: the submission is refused, never silently executed.
     CapacityExhausted,
 }
 
@@ -821,6 +857,11 @@ pub struct StateStore {
     /// persisted — a restart makes resubmission a fresh request and makes
     /// `request.status` answer `unknown`, which the design doc prescribes.
     request_ledger: crate::request_ledger::RequestLedger,
+    /// #332 D-2: per-boot identity minted at `open`. Persisted
+    /// `client_request_id` reservations record it so a reservation seen after
+    /// a restart can tell "still running" from "crashed mid-flight" and mark
+    /// the row `unknown` instead of replaying.
+    durable_boot_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -855,6 +896,7 @@ impl StateStore {
                 conn,
                 unregistered_source_turns: Vec::new(),
                 request_ledger: crate::request_ledger::RequestLedger::default(),
+                durable_boot_id: crate::durable_request_ledger::new_durable_boot_id(),
             });
         }
 
@@ -876,6 +918,7 @@ impl StateStore {
             conn,
             unregistered_source_turns: Vec::new(),
             request_ledger: crate::request_ledger::RequestLedger::default(),
+            durable_boot_id: crate::durable_request_ledger::new_durable_boot_id(),
         })
     }
 
@@ -982,6 +1025,7 @@ impl StateStore {
             conn,
             unregistered_source_turns: Vec::new(),
             request_ledger: crate::request_ledger::RequestLedger::default(),
+            durable_boot_id: crate::durable_request_ledger::new_durable_boot_id(),
         })
     }
 
@@ -1266,6 +1310,382 @@ impl StateStore {
         existing.map(OperationReservation::Existing).ok_or_else(|| {
             "operation reservation was ignored without an authoritative existing row".to_owned()
         })
+    }
+
+    // --- #332 D-2 durable `client_request_id` ledger ---
+    //
+    // Reuses the schema-16 `operations` table under the dedicated
+    // `*.client_request.v1` kinds. Row lifecycle is governed by the kind's own
+    // cleanup inside the reservation transaction: expired *read* rows are
+    // deleted, overdue write summaries are compacted to `expired:true`
+    // tombstones, and pending/unknown/write-complete rows are never pruned.
+
+    /// Per-boot identity minted at `open`; distinguishes own-boot `pending`
+    /// rows (still executing) from crashed-boot rows (delivery unknown).
+    pub fn durable_boot_id(&self) -> &str {
+        &self.durable_boot_id
+    }
+
+    /// Atomically reserve `(kind, key_digest)` for one `client_request_id`
+    /// submission. One Immediate transaction performs the kind-scoped
+    /// cleanup, the `INSERT OR IGNORE` claim, the capacity check, and — on a
+    /// contested key — the authoritative-row read.
+    ///
+    /// `boot_id` is persisted on the reservation; `expires_at` is `Some` only
+    /// for read-intent rows. On a unique-index miss the existing row is
+    /// returned verbatim — callers compare `request_hash` to decide
+    /// replay/conflict; this function never judges fingerprints.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_client_request(
+        &mut self,
+        kind: &str,
+        key_digest: &str,
+        request_hash: &str,
+        op_id: &str,
+        reservation_json: &str,
+        boot_id: &str,
+        now_ms: i64,
+        expires_at: Option<i64>,
+    ) -> Result<ClientRequestReservation, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin client request reservation: {error}"))?;
+        // (1) Drop expired client-request rows. Only rows with a non-NULL
+        // `expires_at` can match; pending/unknown/write-complete/tombstone
+        // rows all carry NULL by contract, so this can only ever delete
+        // expired read-intent reservations and completions.
+        tx.execute(
+            "DELETE FROM operations
+             WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')
+               AND expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now_ms],
+        )
+        .map_err(|error| format!("cannot prune expired client requests: {error}"))?;
+        // (2) Compress write-intent `complete` rows whose logical summary
+        // deadline passed into hash-only tombstones. `expires_at` stays NULL:
+        // a tombstoned key must remain permanently claimed. Rebuilds
+        // `result_json` because SQL has no delete-json-key primitive.
+        tx.execute(
+            "UPDATE operations
+             SET result_json = json_object(
+                     'schema', 1,
+                     'intent', json_extract(result_json, '$.intent'),
+                     'outcome', 'expired',
+                     'expired', json('true'),
+                     'safe_retry_mode', 'none',
+                     'request_id', json_extract(result_json, '$.request_id'),
+                     'key_digest', ?2,
+                     'request_hash', request_hash),
+                 updated_at = ?1
+             WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')
+               AND state = 'complete'
+               AND COALESCE(json_extract(result_json, '$.expired'), 0) = 0
+               AND json_extract(result_json, '$.summary_expires_at_ms') IS NOT NULL
+               AND json_extract(result_json, '$.summary_expires_at_ms') <= ?1",
+            params![now_ms, key_digest],
+        )
+        .map_err(|error| format!("cannot compact expired client request summaries: {error}"))?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO operations (
+                    op_id, kind, idempotency_key, request_hash, phase, state,
+                    boot_id, created_at, updated_at, expires_at, result_json
+                 ) VALUES (?1, ?2, ?3, ?4, 'reserved', 'pending', ?5, ?6, ?6, ?7, ?8)",
+                params![
+                    op_id,
+                    kind,
+                    key_digest,
+                    request_hash,
+                    boot_id,
+                    now_ms,
+                    expires_at,
+                    reservation_json
+                ],
+            )
+            .map_err(|error| format!("cannot reserve client request: {error}"))?;
+        if inserted == 1 {
+            // Capacity: expired read completions were deleted above, so every
+            // remaining row is non-evictable (pending, unknown, write
+            // complete/tombstone, or a still-live read row). Refuse the new
+            // key rather than dropping a record — mirroring the in-memory
+            // ledger's capacity refusal.
+            let rows: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM operations
+                     WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("cannot count client requests: {error}"))?;
+            if rows > crate::durable_request_ledger::CLIENT_REQUEST_LEDGER_MAX_ROWS {
+                return Ok(ClientRequestReservation::CapacityExhausted);
+            }
+            tx.commit()
+                .map_err(|error| format!("cannot commit client request reservation: {error}"))?;
+            return Ok(ClientRequestReservation::Reserved);
+        }
+        let existing = Self::client_request_record_in_tx(&tx, kind, key_digest)
+            .map_err(|error| format!("cannot read reserved client request: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit client request lookup: {error}"))?;
+        existing
+            .map(ClientRequestReservation::Existing)
+            .ok_or_else(|| {
+                "client request reservation was ignored without an authoritative existing row"
+                    .to_owned()
+            })
+    }
+
+    fn client_request_record_in_tx(
+        tx: &Transaction<'_>,
+        kind: &str,
+        key_digest: &str,
+    ) -> Result<Option<ClientRequestRecord>, rusqlite::Error> {
+        tx.query_row(
+            "SELECT op_id, request_hash, phase, state, result_json, boot_id,
+                    created_at, updated_at, expires_at
+             FROM operations
+             WHERE kind = ?1 AND idempotency_key = ?2",
+            params![kind, key_digest],
+            |row| {
+                Ok(ClientRequestRecord {
+                    op_id: row.get(0)?,
+                    request_hash: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    phase: row.get(2)?,
+                    state: row.get(3)?,
+                    result_json: row.get(4)?,
+                    boot_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    expires_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Convert a `pending` client-request row written by a different boot into
+    /// a durable `unknown` tombstone and return the updated record. Returns
+    /// `Ok(None)` when the row already left `pending` (raced settle); callers
+    /// must re-read through `reserve_client_request`.
+    pub fn settle_pending_client_request_unknown(
+        &mut self,
+        kind: &str,
+        key_digest: &str,
+        now_ms: i64,
+    ) -> Result<Option<ClientRequestRecord>, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin unknown conversion: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE operations
+                 SET phase = 'settled', state = 'unknown', expires_at = NULL,
+                     updated_at = ?1,
+                     result_json = json_object(
+                         'schema', 1,
+                         'intent', json_extract(result_json, '$.intent'),
+                         'outcome', 'unknown',
+                         'safe_retry_mode', 'inspect_before_retry',
+                         'delivery_state', 'delivery_unknown',
+                         'request_id', json_extract(result_json, '$.request_id'))
+                 WHERE kind = ?2 AND idempotency_key = ?3 AND state = 'pending'",
+                params![now_ms, kind, key_digest],
+            )
+            .map_err(|error| format!("cannot mark client request unknown: {error}"))?;
+        if changed != 1 {
+            tx.commit()
+                .map_err(|error| format!("cannot commit empty unknown conversion: {error}"))?;
+            return Ok(None);
+        }
+        let record = Self::client_request_record_in_tx(&tx, kind, key_digest)
+            .map_err(|error| format!("cannot read converted client request: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("cannot commit unknown conversion: {error}"))?;
+        Ok(record)
+    }
+
+    /// Mark a reserved client-request row `complete` with its bounded replay
+    /// payload. Mirrors `complete_operation`; `expires_at` stays `None` for
+    /// write intents forever.
+    pub fn complete_client_request(
+        &mut self,
+        kind: &str,
+        key_digest: &str,
+        request_hash: &str,
+        result_json: &str,
+        now_ms: i64,
+        expires_at: Option<i64>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin client request completion: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE operations
+                 SET phase = 'settled', state = 'complete', result_json = ?1,
+                     updated_at = ?2, expires_at = ?3
+                 WHERE kind = ?4 AND idempotency_key = ?5 AND request_hash = ?6
+                   AND state = 'pending'",
+                params![
+                    result_json,
+                    now_ms,
+                    expires_at,
+                    kind,
+                    key_digest,
+                    request_hash
+                ],
+            )
+            .map_err(|error| format!("cannot complete client request: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "client request completion expected one pending row, updated {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit client request completion: {error}"))
+    }
+
+    /// Settle a reserved client-request row to durable `unknown`. The row
+    /// keeps its op_id, never expires, and can only be cleared by explicit
+    /// reconciliation — never re-reserved automatically.
+    pub fn complete_client_request_unknown(
+        &mut self,
+        kind: &str,
+        key_digest: &str,
+        request_hash: &str,
+        result_json: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin unknown client request completion: {error}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE operations
+                 SET phase = 'settled', state = 'unknown', expires_at = NULL,
+                     updated_at = ?2, result_json = ?1
+                 WHERE kind = ?3 AND idempotency_key = ?4 AND request_hash = ?5
+                   AND state = 'pending'",
+                params![result_json, now_ms, kind, key_digest, request_hash],
+            )
+            .map_err(|error| format!("cannot record unknown client request: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "unknown client request completion expected one pending row, updated {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit unknown client request: {error}"))
+    }
+
+    /// Atomically release a still-pending reservation — the caller proved the
+    /// first attempt never delivered (pre-delivery rejection). The key may be
+    /// re-reserved after the caller's own checks pass again.
+    pub fn release_client_request_reservation(
+        &mut self,
+        kind: &str,
+        key_digest: &str,
+        request_hash: &str,
+        op_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin client request release: {error}"))?;
+        let changed = tx
+            .execute(
+                "DELETE FROM operations
+                 WHERE kind = ?1 AND idempotency_key = ?2 AND request_hash = ?3
+                   AND op_id = ?4 AND state = 'pending'",
+                params![kind, key_digest, request_hash, op_id],
+            )
+            .map_err(|error| format!("cannot release client request: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "client request release expected one matching pending row, deleted {changed}"
+            ));
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit client request release: {error}"))
+    }
+
+    /// Read one durable client-request row by `(kind, key_digest)`.
+    pub fn client_request_record(
+        &self,
+        kind: &str,
+        key_digest: &str,
+    ) -> Result<Option<ClientRequestRecord>, String> {
+        self.conn
+            .query_row(
+                "SELECT op_id, request_hash, phase, state, result_json, boot_id,
+                        created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind = ?1 AND idempotency_key = ?2",
+                params![kind, key_digest],
+                |row| {
+                    Ok(ClientRequestRecord {
+                        op_id: row.get(0)?,
+                        request_hash: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        phase: row.get(2)?,
+                        state: row.get(3)?,
+                        result_json: row.get(4)?,
+                        boot_id: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                        expires_at: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read client request record: {error}"))
+    }
+
+    /// Read a client-request row by the first call's recorded `request_id`
+    /// (the `request_hash` tail). Scans at most the bounded client-request
+    /// namespace; status queries are infrequent.
+    pub fn client_request_record_for_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ClientRequestRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT op_id, request_hash, phase, state, result_json, boot_id,
+                        created_at, updated_at, expires_at
+                 FROM operations
+                 WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')",
+            )
+            .map_err(|error| format!("cannot prepare client request id lookup: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ClientRequestRecord {
+                    op_id: row.get(0)?,
+                    request_hash: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    phase: row.get(2)?,
+                    state: row.get(3)?,
+                    result_json: row.get(4)?,
+                    boot_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    expires_at: row.get(8)?,
+                })
+            })
+            .map_err(|error| format!("cannot query client request id: {error}"))?;
+        for record in rows {
+            let record =
+                record.map_err(|error| format!("cannot decode client request record: {error}"))?;
+            if crate::durable_request_ledger::request_id_from_hash(&record.request_hash)
+                == Some(request_id)
+            {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 
     /// Mark one reserved operation complete and persist the bounded replay
