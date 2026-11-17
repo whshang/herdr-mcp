@@ -145,6 +145,17 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                             "name": {"type": "string", "maxLength": 32, "description": "Optional agent name matching [a-z][a-z0-9_-]{0,31}; defaults to kind plus a short stable suffix derived from the idempotency_key."},
                             "workspace_id": {"type": "string", "maxLength": 256, "description": "Target workspace id or unique label. Required unless cwd is inside exactly one live workspace."},
                             "cwd": {"type": "string", "maxLength": 1024, "description": "Absolute cwd inside a managed project root from the live topology; defaults to the workspace checkout path. Validated lexically, never by canonicalizing or running git."},
+                            "worktree": {
+                                "type": "object",
+                                "description": "Optional task-owned linked worktree created before the pane. Requires workspace_id; cwd is taken from the native worktree.create receipt and the receipt is persisted with the dispatch outcome.",
+                                "properties": {
+                                    "branch": {"type": "string", "maxLength": 256, "description": "Required branch or ref for worktree.create."},
+                                    "base": {"type": "string", "maxLength": 256, "description": "Optional base ref passed to worktree.create."},
+                                    "path": {"type": "string", "maxLength": 1024, "description": "Optional absolute checkout path inside a managed project root."}
+                                },
+                                "required": ["branch"],
+                                "additionalProperties": false
+                            },
                             "tab_label": {"type": "string", "maxLength": 64, "description": "Label for the new tab (default path only); defaults to the agent name."},
                             "split_from": {"type": "string", "maxLength": 256, "description": "Optional parent pane id for pane.split. Without it the pane is created as a new tab so the agent gets the full tab width. A horizontal split still respects the readable-width floor and fails with pane_split_too_narrow."},
                             "direction": {"type": "string", "enum": ["right", "down"], "description": "Split direction; requires split_from and defaults to right."},
