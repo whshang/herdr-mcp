@@ -806,6 +806,12 @@ impl PromptRegistry {
             .lock()
             .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
         if let Some(existing) = self.load_task(task_id)? {
+            // #332 B-1: a runtime that crashed between the new row and the
+            // supersede updates (pre-atomic versions, or a DB fault) leaves the
+            // older steering records adoptable. Re-applying supersession is
+            // idempotent and only touches still-unacknowledged records on this
+            // lane, so the retry heals the crash window before returning.
+            self.supersede_unacknowledged_tasks(&existing)?;
             return Ok(Some(existing));
         }
 
@@ -914,22 +920,21 @@ impl PromptRegistry {
         record.max_runtime_ms = max_runtime_ms;
         record.on_budget = on_budget.map(str::to_owned);
         record.request_id = request_id.map(str::to_owned);
-        self.save_task(&record, Some(fingerprint))?;
-        self.supersede_unacknowledged_tasks(&record)?;
+        self.persist_task_with_supersede(&record, Some(fingerprint))?;
         drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
         Ok(reconciled.or(Some(record)))
     }
-    /// #332 B-1: every still-unacknowledged steering on this task's lane
-    /// (same resolved pane or same unresolved target) is superseded by the
-    /// record just persisted. Records already acknowledged (`running`) or
-    /// terminal keep their own stage: a new prompt cannot retroactively
-    /// unsend work the agent already picked up. Runs under the same
-    /// `task_mutations` guard as the task write, before the new record's
-    /// reconcile, so a stale snapshot cannot unmark a supersession.
-    fn supersede_unacknowledged_tasks(&self, task: &PromptTaskRecord) -> Result<(), String> {
-        let now = self.now_ms();
-        for mut prior in self.list_active_tasks()? {
+    /// Every still-unacknowledged steering on this task's lane (same resolved
+    /// pane or same unresolved target). Records already acknowledged (`running`)
+    /// or terminal keep their own stage: a new prompt cannot retroactively
+    /// unsend work the agent already picked up.
+    fn unacknowledged_priors(
+        &self,
+        task: &PromptTaskRecord,
+    ) -> Result<Vec<PromptTaskRecord>, String> {
+        let mut priors = Vec::new();
+        for prior in self.list_active_tasks()? {
             if prior.task_id == task.task_id
                 || !task_matches_target(&prior, &task.target, task.pane_id.as_deref())
             {
@@ -939,9 +944,60 @@ impl PromptRegistry {
                 .steering_state
                 .clone()
                 .unwrap_or_else(|| steering_for_lifecycle(&prior.lifecycle).to_owned());
-            if !matches!(prior_stage.as_str(), "submitted" | "queued" | "delivered") {
-                continue;
+            if matches!(prior_stage.as_str(), "submitted" | "queued" | "delivered") {
+                priors.push(prior);
             }
+        }
+        Ok(priors)
+    }
+
+    /// Persist the new steering record **and** the supersede updates of the
+    /// records it replaces in one SQLite transaction (#332 B-1).
+    ///
+    /// Before this, the new row committed first and each prior row committed
+    /// separately, so a crash between them left an older `submitted|queued|
+    /// delivered` record adoptable forever. Runs under the same
+    /// `task_mutations` guard as before, before the new record's reconcile, so a
+    /// stale snapshot cannot unmark a supersession.
+    fn persist_task_with_supersede(
+        &self,
+        task: &PromptTaskRecord,
+        request_hash: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(());
+        };
+        let now = self.now_ms();
+        let mut rows = vec![encode_task_ledger_row(task, request_hash, now)?];
+        for mut prior in self.unacknowledged_priors(task)? {
+            prior.steering_state = Some("superseded".to_owned());
+            prior.superseded_by = Some(task.task_id.clone());
+            prior.updated_at_ms = now;
+            rows.push(encode_task_ledger_row(&prior, None, now)?);
+        }
+        let mut store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        // Same unknown-key preservation as `save_task`: merging against the
+        // stored row happens under the lock that guards the batch write.
+        for row in &mut rows {
+            let stored_json = store
+                .operation_ledger(&row.id)?
+                .filter(|record| record.kind == PROMPT_TASK_OPERATION_KIND)
+                .and_then(|record| record.result_json);
+            row.json = merge_task_json(stored_json.as_deref(), std::mem::take(&mut row.json));
+        }
+        let inputs = rows
+            .iter()
+            .map(TaskLedgerRow::as_input)
+            .collect::<Vec<OperationLedgerInput<'_>>>();
+        store.put_operation_ledgers_atomic(&inputs)
+    }
+
+    /// Idempotent repair path: re-apply supersession for one existing task.
+    fn supersede_unacknowledged_tasks(&self, task: &PromptTaskRecord) -> Result<(), String> {
+        let now = self.now_ms();
+        for mut prior in self.unacknowledged_priors(task)? {
             prior.steering_state = Some("superseded".to_owned());
             prior.superseded_by = Some(task.task_id.clone());
             prior.updated_at_ms = now;
@@ -1879,7 +1935,86 @@ impl PromptRegistry {
             });
     }
 
+    /// #332 B-1 review P1: repair leftover supersession gaps. A pre-atomic
+    /// runtime (or a DB fault) could commit a new steering row without the
+    /// `superseded` marks on the older unacknowledged records it replaced.
+    /// The oldest strictly-newer task on the same lane is the superseder —
+    /// identical to the arrival order `persist_task_with_supersede` encodes —
+    /// and re-marking the same rows is idempotent, so this pass is safe to run
+    /// on every reconcile, at startup and afterwards.
+    fn repair_supersession_gaps(&self) {
+        let Ok(tasks) = self.list_tasks(512) else {
+            return;
+        };
+        let now = self.now_ms();
+        let mut repaired: Vec<PromptTaskRecord> = Vec::new();
+        for prior in &tasks {
+            if prior.is_terminal() {
+                continue;
+            }
+            let stage = prior
+                .steering_state
+                .clone()
+                .unwrap_or_else(|| steering_for_lifecycle(&prior.lifecycle).to_owned());
+            if !matches!(stage.as_str(), "submitted" | "queued" | "delivered") {
+                continue;
+            }
+            let superseder = tasks
+                .iter()
+                .filter(|candidate| {
+                    candidate.task_id != prior.task_id
+                        && task_matches_target(
+                            prior,
+                            &candidate.target,
+                            candidate.pane_id.as_deref(),
+                        )
+                        && (candidate.created_at_ms, candidate.task_id.as_str())
+                            > (prior.created_at_ms, prior.task_id.as_str())
+                })
+                .min_by_key(|candidate| (candidate.created_at_ms, candidate.task_id.as_str()));
+            let Some(superseder) = superseder else {
+                continue;
+            };
+            let mut healed = prior.clone();
+            healed.steering_state = Some("superseded".to_owned());
+            healed.superseded_by = Some(superseder.task_id.clone());
+            healed.updated_at_ms = now;
+            repaired.push(healed);
+        }
+        if repaired.is_empty() {
+            return;
+        }
+        let Some(store) = self.inner.store.as_ref() else {
+            return;
+        };
+        let Ok(mut store) = store.lock() else {
+            return;
+        };
+        let mut rows = Vec::with_capacity(repaired.len());
+        for task in &repaired {
+            match encode_task_ledger_row(task, None, now) {
+                Ok(mut row) => {
+                    let stored_json = store
+                        .operation_ledger(&row.id)
+                        .ok()
+                        .flatten()
+                        .filter(|record| record.kind == PROMPT_TASK_OPERATION_KIND)
+                        .and_then(|record| record.result_json);
+                    row.json = merge_task_json(stored_json.as_deref(), row.json);
+                    rows.push(row);
+                }
+                Err(_) => return,
+            }
+        }
+        let inputs = rows
+            .iter()
+            .map(TaskLedgerRow::as_input)
+            .collect::<Vec<OperationLedgerInput<'_>>>();
+        let _ = store.put_operation_ledgers_atomic(&inputs);
+    }
+
     fn reconcile_active_tasks(&self) {
+        self.repair_supersession_gaps();
         let Ok(tasks) = self.list_tasks(512) else {
             return;
         };
@@ -2493,13 +2628,24 @@ impl PromptRegistry {
         let Some(store) = self.inner.store.as_ref() else {
             return Ok(());
         };
-        let encoded = serde_json::to_string(task)
-            .map_err(|error| format!("cannot encode agent task: {error}"))?;
-        let now = now_ms();
-        let expires_at = now.saturating_add(prompt_task_ttl_ms());
         let mut store = store
             .lock()
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        // Preserve keys this build does not know (#332 B-1 review P2): a row
+        // written by a newer schema keeps its extra fields when this runtime
+        // rewrites `result_json`. Read happens under the same store lock that
+        // guards the write below.
+        let stored_json = store
+            .operation_ledger(&task.task_id)?
+            .filter(|record| record.kind == PROMPT_TASK_OPERATION_KIND)
+            .and_then(|record| record.result_json);
+        let encoded = merge_task_json(
+            stored_json.as_deref(),
+            serde_json::to_string(task)
+                .map_err(|error| format!("cannot encode agent task: {error}"))?,
+        );
+        let now = now_ms();
+        let expires_at = now.saturating_add(prompt_task_ttl_ms());
         store.put_operation_ledger(OperationLedgerInput {
             op_id: &task.task_id,
             kind: PROMPT_TASK_OPERATION_KIND,
@@ -2516,6 +2662,140 @@ impl PromptRegistry {
             expires_at: Some(i64::try_from(expires_at).unwrap_or(i64::MAX)),
         })
     }
+}
+
+/// One encoded `herdr_prompt_task` ledger row, ready for an atomic batch.
+struct TaskLedgerRow {
+    id: String,
+    json: String,
+    phase: &'static str,
+    state: &'static str,
+    hash: Option<String>,
+    // Preserved from `save_task`: the idempotency digest is a durable lookup
+    // key (`task_operation_ids_by_key_digest`), so a batch write must not drop it.
+    idempotency_key: Option<String>,
+    now_ms: i64,
+    expires_at: Option<i64>,
+}
+
+impl TaskLedgerRow {
+    fn as_input(&self) -> OperationLedgerInput<'_> {
+        OperationLedgerInput {
+            op_id: &self.id,
+            kind: PROMPT_TASK_OPERATION_KIND,
+            idempotency_key: self.idempotency_key.as_deref(),
+            request_hash: self.hash.as_deref(),
+            phase: self.phase,
+            state: self.state,
+            result_json: &self.json,
+            now_ms: self.now_ms,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+fn encode_task_ledger_row(
+    task: &PromptTaskRecord,
+    request_hash: Option<&str>,
+    now: u64,
+) -> Result<TaskLedgerRow, String> {
+    let encoded = serde_json::to_string(task)
+        .map_err(|error| format!("cannot encode agent task: {error}"))?;
+    let expires_at = now.saturating_add(prompt_task_ttl_ms());
+    Ok(TaskLedgerRow {
+        id: task.task_id.clone(),
+        json: encoded,
+        phase: if task.is_terminal() {
+            "terminal"
+        } else {
+            "active"
+        },
+        state: task.lifecycle.as_str(),
+        hash: request_hash.map(str::to_owned),
+        idempotency_key: task.idempotency_key_digest.clone(),
+        now_ms: i64::try_from(now).unwrap_or(i64::MAX),
+        expires_at: Some(i64::try_from(expires_at).unwrap_or(i64::MAX)),
+    })
+}
+
+/// Top-level `result_json` keys this struct serializes (`gate` is
+/// `#[serde(skip)]` and never persisted). A new persisted field MUST be added
+/// here: `known_task_keys_cover_all_serialized_fields` fails otherwise, and
+/// without it `merge_task_json` would resurrect a cleared value on rewrite.
+const KNOWN_TASK_KEYS: &[&str] = &[
+    "schema_version",
+    "task_id",
+    "dispatch_id",
+    "target",
+    "requested_target",
+    "idempotency_key_digest",
+    "pane_id",
+    "workspace_id",
+    "baseline_status",
+    "baseline_seq",
+    "start_cursor",
+    "last_cursor",
+    "lifecycle",
+    "activity_observed",
+    "prior_settle_observed",
+    "turn_id",
+    "turn_seq",
+    "exact_native_turn",
+    "terminal_status",
+    "terminal_cursor",
+    "terminal_at_ms",
+    "final_excerpt",
+    "awaiting_children",
+    "parent_target",
+    "parent_session_ref",
+    "boot_epoch",
+    "notification_state",
+    "notification_attempts",
+    "notification_at_ms",
+    "notification_error",
+    "acknowledged_at_ms",
+    "created_at_ms",
+    "updated_at_ms",
+    "last_heartbeat_at_ms",
+    "worker_done_at_ms",
+    "worker_done_summary",
+    "stall_after_ms",
+    "request_id",
+    "max_runtime_ms",
+    "on_budget",
+    "budget_events",
+    "repair_attempts",
+    "repair_exhausted_at_ms",
+    "steering_state",
+    "superseded_by",
+];
+
+/// Overlay `new_json` onto the row's stored `result_json`, keeping only keys
+/// this struct does not serialize (anything outside `KNOWN_TASK_KEYS`).
+/// Fields a newer runtime wrote survive a downgrade→write→upgrade cycle
+/// instead of being dropped (#332 B-1 review P2). Known keys always come from
+/// the fresh serialization, so a cleared Option is never resurrected from the
+/// stale row. A stored payload that is not a JSON object is replaced whole.
+fn merge_task_json(stored: Option<&str>, new_json: String) -> String {
+    let Some(stored) = stored else {
+        return new_json;
+    };
+    let (Ok(mut new_value), Ok(stored_value)) = (
+        serde_json::from_str::<Value>(&new_json),
+        serde_json::from_str::<Value>(stored),
+    ) else {
+        return new_json;
+    };
+    let (Some(new_obj), Some(stored_obj)) = (new_value.as_object_mut(), stored_value.as_object())
+    else {
+        return new_json;
+    };
+    for (key, value) in stored_obj {
+        if !new_obj.contains_key(key) && !KNOWN_TASK_KEYS.contains(&key.as_str()) {
+            new_obj.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::to_string(&new_value).unwrap_or(new_json)
 }
 
 fn mark_delivery_uncertain(task: &mut PromptTaskRecord, now_ms: u64, reason: &str) -> bool {
@@ -12509,6 +12789,318 @@ mod tests {
 
         drop(reopened);
         remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a new steering and an unacknowledged older one |
+    /// When the durable batch fails after the new row | Then neither row is
+    /// committed and the older record is still not superseded (crash window).
+    #[test]
+    fn steering_registration_is_atomic_with_the_supersede_updates() {
+        let (db_path, registry) = task_registry("supersede-atomic");
+        let first_id = "dispatch:prompt:atomic-first";
+        let second_id = "dispatch:prompt:atomic-second";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+
+        let before = task_agent_state("w1:p1", "idle", 1);
+        let after = task_agent_state("w1:p1", "idle", 1);
+        let input = |id: &'static str, cursor: u64| RegisterTaskInput {
+            task_id: id,
+            target: "child",
+            requested_target: None,
+            fingerprint: id,
+            idempotency_key: None,
+            before: Some(&before),
+            after: Some(&after),
+            submitted: Some(true),
+            start_cursor: cursor,
+            parent_target: None,
+            parent_session_ref: None,
+            stall_after_ms: None,
+            request_id: None,
+            max_runtime_ms: None,
+            on_budget: None,
+        };
+
+        crate::state_store::test_hooks::inject_ledger_batch_failure_after(Some(1));
+        let failed = registry.register_task(input(second_id, 20));
+        crate::state_store::test_hooks::inject_ledger_batch_failure_after(None);
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(
+            registry.load_task(second_id).unwrap().is_none(),
+            "the new row must roll back with the failed batch"
+        );
+        let prior = registry.load_task(first_id).unwrap().unwrap();
+        assert_ne!(
+            prior.steering_state.as_deref(),
+            Some("superseded"),
+            "a failed batch must not leave a half-applied supersession: {prior:?}"
+        );
+
+        // The retry commits the new row and the supersede update together.
+        registry
+            .register_task(input(second_id, 20))
+            .unwrap()
+            .unwrap();
+        let prior = registry.load_task(first_id).unwrap().unwrap();
+        assert_eq!(prior.steering_state.as_deref(), Some("superseded"));
+        assert_eq!(prior.superseded_by.as_deref(), Some(second_id));
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a runtime that crashed after committing the new
+    /// steering row but before the supersede update | When the same task is
+    /// retried | Then the retry heals the older record instead of returning
+    /// early, so the stale record can no longer be adopted.
+    #[test]
+    fn retry_of_existing_steering_task_heals_a_legacy_crash_window() {
+        let (db_path, registry) = task_registry("supersede-heal");
+        let first_id = "dispatch:prompt:heal-first";
+        let second_id = "dispatch:prompt:heal-second";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+
+        // Simulate the pre-atomic crash: the new row exists and the older row
+        // was never superseded.
+        let new = escalation_task(second_id, "child", PromptTaskLifecycle::AwaitingActivity, 0);
+        registry.save_task(&new, Some("fp")).unwrap();
+        assert_ne!(
+            registry
+                .load_task(first_id)
+                .unwrap()
+                .unwrap()
+                .steering_state
+                .as_deref(),
+            Some("superseded")
+        );
+
+        let before = task_agent_state("w1:p1", "idle", 1);
+        let after = task_agent_state("w1:p1", "idle", 1);
+        let retried = registry
+            .register_task(RegisterTaskInput {
+                task_id: second_id,
+                target: "child",
+                requested_target: None,
+                fingerprint: "fp",
+                idempotency_key: None,
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor: 20,
+                parent_target: None,
+                parent_session_ref: None,
+                stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.task_id, second_id);
+        let prior = registry.load_task(first_id).unwrap().unwrap();
+        assert_eq!(prior.steering_state.as_deref(), Some("superseded"));
+        assert_eq!(prior.superseded_by.as_deref(), Some(second_id));
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a superseded record written by B-1 | When a
+    /// pre-B-1 runtime rewrites `result_json` from its own struct | Then only
+    /// the new audit fields are dropped; the task still loads and its
+    /// lifecycle/outcome survive (honest rollback boundary).
+    #[test]
+    fn pre_b1_rewrite_drops_only_the_new_steering_audit_fields() {
+        let (db_path, registry) = task_registry("supersede-rollback");
+        let first_id = "dispatch:prompt:rollback-first";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+        register_pending_task(
+            &registry,
+            "dispatch:prompt:rollback-second",
+            "child",
+            "w1:p1",
+            20,
+        );
+        assert_eq!(
+            registry
+                .load_task(first_id)
+                .unwrap()
+                .unwrap()
+                .steering_state
+                .as_deref(),
+            Some("superseded")
+        );
+
+        let store = registry.inner.store.clone().unwrap();
+        let encoded = {
+            let guard = store.lock().unwrap();
+            let record = guard.operation_ledger(first_id).unwrap().unwrap();
+            let mut value: Value =
+                serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+            value.as_object_mut().unwrap().remove("steering_state");
+            value.as_object_mut().unwrap().remove("superseded_by");
+            serde_json::to_string(&value).unwrap()
+        };
+        {
+            let mut guard = store.lock().unwrap();
+            guard
+                .put_operation_ledger(OperationLedgerInput {
+                    op_id: first_id,
+                    kind: PROMPT_TASK_OPERATION_KIND,
+                    idempotency_key: None,
+                    request_hash: None,
+                    phase: "active",
+                    state: "awaiting_activity",
+                    result_json: &encoded,
+                    now_ms: 100,
+                    expires_at: None,
+                })
+                .unwrap();
+        }
+        let reloaded = registry.load_task(first_id).unwrap().unwrap();
+        assert_eq!(reloaded.steering_state, None);
+        assert_eq!(reloaded.superseded_by, None);
+        assert_eq!(reloaded.lifecycle, PromptTaskLifecycle::AwaitingActivity);
+        assert_eq!(reloaded.task_id, first_id);
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a runtime that crashed after committing the
+    /// new steering row but before the supersede update | When startup
+    /// reconcile runs | Then the older record is superseded by the earliest
+    /// newer task on the lane and the repair is idempotent.
+    #[test]
+    fn reconcile_repairs_a_supersession_gap_left_by_a_crash() {
+        let (db_path, registry) = task_registry("supersede-gap");
+        let first_id = "dispatch:prompt:gap-first";
+        let second_id = "dispatch:prompt:gap-second";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+
+        // Simulate the pre-atomic crash: the newer row was committed and the
+        // older unacknowledged row was never marked.
+        let newer = escalation_task(second_id, "child", PromptTaskLifecycle::AwaitingActivity, 0);
+        registry.save_task(&newer, Some("fp")).unwrap();
+        assert_ne!(
+            registry
+                .load_task(first_id)
+                .unwrap()
+                .unwrap()
+                .steering_state
+                .as_deref(),
+            Some("superseded")
+        );
+
+        // Startup reconcile (also the tracker pass) heals the gap without any
+        // caller retrying the newer task.
+        registry.reconcile_active_tasks();
+        let prior = registry.load_task(first_id).unwrap().unwrap();
+        assert_eq!(prior.steering_state.as_deref(), Some("superseded"));
+        assert_eq!(prior.superseded_by.as_deref(), Some(second_id));
+
+        // Idempotent: a second pass keeps the same superseder instead of
+        // walking the chain forward.
+        registry.reconcile_active_tasks();
+        let prior = registry.load_task(first_id).unwrap().unwrap();
+        assert_eq!(prior.superseded_by.as_deref(), Some(second_id));
+        let newest = registry.load_task(second_id).unwrap().unwrap();
+        assert_ne!(newest.steering_state.as_deref(), Some("superseded"));
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a ledger row written with a field this build
+    /// does not know | When the task is decoded and re-saved by this runtime |
+    /// Then the unknown field survives the read-modify-write roundtrip
+    /// (downgrade→upgrade field preservation, #332 B-1 review P2).
+    #[test]
+    fn ledger_rewrite_preserves_fields_from_a_newer_record_shape() {
+        let (db_path, registry) = task_registry("field-preserve");
+        let task_id = "dispatch:prompt:keep-field";
+        register_pending_task(&registry, task_id, "child", "w1:p1", 10);
+
+        let store = registry.inner.store.clone().unwrap();
+        {
+            let mut guard = store.lock().unwrap();
+            let record = guard.operation_ledger(task_id).unwrap().unwrap();
+            let mut value: Value =
+                serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+            value["future_runtime_field"] = json!({"enabled": true});
+            let encoded = serde_json::to_string(&value).unwrap();
+            guard
+                .put_operation_ledger(OperationLedgerInput {
+                    op_id: task_id,
+                    kind: PROMPT_TASK_OPERATION_KIND,
+                    idempotency_key: None,
+                    request_hash: None,
+                    phase: "active",
+                    state: "awaiting_activity",
+                    result_json: &encoded,
+                    now_ms: 100,
+                    expires_at: None,
+                })
+                .unwrap();
+        }
+
+        // Decode + rewrite through this runtime's save path, the same
+        // read-modify-write a repair pass performs.
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        task.updated_at_ms = 12345;
+        registry.save_task(&task, None).unwrap();
+
+        let guard = store.lock().unwrap();
+        let record = guard.operation_ledger(task_id).unwrap().unwrap();
+        let value: Value = serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(value["future_runtime_field"], json!({"enabled": true}));
+        assert_eq!(value["updated_at_ms"], json!(12345));
+
+        drop(guard);
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// Every key `PromptTaskRecord` can serialize must be listed in
+    /// `KNOWN_TASK_KEYS`; a missing entry would let `merge_task_json`
+    /// resurrect a cleared field from a stale row.
+    #[test]
+    fn known_task_keys_cover_all_serialized_fields() {
+        let mut task = excerpt_test_task("dispatch:prompt:key-coverage");
+        task.requested_target = Some("x".to_owned());
+        task.idempotency_key_digest = Some("x".to_owned());
+        task.turn_seq = Some(1);
+        task.terminal_status = Some("x".to_owned());
+        task.terminal_cursor = Some(1);
+        task.terminal_at_ms = Some(1);
+        task.final_excerpt = Some("x".to_owned());
+        task.awaiting_children = Some(1);
+        task.parent_target = Some("x".to_owned());
+        task.parent_session_ref = Some("x".to_owned());
+        task.notification_at_ms = Some(1);
+        task.notification_error = Some("x".to_owned());
+        task.acknowledged_at_ms = Some(1);
+        task.last_heartbeat_at_ms = Some(1);
+        task.worker_done_at_ms = Some(1);
+        task.worker_done_summary = Some("x".to_owned());
+        task.stall_after_ms = Some(1);
+        task.request_id = Some("x".to_owned());
+        task.max_runtime_ms = Some(1);
+        task.on_budget = Some("x".to_owned());
+        task.budget_events = vec![json!({"event": "x"})];
+        task.repair_attempts = 1;
+        task.repair_exhausted_at_ms = Some(1);
+        task.steering_state = Some("x".to_owned());
+        task.superseded_by = Some("x".to_owned());
+        let value: Value = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        let keys = value.as_object().unwrap();
+        for key in keys.keys() {
+            assert!(
+                KNOWN_TASK_KEYS.contains(&key.as_str()),
+                "serialized key `{key}` is missing from KNOWN_TASK_KEYS"
+            );
+        }
+        assert!(!keys.contains_key("gate"), "gate must never persist");
     }
 
     /// user coordinator | Given a superseded task that the agent picks up
