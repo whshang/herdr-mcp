@@ -1311,6 +1311,41 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
         expected_target = Some(value);
     }
+    // #768 Phase 2 slice 2: the root-lease gate in front of `herdr-core`
+    // execution-class routes. It runs *after* the #941 admitted-backend fence, so
+    // a backend/socket drift still reports `invalid_runtime_backend` first, and
+    // it never widens a route: it can only add the `single_writer_lease_conflict`
+    // refusal when an active root mutation lease exists. With no lease the call
+    // continues into the existing route table, which still refuses execution
+    // (policy parity / no runtime-owned session) exactly as before. A name
+    // outside the frozen catalog fails closed here.
+    if context.runtime_backend.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
+        && crate::runtime_adapter::core_execution_route(name)
+            != crate::runtime_adapter::CoreExecutionRoute::NotExecution
+    {
+        if let Err(refusal) =
+            crate::runtime_adapter::verify_admitted_backend_for_tool(name, context.runtime_backend)
+        {
+            return Ok(tool_result(refusal, true));
+        }
+        match crate::runtime_adapter::core_execution_route(name) {
+            crate::runtime_adapter::CoreExecutionRoute::Unknown => {
+                return Ok(tool_result(
+                    crate::runtime_adapter::core_execution_unknown_refusal(name),
+                    true,
+                ));
+            }
+            crate::runtime_adapter::CoreExecutionRoute::Mutating => {
+                if let Some(refusal) =
+                    check_mutating_tool_root_lease(context, name, &arguments, None)
+                {
+                    return Ok(tool_result(refusal, true));
+                }
+            }
+            crate::runtime_adapter::CoreExecutionRoute::ReadOnly
+            | crate::runtime_adapter::CoreExecutionRoute::NotExecution => {}
+        }
+    }
     let route = match crate::runtime_adapter::public_tool_route(
         name,
         context.runtime_backend,
