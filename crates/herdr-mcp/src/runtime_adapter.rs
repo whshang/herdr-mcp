@@ -1901,15 +1901,18 @@ impl PublicToolRoute {
 /// falling back to the TUI path.
 ///
 /// `admitted` is the backend this runtime process selected when it started and
-/// carried through `AppState`/`RuntimeContext` for the process lifetime; the
-/// drift comparison itself lives in [`verify_admitted_backend`] and is shared
-/// with the candidate transport entrypoint (#768). A request whose current
+/// carried through `AppState`/`RuntimeContext` for the process lifetime.
+/// `admitted_config` carries the same startup pinning: `Some` resolves the
+/// drift check against the config file and environment captured at admission
+/// ([`verify_admitted_backend_config`]), while `None` resolves the live process
+/// environment ([`verify_admitted_backend`]). A request whose pinned
 /// env/config resolves to another backend or, while on `herdr-core`, another
 /// admitted socket fails closed with `invalid_runtime_backend` and requires a
 /// restart (#936).
 pub fn public_tool_route(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
+    admitted_config: Option<&AdmittedBackendConfig>,
     expected_target: Option<&Value>,
 ) -> Result<PublicToolRoute, Value> {
     // 1.2 S0: this admission is the `connect` phase of the request envelope.
@@ -1917,7 +1920,11 @@ pub fn public_tool_route(
     // for `tui` it is the local admission only (typically sub-millisecond).
     let admission_started = std::time::Instant::now();
     let result = (|| {
-        let selection = verify_admitted_backend(admitted).map_err(|error| {
+        let selection = match admitted_config {
+            Some(config) => verify_admitted_backend_config(admitted, config),
+            None => verify_admitted_backend(admitted),
+        }
+        .map_err(|error| {
             invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection")
         })?;
         public_tool_route_for_selection(tool_name, &selection, expected_target)
@@ -1939,9 +1946,10 @@ pub fn public_tool_route(
 ///
 /// Without this check an already running TUI candidate would honour a later
 /// `runtime.backend = "herdr-core"` edit on its next request, although its
-/// state and background workers were only admitted for TUI (#936). The
-/// candidate transport entrypoint reads the pinned startup config instead; see
-/// [`verify_admitted_backend_config`].
+/// state and background workers were only admitted for TUI (#936). Request
+/// paths that carry a pinned [`AdmittedBackendConfig`] — the candidate
+/// transport entrypoint and `tools/call` — read that startup config instead;
+/// see [`verify_admitted_backend_config`] (#991).
 pub fn verify_admitted_backend(
     admitted: &RuntimeBackendSelection,
 ) -> Result<RuntimeBackendSelection, String> {
@@ -1993,16 +2001,18 @@ impl AdmittedBackendConfig {
 /// startup config instead of the current process environment.
 ///
 /// This is the check the candidate entrypoint applies before any handler runs,
-/// on both the loopback TCP router and the trusted Unix IPC router. An
-/// unreadable config, a failed path resolution or a changed selection all fail
-/// closed: a running runtime never re-admits a backend it did not start with.
+/// on the loopback TCP router, the trusted Unix IPC router and the `tools/call`
+/// admission path itself (#991). An unreadable config, a failed path resolution
+/// or a changed selection all fail closed: a running runtime never re-admits a
+/// backend it did not start with.
 pub fn verify_admitted_backend_config(
     admitted: &RuntimeBackendSelection,
     config: &AdmittedBackendConfig,
-) -> Result<(), String> {
+) -> Result<RuntimeBackendSelection, String> {
     let selection =
         resolve_backend_selection_from_path(&config.config_file, &config.instance, &config.env)?;
-    admission_drift(admitted, &selection)
+    admission_drift(admitted, &selection)?;
+    Ok(selection)
 }
 
 fn admission_drift(
@@ -2345,8 +2355,13 @@ pub fn core_execution_unknown_refusal(tool_name: &str) -> Value {
 pub fn verify_admitted_backend_for_tool(
     tool_name: &str,
     admitted: &RuntimeBackendSelection,
+    admitted_config: Option<&AdmittedBackendConfig>,
 ) -> Result<(), Value> {
-    verify_admitted_backend(admitted)
+    let verify = match admitted_config {
+        Some(config) => verify_admitted_backend_config(admitted, config),
+        None => verify_admitted_backend(admitted),
+    };
+    verify
         .map(|_| ())
         .map_err(|error| invalid_runtime_backend_tool_error(tool_name, &error, "backend_selection"))
 }

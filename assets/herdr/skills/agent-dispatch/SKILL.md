@@ -11,6 +11,8 @@ Call shape: target one explicit live Agent name, pane identity, or role selector
 
 Dispatch may opt into a bounded worktree audit with `readonly: true` and/or `owned_paths: [...]`. `owned_paths` accepts relative paths under the project root or absolute paths inside it. The returned `audit` records the project root, before/after `HEAD` and status fingerprints, changed files, the allowlist, and the decision. `readonly_violation` means any HEAD/index/worktree change occurred; `scope_violation` means a changed path was outside `owned_paths`. Missing or invalid audit evidence is reported as an explicit audit failure; it is never treated as a clean task. The same audit is refreshed when the worker reports `worker_done`.
 
+Dispatch may opt into a bounded worktree audit with `readonly: true` and/or `owned_paths: [...]`. `owned_paths` accepts relative paths under the project root or absolute paths inside it. The returned `audit` records the project root, before/after `HEAD` and status fingerprints, changed files, the allowlist, and the decision. `readonly_violation` means any HEAD/index/worktree change occurred; `scope_violation` means a changed path was outside `owned_paths`. Missing or invalid audit evidence is reported as an explicit audit failure; it is never treated as a clean task. The same audit is refreshed when the worker reports `worker_done`.
+
 Delegate non-trivial implementation per `development-orchestration`'s main-brain rule; delegation never removes the planner's own fs/exec capability.
 
 ## Selection

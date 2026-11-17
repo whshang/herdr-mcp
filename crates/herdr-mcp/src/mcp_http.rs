@@ -526,7 +526,7 @@ async fn admitted_backend_gate(
         &state.runtime_backend,
         &state.admitted_config,
     ) {
-        Ok(()) => next.run(request).await,
+        Ok(_selection) => next.run(request).await,
         Err(message) => admitted_backend_refusal(request.uri().path(), &state, &message),
     }
 }
@@ -3307,6 +3307,7 @@ async fn post_mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes
             browser_mutation_admission: Some(&blocking_state.browser_mutation_admission),
             wire_request_id: context_request_id.as_deref(),
             runtime_backend: &blocking_state.runtime_backend,
+            admitted_config: Some(&blocking_state.admitted_config),
             trusted_local_ipc: blocking_state.trusted_extension_ipc,
         };
         let response = mcp::handle(&blocking_request, &context);
@@ -4655,6 +4656,31 @@ mod tests {
             .unwrap_or_else(|| payload.clone())
     }
 
+    /// Raw `(status, payload)` for a `tools/call` that may be refused at the
+    /// entrypoint, e.g. a drifted backend returning 409 instead of the 200 a
+    /// served call produces.
+    async fn public_tool_response(
+        app: &Router,
+        name: &str,
+        arguments: Value,
+    ) -> (StatusCode, Value) {
+        let request = rpc_request(
+            Method::POST,
+            "/mcp",
+            Some(json!({
+                "jsonrpc": "2.0",
+                "id": 922,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            })),
+            &[("user-agent", "openai-mcp/1.0")],
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
     /// 1.2 S0: every tool result envelope carries `transport`,
     /// `timing_ms{queue,connect,execute}` and `request_id` with stable types,
     /// for a local call and for a forwarded (relay) call alike. Non-tool
@@ -4994,12 +5020,25 @@ mod tests {
             assert_eq!(continuity["ok"], true, "{continuity}");
             assert_eq!(continuity["candidates"], json!([]));
             assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-            // #936: a live runtime keeps its admitted backend. Switching the
-            // process env to `tui` after startup must not re-admit the request
-            // onto the TUI socket; it fails closed and asks for a restart.
+            // #991: admission pins the startup inputs, so a later
+            // `HERDR_MCP_RUNTIME_BACKEND` mutation is ignored. A live runtime
+            // can still be drifted the only way startup inputs can move: an
+            // edit to the pinned config file. It fails closed and asks for a
+            // restart without ever re-admitting onto the TUI socket.
+            std::fs::write(
+                config_dir.join("config.json"),
+                br#"{"runtime":{"backend":"tui"}}"#,
+            )
+            .unwrap();
             unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "tui") };
             for method in ["herdr_mcp.agent.task.dispatch", "herdr_mcp.codex_session.resume"] {
-                let result = call_public_tool(&app, "herdr_call", json!({"method": method, "params": {}})).await;
+                let (status, result) = public_tool_response(
+                    &app,
+                    "herdr_call",
+                    json!({"method": method, "params": {}}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{method}: {result}");
                 assert_eq!(result["code"], "invalid_runtime_backend", "{method}: {result}");
                 assert_eq!(result["delivery_state"], "not_delivered", "{method}: {result}");
                 assert!(
@@ -5153,14 +5192,23 @@ mod tests {
             assert_eq!(forwarded["runtime_backend"], "herdr-core");
             assert_eq!(forwarded["delivery_state"], "not_delivered");
 
-            // 2. An invalid backend selection fails closed at the same public entry.
+            // 2. An invalid backend selection fails closed at the same public
+            //    entry. #991: admission reads the pinned startup inputs, so a
+            //    later `HERDR_MCP_RUNTIME_BACKEND` mutation is ignored; the
+            //    drift lands through the pinned config file instead.
             unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "auto") };
-            let invalid = call_public_tool(
+            std::fs::write(
+                config_dir.join("config.json"),
+                br#"{"runtime":{"backend":"bogus"}}"#,
+            )
+            .unwrap();
+            let (status, invalid) = public_tool_response(
                 &app,
                 "herdr_fs_list",
                 json!({"path": project.to_string_lossy()}),
             )
             .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{invalid}");
             assert_eq!(invalid["ok"], false);
             assert_eq!(invalid["code"], "invalid_runtime_backend");
             assert_eq!(invalid["retryable"], false);
@@ -5168,17 +5216,23 @@ mod tests {
 
             // 3. Default TUI selection keeps the existing behavior byte-for-byte,
             //    but only for a runtime that admitted TUI: the live `herdr-core`
-            //    router must not follow the process back to TUI (#936).
+            //    router must not follow the config back to TUI (#936).
+            std::fs::write(
+                config_dir.join("config.json"),
+                br#"{"runtime":{"backend":"tui"}}"#,
+            )
+            .unwrap();
             unsafe {
                 env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
                 env::remove_var("HERDR_MCP_CONFIG_DIR");
             }
-            let switched = call_public_tool(
+            let (status, switched) = public_tool_response(
                 &app,
                 "herdr_fs_list",
                 json!({"path": project.to_string_lossy()}),
             )
             .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{switched}");
             assert_eq!(switched["ok"], false);
             assert_eq!(switched["code"], "invalid_runtime_backend");
             assert_eq!(switched["retryable"], false);
@@ -5331,9 +5385,17 @@ mod tests {
             }
 
             // 3. #941 stays first: a drifted backend reports
-            //    invalid_runtime_backend even while the lease is held.
+            //    invalid_runtime_backend even while the lease is held. #991:
+            //    the drift lands through the pinned config file; a later env
+            //    mutation alone is ignored.
             unsafe { env::set_var("HERDR_MCP_RUNTIME_BACKEND", "auto") };
-            let drift = call_public_tool(&app, "herdr_exec", exec_args).await;
+            std::fs::write(
+                config_dir.join("config.json"),
+                br#"{"runtime":{"backend":"bogus"}}"#,
+            )
+            .unwrap();
+            let (status, drift) = public_tool_response(&app, "herdr_exec", exec_args).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{drift}");
             assert_eq!(drift["code"], "invalid_runtime_backend", "{drift}");
             assert_eq!(drift["delivery_state"], "not_delivered", "{drift}");
         });
@@ -13987,6 +14049,142 @@ mod tests {
             }
         });
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// user unpinned tools/call admission | Given a `test_state`-pinned TUI
+    /// router | When a parallel-style test switches
+    /// `HERDR_MCP_RUNTIME_BACKEND` to `herdr-core` mid-window | Then tool
+    /// admission keeps the pinned startup inputs and the call reaches its own
+    /// result instead of failing with `invalid_runtime_backend` (#991).
+    ///
+    /// Before the fix, `public_tool_route` re-read the live process
+    /// environment on every request, so this env window would have drifted the
+    /// `tools/call` admission even though the transport gate was already
+    /// pinned. `decision_gates::RESOLVE` is the probe: deterministic, requires
+    /// no live Herdr socket, and its refusal is distinguishable from the
+    /// admission envelope. Both the plain `test_state` router and the
+    /// production-shaped `dispatch_test_state` router are covered.
+    #[test]
+    fn tools_call_admission_reads_pinned_config_not_process_env() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("tools-call-pinned-admission");
+        let app = candidate_router(test_state(&root.join("tcp")));
+        let dispatch_app = candidate_router(dispatch_test_state(
+            &root.join("dispatch"),
+            &root.join("missing-herdr.sock"),
+        ));
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_RUNTIME_BACKEND", "herdr-core");
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let resolve = |gate_id: &str| {
+                json!({"gate_id": gate_id, "resolution": "continue", "human": true})
+            };
+            let plain = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": crate::prompt::decision_gates::RESOLVE, "params": resolve("g1")}),
+            )
+            .await;
+            assert_eq!(plain["code"], "gate_resolution_requires_human", "{plain}");
+            assert_ne!(plain["code"], "invalid_runtime_backend", "{plain}");
+            let dispatch = call_public_tool(
+                &dispatch_app,
+                "herdr_call",
+                json!({"method": crate::prompt::decision_gates::RESOLVE, "params": resolve("g2")}),
+            )
+            .await;
+            assert_eq!(
+                dispatch["code"], "gate_resolution_requires_human",
+                "{dispatch}"
+            );
+        });
+        unsafe {
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// user pinned tools/call admission | Given a router that adopted the
+    /// ambient `tui` admission | When its pinned config is edited to
+    /// `herdr-core` mid-flight | Then `tools/call` still fails closed with
+    /// `invalid_runtime_backend` — pinning never weakens the drift fence
+    /// (#991).
+    #[test]
+    fn tools_call_admission_still_fences_pinned_config_drift() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("tools-call-config-drift");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.json"),
+            br#"{"runtime":{"backend":"tui"}}"#,
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state(&root.join("state"));
+        // Adopt the ambient (tui) admission: `admitted_config` now pins the
+        // config file just written, so the later edit below is what every
+        // request-time check must observe.
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        std::fs::write(
+            config_dir.join("config.json"),
+            br#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/tmp/herdr-991-drift.sock"}}"#,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let request = rpc_request(
+                Method::POST,
+                "/mcp",
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": 991,
+                    "method": "tools/call",
+                    "params": {"name": "herdr_methods", "arguments": {}}
+                })),
+                &[("user-agent", "openai-mcp/1.0")],
+            );
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"],
+                crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE,
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+        });
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
