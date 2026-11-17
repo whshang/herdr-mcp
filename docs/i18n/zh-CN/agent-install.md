@@ -64,6 +64,8 @@ herdr-mcp worker bootstrap
 
 这个命令负责 Cloudflare API 预检、Account / `workers.dev` subdomain、现有 Herdr Worker 检测、release manifest 与 `herdr-edge-<version>.mjs` artifact attestation、Worker/DO bootstrap、首台 canonical device enrollment、credential 保存和 production Link 对齐。不运行 Wrangler，不需要源码 checkout。
 
+首台 device 凭据与配置已保存后若激活失败，先修复本机错误，在同一台电脑、同一 OS 账号下重跑 `worker bootstrap`。保留 journal 与凭据：重试会直接认证同一设备，不重新配对、不重新下发 fleet 秘密。缺失、吊销或不匹配的凭据 fail closed；已吊销或删除的凭据无法通过此路径恢复。
+
 公网入口只在 Connector 创建前确定一次：
 
 - Account 只有一个明显合适的 active zone，优先使用专用 Custom Domain，例如 `https://herdr-mcp.example.com/mcp`；

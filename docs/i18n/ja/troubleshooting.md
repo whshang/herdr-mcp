@@ -364,6 +364,12 @@ Handoff は packet を作成し、新しい conversation を作成し、seed を
 
 詳しくは [Cloudflare Edge の資格情報](cloudflare-edge-token.md) と [Cloudflare Edge のデプロイ](cloudflare-edge-deployment.md) を参照してください。
 
+## 症状：最初のデバイスの bootstrap が失敗したが Worker `/health` は 200
+
+Worker はデプロイ済みで、bootstrap がどこで止まったかの記録は本機の永続 journal にある。`herdr-mcp doctor` を実行し `LAYER bootstrap-journal` を読む：止まった `phase`、`device=enrolled|none`、`recovery_upgrade`、journal の `updated` 時刻、journal が別 release のものなら `release_match=false` を報告する。journal は `~/.config/herdr-mcp/bootstrap/first-worker-v1.json` にあり読み取り専用の証拠なので、編集・削除しない。
+
+journal が最初のデバイス資格情報の保存後に失敗したことを示す場合、ローカルのエラーを直し、同じコンピュータと同じ OS アカウントで `herdr-mcp worker bootstrap` を再実行する。再試行は同じデバイスを再 pairing や fleet 秘密の再配布なしに認証する。欠落・失効・不一致の資格情報は fail closed で失敗し、以前に失効または削除された資格情報はこの経路では復元できない。Worker を削除したり、Worker secret を手編集したり、pairing を手動で作成したりしない。
+
 ## 症状：runtime のアップグレードでローカルの挙動が壊れた
 
 同じ contract epoch 内の実装変更の場合：
