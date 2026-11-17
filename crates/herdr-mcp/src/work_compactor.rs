@@ -5140,17 +5140,19 @@ mod tests {
     /// only visible items and archived history is never counted or popped.
     #[test]
     fn bounded_handoff_omits_only_visible_items() {
-        let mut memory = RelayMemory::default();
-        memory.tasks = (0..3)
-            .map(|index| RelayTask {
-                id: format!("a{index}"),
-                text: "archived history".to_owned(),
-                status: "done".to_owned(),
-                updated_ms: Some(index as i64),
-                archived: true,
-                rule_derived: false,
-            })
-            .collect();
+        let mut memory = RelayMemory {
+            tasks: (0..3)
+                .map(|index| RelayTask {
+                    id: format!("a{index}"),
+                    text: "archived history".to_owned(),
+                    status: "done".to_owned(),
+                    updated_ms: Some(index as i64),
+                    archived: true,
+                    rule_derived: false,
+                })
+                .collect(),
+            ..RelayMemory::default()
+        };
         let live: Vec<RelayTask> = (0..80)
             .map(|index| RelayTask {
                 id: format!("t{index}"),
