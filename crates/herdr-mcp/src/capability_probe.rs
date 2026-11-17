@@ -276,8 +276,17 @@ pub fn pi_live_model_evidence(session_value: &str, observed_at_ms: i64) -> PiMod
     }
 }
 
-/// Bound on the returned alias list so a huge catalog cannot bloat a refusal.
-const MAX_PI_MODEL_ALIASES: usize = 512;
+/// Bound on the persisted alias list so an arbitrary catalog cannot bloat a
+/// refusal payload. Real catalogs (~300 today) sit far below it; the bound
+/// exists so a degenerate `pi --list-models` output cannot grow a refusal
+/// without limit (S5 review P2: raise alongside the real catalog, never
+/// shrink below it).
+const MAX_PI_MODEL_ALIASES: usize = 4096;
+
+/// Bound on the captured `pi --list-models` table. The capture file is
+/// size-guarded so a runaway pi cannot fill the temp filesystem; the parser
+/// keeps only alias rows anyway.
+const PI_LIST_MODELS_MAX_BYTES: u64 = 1_048_576;
 
 /// Bound on the `pi --list-models` subprocess: a hung or interactive pi must
 /// never stall a dispatch, and its output is a fixed table.
@@ -296,7 +305,13 @@ const PI_LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(3);
 /// Returns `None` when no runnable pi/list is obtainable (missing binary,
 /// non-zero exit, timeout, empty output): callers then report
 /// `validated: false` instead of guessing. `HERDR_PI_BIN` selects the binary
-/// (tests, development).
+/// (tests, development). Without it, resolution uses
+/// `exec_sessions::enriched_exec_path()` rather than the bare inherited
+/// `PATH`: the production launchd PATH omits the user tool directories
+/// (`~/.npm-global/bin`, mise shims, ...) where pi actually installs (S5
+/// review P1-A). The list itself is obtained under the service process's
+/// environment, so a model pi exposes only inside an interactive shell's
+/// extra env vars may legitimately be absent here.
 pub fn pi_model_aliases() -> Option<Vec<String>> {
     let bin = std::env::var_os("HERDR_PI_BIN")
         .filter(|value| !value.is_empty())
@@ -307,48 +322,51 @@ pub fn pi_model_aliases() -> Option<Vec<String>> {
 }
 
 /// Run `pi --list-models` with a hard bound and capture stdout only.
+///
+/// Output goes to a private temp file, not a pipe: a child that writes past
+/// pipe capacity must not deadlock against a parent that waits for exit
+/// before reading, and a descendant inheriting the write end must not keep
+/// an EOF wait alive past the deadline (S5 review P1-1). The file read is
+/// size-bounded and happens only after the child is reaped.
 fn run_bounded_pi_list_models(bin: &Path) -> Option<String> {
+    let capture = std::env::temp_dir().join(format!(
+        "herdr-mcp-pi-models-{}-{}.out",
+        std::process::id(),
+        PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let capture_file = std::fs::File::create(&capture).ok()?;
+    // Explicit PATH resolves `pi` and is inherited by the child: the service
+    // PATH alone would not find ~/.npm-global/bin/pi.
+    let enriched_path = crate::exec_sessions::enriched_exec_path();
     let mut child = std::process::Command::new(bin)
         .arg("--list-models")
+        .env("PATH", &enriched_path)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(capture_file))
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
     let started = std::time::Instant::now();
-    loop {
+    let success = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
+            Ok(Some(status)) => break status.success(),
             Ok(None) if started.elapsed() < PI_LIST_MODELS_TIMEOUT => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Ok(None) => {
+            Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+                break false;
             }
         }
-    }
-    // Read stdout directly instead of wait_with_output: try_wait already
-    // reaped the child, and a second wait can report an error on some
-    // platforms even though the process exited cleanly.
-    let mut stdout = Vec::new();
-    let read_ok = child
-        .stdout
-        .take()
-        .is_some_and(|mut pipe| std::io::Read::read_to_end(&mut pipe, &mut stdout).is_ok());
-    let text = String::from_utf8_lossy(&stdout);
-    (read_ok && !text.trim().is_empty()).then(|| text.into_owned())
+    };
+    let text = std::fs::metadata(&capture)
+        .ok()
+        .filter(|meta| meta.len() <= PI_LIST_MODELS_MAX_BYTES)
+        .and_then(|_| std::fs::read_to_string(&capture).ok());
+    let _ = std::fs::remove_file(&capture);
+    let text = text?;
+    (success && !text.trim().is_empty()).then_some(text)
 }
 
 /// Parse the `pi --list-models` table: header line, then
@@ -1063,8 +1081,14 @@ mod tests {
     fn fake_pi_listing(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("pi");
-        fs::write(&bin, body).unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        // Publish through a staged rename like `script()`: a direct write can
+        // race exec under load (ETXTBSY while a writer still owns the inode,
+        // or a partial read), which surfaced as an intermittent None in the
+        // registry test (S5 review P2 flake).
+        let staged = dir.join(".pi.staged");
+        fs::write(&staged, body).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&staged, &bin).unwrap();
         bin
     }
 
@@ -1164,5 +1188,114 @@ mod tests {
         );
         assert!(pi_model_aliases_from_list("").is_none());
         assert!(pi_model_aliases_from_list("provider model\n").is_none());
+    }
+
+    /// S5 review P1-1: output beyond pipe capacity must not deadlock the
+    /// probe. The old pipe-based reader waited for exit before draining and
+    /// wedged once the table crossed ~64KB; the file capture does not.
+    #[cfg(unix)]
+    #[test]
+    fn pi_model_aliases_survive_output_beyond_pipe_capacity() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HERDR_PI_BIN");
+        let dir = temp_dir("pi-model-large");
+        fs::create_dir_all(&dir).unwrap();
+        // ~700KB of table rows: far beyond any pipe capacity.
+        let mut script = String::from(
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\nprintf 'provider model\\n';\n",
+        );
+        script.push_str(
+            "i=0; while [ $i -lt 2000 ]; do printf 'prov%05d model-%05d-with-a-fairly-long-id\\n' $i $i; i=$((i+1)); done\n",
+        );
+        script.push_str("else\nexit 1\nfi\n");
+        let bin = fake_pi_listing(&dir, &script);
+        unsafe { std::env::set_var("HERDR_PI_BIN", &bin) };
+        let started = std::time::Instant::now();
+        let aliases = pi_model_aliases().expect("large registry must parse");
+        assert_eq!(aliases.len(), 2000);
+        assert!(aliases.contains(&"prov01999/model-01999-with-a-fairly-long-id".to_owned()));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "capture must not block on pipe capacity"
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// S5 review P1-1: a descendant that keeps the inherited stdout open must
+    /// not stretch the probe past the exit deadline. With a pipe, read_to_end
+    /// waits for every write end to close; the file capture reads what the
+    /// reaped child already wrote.
+    #[cfg(unix)]
+    #[test]
+    fn pi_model_aliases_ignore_descendants_holding_stdout() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("HERDR_PI_BIN");
+        let dir = temp_dir("pi-model-descendant");
+        fs::create_dir_all(&dir).unwrap();
+        let bin = fake_pi_listing(
+            &dir,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\n( sleep 5 ) &\nprintf 'provider model\\nmagpie aliyun/auto/deepseek-v4.1-flash\\n';\nelse\nexit 1\nfi\n",
+        );
+        unsafe { std::env::set_var("HERDR_PI_BIN", &bin) };
+        let started = std::time::Instant::now();
+        let aliases = pi_model_aliases().expect("descendant must not block the probe");
+        assert_eq!(
+            aliases,
+            vec!["magpie/aliyun/auto/deepseek-v4.1-flash".to_owned()]
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "probe must not wait on the descendant's inherited handle"
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// S5 review P1-A: without `HERDR_PI_BIN`, resolution uses the enriched
+    /// exec PATH (user tool dirs like ~/.npm-global/bin), which the
+    /// production service PATH omits.
+    #[cfg(unix)]
+    #[test]
+    fn pi_model_aliases_resolve_pi_off_the_enriched_path() {
+        let _guard = crate::test_env::lock();
+        let previous_bin = std::env::var_os("HERDR_PI_BIN");
+        let home = temp_dir("pi-model-home");
+        let bindir = home.join(".npm-global/bin");
+        fs::create_dir_all(&bindir).unwrap();
+        fake_pi_listing(
+            &bindir,
+            "#!/bin/sh\nif [ \"$1\" = \"--list-models\" ]; then\nprintf 'provider model\\nopenai gpt-4\\n';\nelse\nexit 1\nfi\n",
+        );
+        // A bare `pi` under the bare service PATH is not found; the enriched
+        // PATH adds the user tool directory this test installs into.
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var("HERDR_PI_BIN");
+            std::env::set_var("HOME", &home);
+        }
+        let aliases = pi_model_aliases().expect("pi in ~/.npm-global/bin must resolve");
+        assert_eq!(aliases, vec!["openai/gpt-4".to_owned()]);
+        unsafe {
+            match previous_bin {
+                Some(value) => std::env::set_var("HERDR_PI_BIN", value),
+                None => std::env::remove_var("HERDR_PI_BIN"),
+            }
+            match previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(home);
     }
 }

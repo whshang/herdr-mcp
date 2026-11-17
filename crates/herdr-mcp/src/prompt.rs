@@ -202,6 +202,14 @@ struct PromptTaskRecord {
     activity_observed: bool,
     prior_settle_observed: bool,
     turn_id: Option<String>,
+    /// The `state_change_seq` this task's dispatch was pinned to, when the
+    /// pane reported one. An interrupt is only legal while the pane still
+    /// sits on this sequence: a later seq means the agent already moved past
+    /// this task's turn, so the C-c would land on unrelated work (S5 review
+    /// P1-4). Absent on older records, which keep interrupting on the
+    /// `working`-status evidence alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_seq: Option<u64>,
     exact_native_turn: bool,
     terminal_status: Option<String>,
     terminal_cursor: Option<u64>,
@@ -781,6 +789,13 @@ impl PromptRegistry {
                 &format!("seq:{}", after_seq.unwrap_or_default()),
             ));
         }
+        // Pin the dispatch to the pane's observed seq when one was reported;
+        // an interrupt later refuses once the pane moves past it.
+        let turn_seq = if seq_advanced {
+            after_seq
+        } else {
+            baseline_seq
+        };
 
         let mut record = PromptTaskRecord {
             schema_version: 1,
@@ -800,6 +815,7 @@ impl PromptRegistry {
             activity_observed,
             prior_settle_observed: false,
             turn_id,
+            turn_seq,
             exact_native_turn: false,
             terminal_status: None,
             terminal_cursor: None,
@@ -1807,7 +1823,10 @@ impl PromptRegistry {
     /// entirely (the default 20-minute stall liveness projection is unchanged
     /// and emits nothing). Never terminates a task.
     fn sweep_task_budgets(&self) {
-        let Ok(tasks) = self.list_tasks(512) else {
+        // Active tasks only: the bounded recent-512 window can evict a still
+        // running task behind newer terminal history and silence its caps
+        // forever (S5 review P1-5).
+        let Ok(tasks) = self.list_active_tasks() else {
             return;
         };
         let now = self.now_ms();
@@ -1878,20 +1897,31 @@ impl PromptRegistry {
         {
             return;
         }
-        let interrupt_requested = task.on_budget.as_deref() == Some("interrupt");
+        // Interrupt eligibility is a one-shot, durably reserved at emit time
+        // under the task mutation lock: a second due event (stall + runtime
+        // cap expiring together, or a later threshold on the same task) may
+        // still notify the parent but must never produce a second C-c
+        // (S5 review P1-3).
+        let interrupt_reserved = task.on_budget.as_deref() == Some("interrupt")
+            && !task.budget_events.iter().any(|row| {
+                row.get("interrupt_state").and_then(Value::as_str) != Some("not_requested")
+                    && row.get("interrupt_state").and_then(Value::as_str).is_some()
+            });
         task.budget_events.push(json!({
             "event": event,
             "at_ms": now,
             "notification_state": "pending",
-            "interrupt_state": if interrupt_requested { "pending" } else { "not_requested" },
+            "interrupt_state": if interrupt_reserved { "pending" } else { "not_requested" },
         }));
+        // The delivery call below interrupts only for the row that reserved
+        // eligibility above.
         // Budget events are observations, not activity: do not touch
         // updated_at_ms, or a stall event would reset its own stall clock.
         if self.save_task(&task, None).is_err() {
             return;
         }
         drop(_guard);
-        self.deliver_budget_event(task_id, event, now, interrupt_requested);
+        self.deliver_budget_event(task_id, event, now, interrupt_reserved);
     }
 
     fn deliver_budget_event(&self, task_id: &str, event: &str, now: u64, interrupt: bool) {
@@ -1966,8 +1996,10 @@ impl PromptRegistry {
     }
 
     /// One explicit C-c to the task's own pane, only when an agent is actively
-    /// working (mirrors browser_control::execute_interrupt's guard). Never
-    /// sends to a parent or an idle pane.
+    /// working on *this task's* turn (mirrors browser_control::execute_interrupt's
+    /// guard plus the durable ownership checks below). Never sends to a parent,
+    /// an idle pane, a task that already settled, or a pane that moved past
+    /// the seq this task was pinned to (S5 review P1-4).
     fn interrupt_task_pane(&self, client: &HerdrClient, task: &PromptTaskRecord) -> String {
         let Some(pane_id) = task.pane_id.as_deref() else {
             return "no_pane".to_owned();
@@ -1977,6 +2009,27 @@ impl PromptRegistry {
         };
         if state.agent_status.as_deref() != Some("working") {
             return "no_active_turn".to_owned();
+        }
+        // Side-effect fence, re-checked at send time: the notification call
+        // above can span seconds, during which a worker_done/terminal event
+        // may settle this task or the pane may start an unrelated new turn.
+        // Reload the durable record and require the pane to still sit on the
+        // seq this task was pinned to before touching the keyboard; anything
+        // that cannot prove ownership fails closed (S5 review P1-4).
+        match self.load_task(&task.task_id) {
+            Ok(Some(fresh)) => {
+                if fresh.is_terminal() {
+                    return "task_settled".to_owned();
+                }
+                match (fresh.turn_seq, state.state_change_seq) {
+                    (Some(pinned), Some(live)) if live == pinned => {}
+                    (Some(_), Some(_)) => return "turn_mismatch".to_owned(),
+                    _ => return "turn_unverifiable".to_owned(),
+                }
+            }
+            // A record that vanished or a store that cannot answer cannot
+            // prove the pane still belongs to this task.
+            _ => return "turn_unverifiable".to_owned(),
         }
         match client.call_with_timeout(
             "pane.send_keys",
@@ -2313,6 +2366,29 @@ impl PromptRegistry {
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
         store
             .operation_ledgers(PROMPT_TASK_OPERATION_KIND, limit)?
+            .into_iter()
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
+            .collect()
+    }
+
+    /// Every task whose ledger row is still non-terminal, unbounded by the
+    /// recent-window cap: the budget sweep must see a long-running task even
+    /// when hundreds of newer terminal tasks were written after it (S5
+    /// review P1-5). Open gates stay live the same way `list_tasks` sees
+    /// them, so gated tasks still appear here.
+    fn list_active_tasks(&self) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        store
+            .operation_ledgers_by_phase(PROMPT_TASK_OPERATION_KIND, "active")?
             .into_iter()
             .map(|record| {
                 let mut task = decode_task_record(&record)?;
@@ -2899,6 +2975,13 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
                     task.task_id.as_str(),
                     &format!("cursor:{cursor}"),
                 ));
+            }
+            // The task's live turn is the seq the pane entered working on;
+            // re-pin the interrupt fence here so a dispatch-time baseline
+            // cannot hold the interrupt back, and a later unrelated turn
+            // still refuses (S5 review P1-4).
+            if let Some(seq) = task_event_state_change_seq(event) {
+                task.turn_seq = Some(seq);
             }
             task.updated_at_ms = now;
             true
@@ -4047,6 +4130,45 @@ pub fn run_with_parent_session(
             },
         }
     }
+    // S5 review P1-2: model admission runs only after the durable record was
+    // consulted. A replay of an already-recorded outcome returns above and
+    // never probes the live model list or schema; a resumed chain whose agent
+    // is still pending re-uses the persisted delivery form and only
+    // re-admits when the checkpoint predates the field.
+    let mut spawn = spawn;
+    if let Some(spawn) = spawn.as_mut() {
+        match spawn_resume
+            .as_ref()
+            .map(|resume| resume.model_deliverable.clone())
+        {
+            Some(Some(deliverable)) => spawn.model_deliverable = Some(deliverable),
+            Some(None) if spawn_resume.is_some() => {
+                // Checkpoint written before the delivery form was persisted:
+                // re-run admission rather than drop the requested model.
+                if let Err(refusal) = admit_spawn_model(spawn) {
+                    return finish_spawn_failure(
+                        registry,
+                        idempotency_key,
+                        &fingerprint,
+                        task_id,
+                        refusal,
+                    );
+                }
+            }
+            None => {
+                if let Err(refusal) = admit_spawn_model(spawn) {
+                    return finish_spawn_failure(
+                        registry,
+                        idempotency_key,
+                        &fingerprint,
+                        task_id,
+                        refusal,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
     // Resolve the spawn plan (workspace, cwd, agent name) before any mutation:
     // an invalid plan must never leave a pane or an agent behind, and its
     // rejection is persisted so the key replays it instead of spawning later.
@@ -4544,7 +4666,7 @@ struct SpawnProgress {
 
 impl SpawnProgress {
     fn facts(&self, spawn: &SpawnDispatch) -> Value {
-        json!({
+        let mut facts = json!({
             "pane_id": self.pane_id,
             "tab_id": self.tab_id,
             "agent_name": spawn.agent_name,
@@ -4554,7 +4676,25 @@ impl SpawnProgress {
             "created": self.pane_id.is_some(),
             "agent_started": self.agent_started,
             "steps": self.steps,
-        })
+        });
+        // The admitted delivery form is durable checkpoint state: a resume
+        // must deliver the same canonical model without re-running live
+        // admission probes (S5 review P1-2).
+        if let Some(object) = facts.as_object_mut() {
+            if let Some(delivery) = &spawn.request.model_deliverable {
+                let (form, canonical) = match delivery {
+                    ModelDelivery::Property(canonical) => ("property", canonical.clone()),
+                    ModelDelivery::Args(canonical) => ("args", canonical.clone()),
+                };
+                object.insert(
+                    "model_deliverable".to_owned(),
+                    json!({"form": form, "canonical": canonical}),
+                );
+            } else if let Some(model) = &spawn.request.model {
+                object.insert("model".to_owned(), json!(model));
+            }
+        }
+        facts
     }
 
     fn failure(&self, spawn: &SpawnDispatch, failed_step: &str, error: &SpawnStepError) -> Value {
@@ -4633,6 +4773,9 @@ struct SpawnResume {
     phase: String,
     steps: Vec<Value>,
     attempts: u64,
+    /// The admitted delivery form persisted by `SpawnProgress::facts`: a
+    /// resumed chain replays the same canonical model without re-validating.
+    model_deliverable: Option<ModelDelivery>,
 }
 
 impl SpawnResume {
@@ -4663,6 +4806,14 @@ fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
         return None;
     }
     let spawn = result.get("spawn")?;
+    let model_deliverable = spawn.get("model_deliverable").and_then(|value| {
+        let canonical = value.get("canonical").and_then(Value::as_str)?.to_owned();
+        match value.get("form").and_then(Value::as_str)? {
+            "property" => Some(ModelDelivery::Property(canonical)),
+            "args" => Some(ModelDelivery::Args(canonical)),
+            _ => None,
+        }
+    });
     Some(SpawnResume {
         pane_id: spawn.get("pane_id").and_then(Value::as_str)?.to_owned(),
         tab_id: spawn
@@ -4680,6 +4831,7 @@ fn spawn_checkpoint(result: &Value) -> Option<SpawnResume> {
             .cloned()
             .unwrap_or_default(),
         attempts: result.get("attempts").and_then(Value::as_u64).unwrap_or(0),
+        model_deliverable,
     })
 }
 
@@ -4841,54 +4993,11 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
             }
         },
     };
-    // 1.2 S5: an explicit model alias is validated before any pane/agent
-    // mutation and before key reservation. Unknown aliases and kinds without
-    // an obtainable list fail closed (model_alias_unknown); a retry
-    // re-validates and refuses identically, never spawning with an
-    // unvalidated model.
+    // 1.2 S5: the model alias is validated later, at admission time — after
+    // the idempotency record has been consulted (S5 review P1-2). Parsing
+    // here only preserves the raw alias so a replay whose key already owns a
+    // durable result never touches the live model list or schema.
     let model = spawn_optional_string(object, "model", 256)?;
-    let mut model_deliverable = None;
-    if let Some(alias) = &model {
-        let check = crate::model_alias::validate_model_alias(&kind, alias);
-        let crate::model_alias::ModelAliasCheck::Validated { canonical } = &check else {
-            let mut refusal = crate::model_alias::model_alias_refusal(&kind, alias, &check);
-            if let Some(object) = refusal.as_object_mut() {
-                object.insert("failed_step".to_owned(), json!("validate"));
-                object.insert("requires_human".to_owned(), json!(false));
-            }
-            return Err(refusal);
-        };
-        // The schema delivery decision belongs here too: a schema that cannot
-        // carry a model must refuse before the chain creates a pane, so the
-        // caller is never left with a residual pane and a failed start.
-        let deliverable = match crate::schema::agent_start_param_properties() {
-            Ok(Some(properties)) if properties.contains_key("model") => {
-                Some(ModelDelivery::Property(canonical.clone()))
-            }
-            Ok(Some(properties)) if properties.contains_key("args") && kind == "pi" => {
-                Some(ModelDelivery::Args(canonical.clone()))
-            }
-            _ => None,
-        };
-        let Some(delivery) = deliverable else {
-            let fact = crate::model_alias::validation_fact(&kind, alias, &check);
-            return Err(json!({
-                "ok": false,
-                "code": "model_delivery_unsupported",
-                "kind": kind,
-                "requested_model": alias,
-                "delivery_state": "not_delivered",
-                "submitted": false,
-                "fallback_allowed": false,
-                "retryable": false,
-                "model_validation": fact,
-                "failed_step": "validate",
-                "requires_human": false,
-                "message": "the live herdr agent.start schema cannot carry a model (no model property, and no args passthrough for a pi kind); the validated alias was not silently dropped",
-            }));
-        };
-        model_deliverable = Some(delivery);
-    }
     Ok(Some(SpawnRequest {
         kind,
         name,
@@ -4899,8 +5008,63 @@ fn parse_spawn(args: &Value) -> Result<Option<SpawnRequest>, Value> {
         direction,
         startup_timeout_ms,
         model,
-        model_deliverable,
+        model_deliverable: None,
     }))
+}
+
+/// Admit the spawn's explicit model alias against live evidence.
+///
+/// Runs only for a new reservation or a checkpoint resume whose agent step is
+/// still pending — a replay of an already-recorded outcome never reaches this
+/// function, so a transient pi/schema outage cannot downgrade a completed
+/// dispatch to `model_alias_unknown` / `model_delivery_unsupported` (S5 review
+/// P1-2). A refusal here is the key's recorded outcome: persisted like every
+/// other pre-pane failure, so a same-key replay returns it instead of
+/// re-running the live probes.
+fn admit_spawn_model(spawn: &mut SpawnRequest) -> Result<(), Value> {
+    let Some(alias) = &spawn.model else {
+        return Ok(());
+    };
+    let check = crate::model_alias::validate_model_alias(&spawn.kind, alias);
+    let crate::model_alias::ModelAliasCheck::Validated { canonical } = &check else {
+        let mut refusal = crate::model_alias::model_alias_refusal(&spawn.kind, alias, &check);
+        if let Some(object) = refusal.as_object_mut() {
+            object.insert("failed_step".to_owned(), json!("validate"));
+            object.insert("requires_human".to_owned(), json!(false));
+        }
+        return Err(refusal);
+    };
+    // The schema delivery decision is admission too: a schema that cannot
+    // carry a model must refuse before the chain creates a pane, so the
+    // caller is never left with a residual pane and a failed start.
+    let deliverable = match crate::schema::agent_start_param_properties() {
+        Ok(Some(properties)) if properties.contains_key("model") => {
+            Some(ModelDelivery::Property(canonical.clone()))
+        }
+        Ok(Some(properties)) if properties.contains_key("args") && spawn.kind == "pi" => {
+            Some(ModelDelivery::Args(canonical.clone()))
+        }
+        _ => None,
+    };
+    let Some(delivery) = deliverable else {
+        let fact = crate::model_alias::validation_fact(&spawn.kind, alias, &check);
+        return Err(json!({
+            "ok": false,
+            "code": "model_delivery_unsupported",
+            "kind": spawn.kind,
+            "requested_model": alias,
+            "delivery_state": "not_delivered",
+            "submitted": false,
+            "fallback_allowed": false,
+            "retryable": false,
+            "model_validation": fact,
+            "failed_step": "validate",
+            "requires_human": false,
+            "message": "the live herdr agent.start schema cannot carry a model (no model property, and no args passthrough for a pi kind); the validated alias was not silently dropped",
+        }));
+    };
+    spawn.model_deliverable = Some(delivery);
+    Ok(())
 }
 
 fn spawn_optional_string(
@@ -9511,6 +9675,7 @@ mod tests {
             prior_settle_observed: false,
             lifecycle: lifecycle.clone(),
             turn_id: None,
+            turn_seq: None,
             exact_native_turn: false,
             terminal_status: terminal.then(|| lifecycle.as_str().to_owned()),
             terminal_cursor: None,
@@ -10871,6 +11036,7 @@ mod tests {
             stall_after_ms: None,
             request_id: None,
             max_runtime_ms: None,
+            turn_seq: None,
             on_budget: None,
             budget_events: Vec::new(),
             gate: None,
@@ -12875,6 +13041,31 @@ mod tests {
                 .count(),
             1
         );
+        drop(recorded);
+        // S5 review P1-2: a replay under the same key must return the
+        // recorded outcome without re-running live admission. The fake
+        // server is already stopped and the PI env points nowhere, so any
+        // probe would fail; the replay must still answer ok:true.
+        let replay = run(
+            &HerdrClient::new(&socket),
+            &registry,
+            &json!({
+                "spawn": {"kind": "pi", "workspace_id": "w1", "model": "openai/gpt-4"},
+                "text": "work",
+                "idempotency_key": "s5-modelflag",
+            }),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "agent.prompt")
+                .count(),
+            1,
+            "a replay must never re-prompt"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -13239,6 +13430,10 @@ mod tests {
         let mut task = escalation_task("s5-int-task", "w1:p9", PromptTaskLifecycle::Running, 0);
         task.parent_target = Some("w1:p1".to_owned());
         task.pane_id = Some("w1:p9".to_owned());
+        // The task's live turn is pinned to the same seq the pane reports
+        // below; the interrupt fence re-checks it at send time (S5 review
+        // P1-4).
+        task.turn_seq = Some(3);
         task.max_runtime_ms = Some(60_000);
         task.on_budget = Some("interrupt".to_owned());
         task.created_at_ms = clock.load(Ordering::SeqCst);
@@ -13271,6 +13466,152 @@ mod tests {
         );
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given on_budget interrupt and both stall + runtime caps
+    /// expiring in one sweep | Then the parent gets both notifications but the
+    /// pane receives exactly one C-c (S5 review P1-3).
+    #[test]
+    fn budget_interrupt_sends_at_most_one_cc_across_two_due_events() {
+        let (path, mut registry, clock) = worker_registry("s5-interrupt-once");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("agent.prompt", json!({"prompt": {"status": "submitted"}})),
+                (
+                    "agent.get",
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 3}}),
+                ),
+                ("pane.send_keys", json!({"ok": true})),
+            ],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-int2-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.pane_id = Some("w1:p9".to_owned());
+        task.turn_seq = Some(3);
+        task.stall_after_ms = Some(60_000);
+        task.max_runtime_ms = Some(60_000);
+        task.on_budget = Some("interrupt".to_owned());
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 2, "{:?}", stored.budget_events);
+        let interrupts: Vec<_> = stored
+            .budget_events
+            .iter()
+            .map(|row| row["interrupt_state"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            interrupts.iter().filter(|state| **state == "sent").count(),
+            1,
+            "exactly one event may send the C-c: {interrupts:?}"
+        );
+        let cc = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "pane.send_keys")
+            .count();
+        assert_eq!(cc, 1);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given the pane moved past the task's pinned turn |
+    /// When the interrupt fires | Then the C-c is refused rather than
+    /// interrupting unrelated new work (S5 review P1-4).
+    #[test]
+    fn budget_interrupt_refuses_when_the_pane_moved_to_a_new_turn() {
+        let (path, mut registry, clock) = worker_registry("s5-interrupt-turn");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = repeating_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            stop.clone(),
+            vec![
+                ("agent.prompt", json!({"prompt": {"status": "submitted"}})),
+                (
+                    "agent.get",
+                    // A later turn than the task's pinned seq 3.
+                    json!({"agent": {"pane_id": "w1:p9", "agent_status": "working", "state_change_seq": 7}}),
+                ),
+                ("pane.send_keys", json!({"ok": true})),
+            ],
+            requests.clone(),
+        );
+        Arc::get_mut(&mut registry.inner).unwrap().client = Some(HerdrClient::new(&socket));
+        let mut task = escalation_task("s5-int3-task", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.parent_target = Some("w1:p1".to_owned());
+        task.pane_id = Some("w1:p9".to_owned());
+        task.turn_seq = Some(3);
+        task.max_runtime_ms = Some(60_000);
+        task.on_budget = Some("interrupt".to_owned());
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        clock.fetch_add(61_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(stored.budget_events.len(), 1);
+        assert_eq!(stored.budget_events[0]["interrupt_state"], "turn_mismatch");
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r["method"] != "pane.send_keys"),
+            "no C-c may reach a pane serving a different turn"
+        );
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// user planner | Given an active task older than a full page of terminal
+    /// history | When the budget sweep runs | Then the old task's cap still
+    /// emits (S5 review P1-5).
+    #[test]
+    fn budget_sweep_sees_active_tasks_beyond_the_recent_window() {
+        let (path, registry, clock) = worker_registry("s5-sweep-window");
+        // An old active task whose cap expired long ago.
+        let mut task = escalation_task("s5-old-active", "w1:p9", PromptTaskLifecycle::Running, 0);
+        task.max_runtime_ms = Some(60_000);
+        task.created_at_ms = clock.load(Ordering::SeqCst);
+        task.updated_at_ms = clock.load(Ordering::SeqCst);
+        registry.save_task(&task, None).unwrap();
+        // Fill the recent window with terminal tasks so a bounded updated_at
+        // query could never reach the active one.
+        for index in 0..520 {
+            let terminal = escalation_task(
+                &format!("s5-terminal-{index}"),
+                "w1:p8",
+                PromptTaskLifecycle::Completed,
+                0,
+            );
+            registry.save_task(&terminal, None).unwrap();
+        }
+        clock.fetch_add(120_000, Ordering::SeqCst);
+        registry.sweep_task_budgets();
+        let stored = registry.load_task(&task.task_id).unwrap().unwrap();
+        assert_eq!(
+            stored.budget_events.len(),
+            1,
+            "an old active task must still emit its cap: {:?}",
+            stored.budget_events
+        );
+        assert_eq!(stored.budget_events[0]["event"], "agent_budget_exceeded");
         let _ = fs::remove_file(path);
     }
 

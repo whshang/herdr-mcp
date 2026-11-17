@@ -12,6 +12,13 @@
 //! `model-id`, and an optional `:<thinking>` suffix. Matching is exact (no
 //! glob/fuzzy expansion): a pattern that is not a listed model is refused so
 //! the caller picks an explicit id instead of relying on CLI-side resolution.
+//!
+//! Environment note (S5 review P1-A): `pi --list-models` runs under the
+//! service process's environment, not an interactive login shell's. A model
+//! pi only exposes because a provider credential lives in the user's shell
+//! environment may be absent from this list even though it works inside a
+//! terminal pane; that absence is a `validated: false` refusal, not a
+//! silently honoured alias.
 
 use serde_json::{Value, json};
 
