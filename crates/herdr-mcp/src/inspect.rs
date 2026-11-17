@@ -678,12 +678,33 @@ mod tests {
         assert_eq!(output["capability_inventory"]["needs_scan"], true);
         assert!(output["capability_inventory"]["available_agents"].is_null());
         assert_eq!(output["agents"][0]["capabilities"]["source"], "live_only");
+        assert_eq!(output["semantic"], output["semantic_judgment"]);
         assert_eq!(output["workstation_info"]["default_cwd"], "/tmp/demo");
         assert_eq!(
             output["workstation_info"]["managed_git_roots"],
             json!(["/tmp/demo"])
         );
         assert!(output.get("warnings").is_none());
+    }
+
+    #[test]
+    fn inspect_keeps_duplicate_fields_equal() {
+        let mut output = project_snapshot(
+            &fixture(),
+            &json!({"version": "0.9.0", "protocol": 22}),
+            SnapshotSource::Snapshot,
+            &AgentVisibility::All,
+            &[],
+            false,
+            &herdr_native::HerdrCliProbe::default(),
+        );
+        crate::runtime_meta::augment_inspect(&mut output, None, None);
+
+        assert_eq!(output["semantic"], output["semantic_judgment"]);
+        assert_eq!(
+            output["native_migration"],
+            output["workstation_info"]["native_migration"]
+        );
     }
 
     #[test]

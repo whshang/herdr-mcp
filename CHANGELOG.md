@@ -2,6 +2,8 @@
 
 ## Unreleased (post-v1.1.1)
 
+- **1.2 S3 `herdr_inspect` 增量游标与重复字段弃用声明（待发布）：** `herdr_inspect` 现在在读取工作站快照前先返回 `since_cursor`，调用方可直接把该整数游标传给 `herdr_since`；游标取得后至快照读取期间发生的事件会由后续增量读取返回。为保持现有客户端兼容，顶层 `semantic_judgment` 与嵌套 `workstation_info.native_migration` 仍保留，但已正式弃用，请分别改读顶层 `semantic` 与顶层 `native_migration`。非法游标现在以 `invalid_params` 静默拒绝，不会降级为首轮游标 `0`。未改 `SCHEMA_VERSION`、runtime-exec 契约、`full` 视图字段或 `edge/`；未部署或升级设备。
+
 - **First-Worker activation recovery (#942, pending release):** After the first device credential and local configuration are persisted, an activation failure preserves both and permits `worker bootstrap` to resume on that same device after authenticating its journal-bound identity. The retry does not re-pair or rotate fleet secrets; incomplete, foreign or missing credentials fail closed. Already revoked or deleted credentials cannot be recovered by this change. Windows physical verification remains outstanding.
 
 - **1.2 S7 本地诊断快照（待发布）：** 新增只读命令 `herdr-mcp doctor --local`，输出一次性 JSON 快照：白名单进程（名称、PID、启动时间）、白名单回环端口是否在监听、白名单配置文件是否存在及 mtime（`config.json`、`runtime-control.json`、`runtime-status.json`、`link-transport-telemetry.json`、`runtime/current`）。**只返回元数据**：文件内容、环境变量值、凭据既不被读取也不被返回；非白名单进程、端口与文件不会出现在结果中；`state.db` 不在清单内。元数据读取失败（例如权限不足）会返回显式的 `permission_denied` 而不是伪装成不存在，进程枚举失败会返回 `process_error` 而不是空列表。未改 MCP 工具目录、契约 epoch/hash，未触碰 `edge/` 与 `relay/`。此条为 Unreleased，未创建 Release、未部署或升级设备。

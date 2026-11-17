@@ -3581,6 +3581,7 @@ mod tests {
         let busy_new = run_durable(&client, &busy_snapshot, &registry, &store, &gate_args);
         assert_eq!(busy_new["ok"], false, "unexpected busy gate: {busy_new}");
         assert_eq!(busy_new["reason"], "agent_working");
+        assert_eq!(busy_new["busy_kind"], "writers");
         assert_eq!(busy_new["delivery_state"], "not_delivered");
         assert!(!gate_marker.exists());
         let after_settle = run_durable(&client, &snapshot, &registry, &store, &gate_args);

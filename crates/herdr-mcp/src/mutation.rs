@@ -128,28 +128,10 @@ pub fn working_agents_from(
     snapshot: &Value,
     root: &Path,
 ) -> Vec<Value> {
-    let pane_ids = topology
-        .projects
-        .get(root)
-        .map(|project| project.pane_ids.iter().cloned().collect::<HashSet<_>>())
-        .unwrap_or_default();
-    let mut working = snapshot
-        .get("agents")
-        .and_then(Value::as_array)
+    let mut working = working_agent_entries(topology, snapshot, root)
         .into_iter()
-        .flatten()
         .filter_map(|agent| {
-            let status = agent
-                .get("agent_status")
-                .and_then(Value::as_str)
-                .or_else(|| agent.get("status").and_then(Value::as_str));
-            if status != Some("working") {
-                return None;
-            }
             let pane = agent.get("pane_id").and_then(Value::as_str)?;
-            if !pane_ids.contains(pane) {
-                return None;
-            }
             Some(json!({
                 "pane": pane,
                 "agent": agent.get("agent").cloned().unwrap_or(Value::Null),
@@ -162,6 +144,57 @@ pub fn working_agents_from(
             .cmp(&right.get("pane").and_then(Value::as_str))
     });
     working
+}
+
+fn working_agent_entries<'a>(
+    topology: &ProjectTopology,
+    snapshot: &'a Value,
+    root: &Path,
+) -> Vec<&'a Value> {
+    let pane_ids = topology
+        .projects
+        .get(root)
+        .map(|project| project.pane_ids.iter().cloned().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    snapshot
+        .get("agents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|agent| {
+            let status = agent
+                .get("agent_status")
+                .and_then(Value::as_str)
+                .or_else(|| agent.get("status").and_then(Value::as_str));
+            if status != Some("working") {
+                return false;
+            }
+            agent
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .is_some_and(|pane| pane_ids.contains(pane))
+        })
+        .collect()
+}
+
+fn explicitly_read_only_agent(agent: &Value) -> bool {
+    agent.get("read_only").and_then(Value::as_bool) == Some(true)
+        || agent.get("intent").and_then(Value::as_str) == Some("read_only")
+}
+
+fn busy_kind_for_working_agents(
+    topology: &ProjectTopology,
+    snapshot: &Value,
+    root: &Path,
+) -> &'static str {
+    let working = working_agent_entries(topology, snapshot, root);
+    if !working.is_empty() && working.into_iter().all(explicitly_read_only_agent) {
+        "readers_only"
+    } else {
+        // An active agent without an explicit read-only declaration may be
+        // writing. Unknown activity is therefore classified conservatively.
+        "writers"
+    }
 }
 
 fn check_with_policy_and_topology(
@@ -204,6 +237,7 @@ fn check_with_policy_and_topology(
             "reason": "agent_working",
             "root": root.to_string_lossy(),
             "working": working,
+            "busy_kind": busy_kind_for_working_agents(topology, snapshot, root),
             "hint": "A project agent is active; confirm_busy=true acknowledges concurrent modification risk, or the operation can run after the agent settles.",
         }));
     }
@@ -492,10 +526,26 @@ mod tests {
             check_with_policy(&snap, &root, false, &allowed).unwrap_err()["reason"],
             "agent_working"
         );
+        assert_eq!(
+            check_with_policy(&snap, &root, false, &allowed).unwrap_err()["busy_kind"],
+            "writers"
+        );
         let forced = check_with_policy(&snap, &root, true, &allowed).unwrap();
         assert_eq!(forced.len(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn explicit_read_only_agent_activity_is_classified_as_readers_only() {
+        let root = repo();
+        let mut snap = snapshot(&root, true);
+        snap["agents"][0]["intent"] = json!("read_only");
+        let policy = MutationPolicy::new(false, vec![]);
+        let error = check_with_policy(&snap, &root, false, &policy).unwrap_err();
+        assert_eq!(error["reason"], "agent_working");
+        assert_eq!(error["busy_kind"], "readers_only");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
