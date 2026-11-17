@@ -700,8 +700,11 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
             paths,
             None,
             None,
-            None,
-            "",
+            &BootstrapRunContext {
+                selected_account_id: None,
+                release: None,
+                runtime_version: "",
+            },
             language,
         ));
     }
@@ -711,12 +714,19 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
             paths,
             None,
             None,
-            None,
-            "",
+            &BootstrapRunContext {
+                selected_account_id: None,
+                release: None,
+                runtime_version: "",
+            },
             language,
         ));
     }
-    run_inner(paths, language).map_err(|error| {
+    // The Cloudflare account this run actually selected (if it got that far).
+    // A failure before account selection cannot prove the journal's account is
+    // the current one, so it must not claim recovery.
+    let selected_account = std::cell::RefCell::new(None::<String>);
+    run_inner(paths, language, &selected_account).map_err(|error| {
         // #865 S3: the classification is read from durable local state, never
         // from the error text, and never changes a mutation decision.
         let release = crate::runtime_meta::compiled_source_commit();
@@ -727,11 +737,31 @@ pub fn run(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
             crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)
                 .ok()
                 .as_ref(),
-            release,
-            crate::runtime_meta::runtime_version(),
+            &BootstrapRunContext {
+                selected_account_id: selected_account.borrow().as_deref(),
+                release,
+                runtime_version: crate::runtime_meta::runtime_version(),
+            },
             language,
         )
     })
+}
+
+/// What this bootstrap run itself established (as opposed to what the local
+/// journal claims): the account it actually selected and the release it runs.
+struct BootstrapRunContext<'a> {
+    selected_account_id: Option<&'a str>,
+    release: Option<&'a str>,
+    runtime_version: &'a str,
+}
+
+/// Local, read-only evidence that decides whether a bootstrap failure is
+/// recoverable on this machine. `selected_account_id` is the Cloudflare account
+/// this run actually proved/selected (never guessed from the journal).
+struct BootstrapLocalEvidence {
+    selected_account_id: Option<String>,
+    expected_worker_name: Option<String>,
+    local_credential_available: bool,
 }
 
 /// #865 S3: a bootstrap failure gets a next-step line that states whether
@@ -748,45 +778,30 @@ fn render_bootstrap_failure(
     paths: &RuntimePaths,
     journal: Option<&BootstrapJournal>,
     config: Option<&crate::config::Config>,
-    release: Option<&str>,
-    runtime_version: &str,
+    run: &BootstrapRunContext<'_>,
     language: Locale,
 ) -> String {
-    render_bootstrap_failure_with(
-        message,
-        journal,
-        config,
-        release,
-        runtime_version,
-        local_worker_name().as_deref(),
-        local_device_credential_available(paths, journal),
-        language,
-    )
+    let evidence = BootstrapLocalEvidence {
+        selected_account_id: run.selected_account_id.map(str::to_owned),
+        expected_worker_name: local_worker_name(),
+        local_credential_available: local_device_credential_available(paths, journal),
+    };
+    render_bootstrap_failure_with(message, journal, config, &evidence, run, language)
 }
 
 /// The rendering half of [`render_bootstrap_failure`], with the local evidence
-/// (this computer's Worker name and whether the credential store still holds the
-/// device credential) passed in so the classification itself is directly
-/// testable.
-#[allow(clippy::too_many_arguments)]
+/// (selected account, this computer's Worker name, and whether the credential
+/// store still holds the device credential) passed in so the classification
+/// itself is directly testable.
 fn render_bootstrap_failure_with(
     message: &str,
     journal: Option<&BootstrapJournal>,
     config: Option<&crate::config::Config>,
-    release: Option<&str>,
-    runtime_version: &str,
-    expected_worker_name: Option<&str>,
-    local_credential_available: bool,
+    evidence: &BootstrapLocalEvidence,
+    run: &BootstrapRunContext<'_>,
     language: Locale,
 ) -> String {
-    let durable = durable_first_device_state(
-        journal,
-        config,
-        release,
-        runtime_version,
-        expected_worker_name,
-        local_credential_available,
-    );
+    let durable = durable_first_device_state(journal, config, evidence, run);
     let next_step = if durable {
         language.text(
             "Next step: this computer's first-device journal and credential are already saved. Keep ~/.config/herdr-mcp/bootstrap/ and the device credential, resolve the local error above, then rerun `herdr-mcp worker bootstrap` on this same computer and OS account. Do not delete the journal or edit the secrets.",
@@ -806,10 +821,8 @@ fn render_bootstrap_failure_with(
 fn durable_first_device_state(
     journal: Option<&BootstrapJournal>,
     config: Option<&crate::config::Config>,
-    release: Option<&str>,
-    runtime_version: &str,
-    expected_worker_name: Option<&str>,
-    local_credential_available: bool,
+    evidence: &BootstrapLocalEvidence,
+    run: &BootstrapRunContext<'_>,
 ) -> bool {
     let (Some(journal), Some(config)) = (journal, config) else {
         return false;
@@ -820,15 +833,22 @@ fn durable_first_device_state(
     if journal.phase < Phase::SecretsProvisioned || journal.phase >= Phase::OperationalReady {
         return false;
     }
-    let same_release = release.is_some_and(|commit| commit == journal.source_commit)
-        && runtime_version == journal.runtime_version;
+    let same_release = run
+        .release
+        .is_some_and(|commit| commit == journal.source_commit)
+        && run.runtime_version == journal.runtime_version;
     // The recovery path re-proves the Cloudflare account/Worker before any
     // mutation. Nothing local can prove the account externally, so it must at
     // least be recorded, and the Worker must still be this computer's Worker;
     // an empty or switched identity is treated as a fail-closed refusal.
+    //
+    // The account comparison mirrors `validate_journal(..., &account.id, ...)`:
+    // it must be the account this run actually selected. A failure before that
+    // selection, or a different account, is a fail-closed refusal.
     let identity_recorded = !journal.account_id.trim().is_empty()
         && !journal.worker_name.trim().is_empty()
-        && expected_worker_name == Some(journal.worker_name.as_str());
+        && evidence.selected_account_id.as_deref() == Some(journal.account_id.as_str())
+        && evidence.expected_worker_name.as_deref() == Some(journal.worker_name.as_str());
     same_release
         && identity_recorded
         && config.edge_device_id.as_deref() == Some(device)
@@ -839,7 +859,7 @@ fn durable_first_device_state(
         // The real retry authenticates with this credential; without it the
         // rerun cannot succeed, so the hint must not claim recovery. Only the
         // availability is checked here; the secret is never read into output.
-        && local_credential_available
+        && evidence.local_credential_available
 }
 
 fn local_worker_name() -> Option<String> {
@@ -1240,7 +1260,11 @@ where
     activate(&enrolled.device_id)
 }
 
-fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
+fn run_inner(
+    paths: &RuntimePaths,
+    language: Locale,
+    selected_account: &std::cell::RefCell<Option<String>>,
+) -> Result<ExitCode, String> {
     let source_commit = crate::runtime_meta::compiled_source_commit()
         .filter(|value| valid_source_commit(value))
         .ok_or_else(|| {
@@ -1283,6 +1307,7 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
     );
 
     let account = select_account_for_locale(&cloudflare, language)?;
+    *selected_account.borrow_mut() = Some(account.id.clone());
     println!(
         "{} {} ({}).",
         language.text(
@@ -4705,16 +4730,19 @@ mod tests {
             edge_public_origin: Some(origin.into()),
             ..crate::config::Config::default()
         };
+        let evidence = || BootstrapLocalEvidence {
+            selected_account_id: Some("account".to_owned()),
+            expected_worker_name: Some("herdr-edge".to_owned()),
+            local_credential_available: true,
+        };
+        let run = BootstrapRunContext {
+            selected_account_id: Some("account"),
+            release: Some(&release),
+            runtime_version: "1.2.0",
+        };
         let guidance = |journal: Option<&BootstrapJournal>,
                         config: Option<&crate::config::Config>| {
-            durable_first_device_state(
-                journal,
-                config,
-                Some(&release),
-                "1.2.0",
-                Some("herdr-edge"),
-                true,
-            )
+            durable_first_device_state(journal, config, &evidence(), &run)
         };
 
         assert!(guidance(Some(&journal()), Some(&config())), "durable state");
@@ -4754,10 +4782,12 @@ mod tests {
             !durable_first_device_state(
                 Some(&journal()),
                 Some(&config()),
-                Some(&release),
-                "1.3.0",
-                Some("herdr-edge"),
-                true
+                &evidence(),
+                &BootstrapRunContext {
+                    selected_account_id: Some("account"),
+                    release: Some(&release),
+                    runtime_version: "1.3.0",
+                }
             ),
             "journal from another runtime version"
         );
@@ -4765,10 +4795,12 @@ mod tests {
             !durable_first_device_state(
                 Some(&journal()),
                 Some(&config()),
-                None,
-                "1.2.0",
-                Some("herdr-edge"),
-                true
+                &evidence(),
+                &BootstrapRunContext {
+                    selected_account_id: Some("account"),
+                    release: None,
+                    runtime_version: "1.2.0",
+                }
             ),
             "a runtime without an exact release must not claim recovery"
         );
@@ -4790,21 +4822,53 @@ mod tests {
             !durable_first_device_state(
                 Some(&journal()),
                 Some(&config()),
-                Some(&release),
-                "1.2.0",
-                None,
-                true
+                &BootstrapLocalEvidence {
+                    selected_account_id: Some("account".to_owned()),
+                    expected_worker_name: None,
+                    local_credential_available: true,
+                },
+                &run
             ),
             "hostname/Worker resolution unavailable"
+        );
+        // #977 droid P2 (re-review): the journal's account must be the account
+        // this run actually selected, exactly like `validate_journal`.
+        assert!(
+            !durable_first_device_state(
+                Some(&journal()),
+                Some(&config()),
+                &BootstrapLocalEvidence {
+                    selected_account_id: Some("switched-account".to_owned()),
+                    expected_worker_name: Some("herdr-edge".to_owned()),
+                    local_credential_available: true,
+                },
+                &run
+            ),
+            "Cloudflare account switched away from the journal's account"
         );
         assert!(
             !durable_first_device_state(
                 Some(&journal()),
                 Some(&config()),
-                Some(&release),
-                "1.2.0",
-                Some("herdr-edge"),
-                false
+                &BootstrapLocalEvidence {
+                    selected_account_id: None,
+                    expected_worker_name: Some("herdr-edge".to_owned()),
+                    local_credential_available: true,
+                },
+                &run
+            ),
+            "failure before any account was selected cannot prove the account"
+        );
+        assert!(
+            !durable_first_device_state(
+                Some(&journal()),
+                Some(&config()),
+                &BootstrapLocalEvidence {
+                    selected_account_id: Some("account".to_owned()),
+                    expected_worker_name: Some("herdr-edge".to_owned()),
+                    local_credential_available: false,
+                },
+                &run
             ),
             "device credential missing from the credential store"
         );
@@ -4827,10 +4891,8 @@ mod tests {
             "cannot read current Worker health: connection refused",
             Some(&journal()),
             Some(&config()),
-            Some(&release),
-            "1.2.0",
-            Some("herdr-edge"),
-            true,
+            &evidence(),
+            &run,
             Locale::En,
         );
         assert!(rendered.contains("already saved"), "{rendered}");
@@ -4847,8 +4909,7 @@ mod tests {
             &test_paths(),
             Some(&journal()),
             Some(&config()),
-            Some(&release),
-            "1.2.0",
+            &run,
             Locale::En,
         );
         assert!(
@@ -4868,8 +4929,11 @@ mod tests {
             &test_paths(),
             None,
             None,
-            Some(&"a".repeat(40)),
-            "1.2.0",
+            &BootstrapRunContext {
+                selected_account_id: None,
+                release: Some(&"a".repeat(40)),
+                runtime_version: "1.2.0",
+            },
             Locale::En,
         );
         assert!(message.starts_with("existing bootstrap journal belongs to a different release"));
@@ -4882,8 +4946,11 @@ mod tests {
             &test_paths(),
             None,
             None,
-            Some(&"a".repeat(40)),
-            "1.2.0",
+            &BootstrapRunContext {
+                selected_account_id: None,
+                release: Some(&"a".repeat(40)),
+                runtime_version: "1.2.0",
+            },
             Locale::En,
         );
         assert!(durable.contains("fail-closed refusal"), "{durable}");
