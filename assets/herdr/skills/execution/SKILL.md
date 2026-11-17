@@ -11,6 +11,8 @@ Call shape: `herdr_exec` accepts `command` **or** `steps`, never both. Use `step
 
 An exec result describes one command, not an Agent. Classify it only by its own `ok`/`exit_code`, `phase`, `session_id` (and any `delivery_state` on a failure path); a command that legitimately prints nothing is still `ok:true`, and empty or missing stdout is never an error and never an Agent result. Agent outcomes belong to `herdr_mcp.agent.task.dispatch` plus task status/inbox or a worker report — never infer Agent failure, stall, or non-delivery from an exec probe.
 
+When a mutating request is refused with `reason:"agent_working"`, use its `busy_kind`: `readers_only` is valid only when every reported active agent is explicitly read-only; `writers` includes any write or unknown activity. A `single_writer_lease_conflict` with `busy_kind:"writers"` remains a hard lease refusal even when `confirm_busy:true` is supplied.
+
 Use `herdr_exec` for bounded deterministic commands expected to finish in one call. Use `herdr_exec_start` for non-trivial tests, builds, servers, benchmarks, network-bound file transfers, or work that may outlive a Web turn. Treat GitHub Actions artifact downloads (`gh api` / `gh run download`), `curl`/`wget`, `scp`/`rsync`, and comparable uploads/downloads as durable-session work by default when remote latency or artifact size can push them beyond the synchronous budget.
 
 Do not plan a long operation around the synchronous request ceiling and then restart it after timeout. Start long work once, keep the returned session identity, and observe that same process.
