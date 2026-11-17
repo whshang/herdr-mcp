@@ -604,10 +604,23 @@ pub fn run_durable(
         #[cfg(unix)]
         {
             let _ = cleanup_stale_scripts();
-            return finish_durable(
-                store,
-                reservation,
-                request.intent,
+            // #332 slice C: an independently declared read-only command must not
+            // queue behind (or hold) the shared utility pane. It runs in its own
+            // one-shot pane instead, so two parallel read-only executions never
+            // contend; the pane is reclaimed on completion, failure and timeout.
+            // Default/write/protected-path executions keep the existing utility
+            // pane, so interactive foreground contention still refuses exactly
+            // as before.
+            let run = if request.intent == Some(ExecIntent::ReadOnly) {
+                run_oneshot_readonly(
+                    client,
+                    registry,
+                    (&workspace.id, &effective_root),
+                    &command,
+                    timeout_ms,
+                    &working,
+                )
+            } else {
                 run_unix_durable(
                     client,
                     snapshot,
@@ -616,8 +629,9 @@ pub fn run_durable(
                     &command,
                     timeout_ms,
                     &working,
-                ),
-            );
+                )
+            };
+            return finish_durable(store, reservation, request.intent, run);
         }
         #[cfg(not(unix))]
         {
@@ -829,6 +843,140 @@ pub(crate) fn start_private_pane_session(
                 private_pane_start_failure(workspace_id, &pane_id, command, error)
             }
         }
+    }
+}
+
+/// One-shot read-only execution (#332 slice C).
+///
+/// Creates a task-owned private pane, starts the command there, waits bounded,
+/// and reclaims the pane on completion, failure and timeout. It never touches
+/// the remembered utility pane or the utility submission lock, so independent
+/// read-only commands cannot return `utility_pane_not_ready` to each other. No
+/// queue, scheduler or session retention is introduced: a timed-out read-only
+/// command is terminated with its pane because it declared no side effect.
+#[cfg(unix)]
+fn run_oneshot_readonly(
+    client: &HerdrClient,
+    registry: &ExecRegistry,
+    target: (&str, &Path),
+    command: &str,
+    timeout_ms: u64,
+    working: &[Value],
+) -> Value {
+    let (workspace_id, effective_root) = target;
+    let started = Instant::now();
+    let start = start_private_pane_session(client, registry, workspace_id, effective_root, command);
+    let pane_id = start
+        .get("pane_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if start.get("ok").and_then(Value::as_bool) != Some(true) {
+        // The private-pane start path already closes the pane when the failure
+        // proves nothing was delivered; keep its fail-closed result.
+        return start;
+    }
+    let (Some(pane_id), Some(session_id)) = (
+        pane_id,
+        start
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    ) else {
+        if let Some(pane_id) = start.get("pane_id").and_then(Value::as_str) {
+            let _ = client.call_with_timeout(
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                PRE_SEND_TIMEOUT,
+            );
+        }
+        return json!({"ok": false, "code": "exec_start_failed", "message": "one-shot read-only exec start returned no session_id"});
+    };
+    let deadline = Duration::from_millis(timeout_ms);
+    loop {
+        let read = registry.read(&session_id, "both", 0, 65_536);
+        if read.get("phase").and_then(Value::as_str) == Some("completed") {
+            let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
+            let ok = exit_code.as_i64() == Some(0);
+            let mut result = Map::new();
+            result.insert("ok".to_owned(), json!(ok));
+            result.insert("backend".to_owned(), json!("private_pane"));
+            result.insert("workspace".to_owned(), json!(workspace_id));
+            result.insert("pane_id".to_owned(), json!(pane_id));
+            result.insert("created_exec_pane".to_owned(), json!(true));
+            result.insert("one_shot_pane".to_owned(), json!(true));
+            result.insert("command".to_owned(), json!(command));
+            result.insert("session_id".to_owned(), json!(session_id));
+            result.insert("op_id".to_owned(), json!(session_id));
+            result.insert("phase".to_owned(), json!("completed"));
+            result.insert("exit_code".to_owned(), exit_code);
+            result.insert(
+                "output".to_owned(),
+                read.get("text").cloned().unwrap_or_else(|| json!("")),
+            );
+            result.insert(
+                "effective_cwd".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            result.insert(
+                "project_root".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            for key in ["progress", "truncated", "compacted", "counts"] {
+                if let Some(value) = read.get(key) {
+                    result.insert(key.to_owned(), value.clone());
+                }
+            }
+            let observed_exit_code = result.get("exit_code").and_then(Value::as_i64);
+            exec_evidence::insert_completed_evidence(&mut result, observed_exit_code);
+            project_structured_output(&mut result, registry, &session_id);
+            add_working_warning(&mut result, working);
+            return Value::Object(result);
+        }
+        if started.elapsed() >= deadline {
+            // Reclaim the one-shot pane: the caller declared no side effect, so
+            // the command is terminated rather than left running in a pane no
+            // later call will address.
+            let killed = registry.kill(&session_id);
+            if killed.get("ok").and_then(Value::as_bool) != Some(true) {
+                let _ = client.call_with_timeout(
+                    "pane.close",
+                    json!({"pane_id": pane_id}),
+                    PRE_SEND_TIMEOUT,
+                );
+            }
+            let mut result = Map::new();
+            result.insert("ok".to_owned(), json!(false));
+            result.insert("code".to_owned(), json!("exec_timeout"));
+            result.insert("backend".to_owned(), json!("private_pane"));
+            result.insert("workspace".to_owned(), json!(workspace_id));
+            result.insert("pane_id".to_owned(), json!(pane_id));
+            result.insert("created_exec_pane".to_owned(), json!(true));
+            result.insert("one_shot_pane".to_owned(), json!(true));
+            result.insert("command".to_owned(), json!(command));
+            result.insert("session_id".to_owned(), json!(session_id));
+            result.insert("op_id".to_owned(), json!(session_id));
+            result.insert("phase".to_owned(), json!("running"));
+            result.insert(
+                "partial_output".to_owned(),
+                read.get("text").cloned().unwrap_or_else(|| json!("")),
+            );
+            result.insert(
+                "effective_cwd".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            result.insert(
+                "project_root".to_owned(),
+                json!(effective_root.to_string_lossy()),
+            );
+            exec_evidence::insert_timeout_evidence(&mut result);
+            add_working_warning(&mut result, working);
+            result.insert(
+                "hint".to_owned(),
+                json!("the declared read-only command exceeded timeout_ms; its one-shot pane was terminated and reclaimed (no retained session). Re-run a bounded read-only command instead of reading this session."),
+            );
+            return Value::Object(result);
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2202,6 +2350,187 @@ mod tests {
             json!({"started": false, "completed": false, "exit_code": null})
         );
         assert_eq!(result["failure_origin"], "herdr_control_plane");
+    }
+
+    /// #332 slice C: a declared read-only protected execution runs in its own
+    /// one-shot pane instead of the shared utility pane, and the pane is
+    /// reclaimed when the bounded wait expires.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_protected_exec_uses_a_reclaimed_one_shot_pane() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&methods);
+        let server = thread::spawn(move || {
+            for pane in ["w1:p9"] {
+                for _ in 0..5 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap().to_owned();
+                    recorded.lock().unwrap().push(method.clone());
+                    let result = match method.as_str() {
+                        "pane.split" => json!({"pane": {"pane_id": pane}}),
+                        "pane.rename"
+                        | "pane.wait_for_output"
+                        | "pane.send_text"
+                        | "pane.close" => json!({"ok": true}),
+                        other => panic!("unexpected Herdr method: {other}"),
+                    };
+                    writeln!(
+                        stream,
+                        "{}",
+                        json!({"id": request["id"].clone(), "result": result})
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home
+            .join("Documents")
+            .join(format!("herdr-readonly-oneshot-{}", std::process::id()));
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &test_store(),
+            &json!({
+                "workspace": "w1",
+                "command": "printf 'read-only\n'",
+                "intent": "read_only",
+                "timeout_ms": 300,
+            }),
+        );
+
+        assert_ne!(result["code"], "utility_pane_not_ready", "{result}");
+        assert_eq!(result["backend"], "private_pane", "{result}");
+        assert_eq!(result["created_exec_pane"], true, "{result}");
+        assert_eq!(result["one_shot_pane"], true, "{result}");
+        assert_eq!(result["code"], "exec_timeout", "{result}");
+        assert!(
+            result["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("reclaimed")),
+            "{result}"
+        );
+        let observed = methods.lock().unwrap().clone();
+        assert_eq!(observed[0], "pane.split", "{observed:?}");
+        assert!(
+            observed.contains(&"pane.send_text".to_owned()),
+            "{observed:?}"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|method| *method == "pane.close")
+                .count(),
+            1,
+            "the one-shot pane must be reclaimed exactly once: {observed:?}"
+        );
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// #332 slice C acceptance: two parallel read-only executions each get their
+    /// own pane, so neither returns `utility_pane_not_ready`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parallel_read_only_protected_execs_do_not_contend_for_the_utility_pane() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&methods);
+        let server = thread::spawn(move || {
+            let mut splits = 0;
+            let mut served = 0;
+            while served < 10 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(method.clone());
+                let result = match method.as_str() {
+                    "pane.split" => {
+                        splits += 1;
+                        json!({"pane": {"pane_id": format!("w1:p{}", 8 + splits)}})
+                    }
+                    "pane.rename" | "pane.wait_for_output" | "pane.send_text" | "pane.close" => {
+                        json!({"ok": true})
+                    }
+                    other => panic!("unexpected Herdr method: {other}"),
+                };
+                served += 1;
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"id": request["id"].clone(), "result": result})
+                )
+                .unwrap();
+            }
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home
+            .join("Documents")
+            .join(format!("herdr-readonly-parallel-{}", std::process::id()));
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+
+        let mut panes = Vec::new();
+        for _ in 0..2 {
+            let result = run_durable(
+                &client,
+                &snapshot,
+                &registry,
+                &test_store(),
+                &json!({
+                    "workspace": "w1",
+                    "command": "printf 'read-only\n'",
+                    "intent": "read_only",
+                    "timeout_ms": 300,
+                }),
+            );
+            assert_ne!(result["code"], "utility_pane_not_ready", "{result}");
+            assert_eq!(result["backend"], "private_pane", "{result}");
+            assert_eq!(result["one_shot_pane"], true, "{result}");
+            panes.push(result["pane_id"].as_str().unwrap().to_owned());
+        }
+        assert_ne!(panes[0], panes[1], "each read-only execution owns its pane");
+        server.join().unwrap();
+        let observed = methods.lock().unwrap().clone();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|method| *method == "pane.split")
+                .count(),
+            2,
+            "{observed:?}"
+        );
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(target_os = "macos")]
