@@ -1147,11 +1147,12 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "mutation",
-            "description": "Acquire or idempotently re-acquire a durable single-writer mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Device attribution is derived from the enrolled local runtime configuration, never from request parameters. Returns monotonic lease_epoch fencing token and unpredictable lease_token capability; returns single_writer_lease_conflict when held by another active owner.",
+            "description": "Acquire or idempotently re-acquire a durable mutation lease on a canonicalized project_root (and optional lane_key, default '*'). Write intent is exclusive; read intent permits multiple readers and excludes writers. Intent defaults to write. Device attribution is derived from the enrolled local runtime configuration, never from request parameters. Returns a monotonic lease_epoch fencing token and unpredictable lease_token capability; incompatible active owners cause a single_writer_lease_conflict.",
             "params": {
                 "properties": {
                     "project_root": {"type": "string", "maxLength": 4096},
                     "lane_key": {"type": "string", "maxLength": 256, "default": "*"},
+                    "intent": {"type": "string", "enum": ["read", "write"], "default": "write"},
                     "holder_id": {"type": "string", "maxLength": 256},
                     "lease_token": {"type": ["string", "null"], "maxLength": 256},
                     "ttl_seconds": {"type": "integer", "minimum": 10, "maximum": 3600, "default": 300},
@@ -1205,7 +1206,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
             "source": "herdr_mcp_local",
             "schema_version": 1,
             "access": "read_only",
-            "description": "List active non-expired mutation leases, exposing project/device/workspace/branch/holder/expiry metadata only; lease tokens are never returned.",
+            "description": "List active non-expired mutation leases, including intent and sanitized active reader metadata; lease tokens and token digests are never returned.",
             "params": {
                 "properties": {
                     "project_root": {"type": ["string", "null"], "maxLength": 4096},
