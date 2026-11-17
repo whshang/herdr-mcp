@@ -1,6 +1,7 @@
 mod agent_gate_cli;
 mod agent_visibility;
 mod artifact_import;
+mod bootstrap_recovery;
 mod browser_control;
 mod browser_extension_identity;
 mod capability_inventory;

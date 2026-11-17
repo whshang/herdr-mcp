@@ -1356,9 +1356,10 @@ fn run_inner(
     gate.mark_classified();
 
     let recovery_upgrade = match &classification {
-        FleetClassification::ExistingFleet { worker_name } => {
-            return Err(format!(
-                "existing Herdr Worker '{worker_name}' found in this Cloudflare account; do not deploy a second fleet. On any enrolled computer run `herdr-mcp worker pair`, then run `herdr-mcp worker connect <pairing-address>` here"
+        FleetClassification::ExistingFleet { .. } => {
+            return Err(crate::bootstrap_recovery::refusal(
+                crate::bootstrap_recovery::RecoveryReason::ExistingFleetMaterial,
+                language,
             ));
         }
         FleetClassification::AmbiguousTarget {
@@ -1396,7 +1397,13 @@ fn run_inner(
                     &runtime_version,
                     &account.id,
                     worker_name,
-                )?;
+                )
+                .map_err(|_| {
+                    crate::bootstrap_recovery::refusal(
+                        crate::bootstrap_recovery::RecoveryReason::StaleJournal,
+                        language,
+                    )
+                })?;
             }
             println!(
                 "{}",
@@ -1436,7 +1443,13 @@ fn run_inner(
                 &runtime_version,
                 &account.id,
                 &worker_name,
-            )?;
+            )
+            .map_err(|_| {
+                crate::bootstrap_recovery::refusal(
+                    crate::bootstrap_recovery::RecoveryReason::StaleJournal,
+                    language,
+                )
+            })?;
             journal
         }
         None => BootstrapJournal::new(
@@ -1456,7 +1469,10 @@ fn run_inner(
     }
     write_journal(&journal_path, &journal)?;
     if journal.phase == Phase::SecretsProvisioned && journal.canonical_device_id.is_none() {
-        return Err("bootstrap enrollment state is ambiguous; refusing to reprovision secrets or create another device".to_owned());
+        return Err(crate::bootstrap_recovery::refusal(
+            crate::bootstrap_recovery::RecoveryReason::MissingCanonicalDevice,
+            language,
+        ));
     }
 
     let subdomain = match existing_subdomain {
