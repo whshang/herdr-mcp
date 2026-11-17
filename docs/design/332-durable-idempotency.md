@@ -2,7 +2,7 @@
 
 状态：设计待批准，未改 schema，未改 Rust，未改变 Runtime Execution Contract。
 
-基线：`origin/main` `495156ecca86b3e092f63fa76f8c5323ea034fd9`。
+基线：`origin/main` `83176c7b846c38b6397c7007bc76bf5951539782`。
 
 关联：issue #332，差距分析评论 `6937170052`。
 
@@ -55,7 +55,7 @@ key_digest = SHA-256(
 )
 ```
 
-`caller_scope_digest` 必须来自重启后仍可解析的持久身份，不能直接使用只存在于当前请求的 opaque session 字符串。浏览器调用者先用持久的 `browser_caller_sessions` 或 `browser_cross_device_caller_sessions` 绑定，将 `session_ref` 与 `owning_device_id` 作为 scope 来源；这两张表通过 caller session 的哈希查找，见 `state_store.rs:4804-4868`、`:5112-5144`。本地或 trusted caller 使用当前实例 `config.json` 中持久的 `edge_device_id` 和已认证的 caller 类型；没有持久设备身份时，D-1 必须拒绝提供重启后 replay，而不能继续沿用当前空 scope。已验证的 lease holder 可以作为额外绑定字段，但不能单独作为身份权威。租约 token、cookie、bearer 等秘密不得进入明文或摘要之外的结果。请求摘要绑定以下内容：
+`caller_scope_digest` 必须来自重启后仍可解析的持久身份，不能直接使用只存在于当前请求的 opaque session 字符串。浏览器调用者先用持久的 `browser_caller_sessions` 或 `browser_cross_device_caller_sessions` 绑定，将 `provider`、`session_ref` 和 `owning_device_id` 作为 scope 来源；本机浏览器没有设备归属时也要编码一个明确的 `device_local` 标记，不能把 `None` 和跨设备的 `Some(device_id)` 混成同一 scope。这两张表通过 caller session 的哈希查找，见 `state_store.rs:4804-4868`、`:5112-5144`。本地或 trusted caller 必须使用当前实例 `config.json` 中持久的 `edge_device_id` 和已认证的 caller 类型；没有持久设备身份时，在预留前返回 `durable_caller_scope_unavailable`，不执行写命令，也不提供重启 replay，不能继续沿用现有内存账本的空 scope。已验证的 lease holder 可以作为额外绑定字段，但不能单独作为身份权威。租约 token、cookie、bearer 等秘密不得进入明文或摘要之外的结果。请求摘要绑定以下内容：
 
 ```text
 request_hash = SHA-256(canonical JSON {
@@ -91,7 +91,7 @@ request_hash = SHA-256(canonical JSON {
 | `runtime_generation` | 可选写入执行时 generation，便于诊断和回滚审计；不参与 replay 许可判断 |
 | `boot_id` | 可选写入执行时 boot，区分重启前后的观察 |
 | `created_at`、`updated_at` | 预留、送达、结算和清理时间 |
-| `expires_at` | 完整终态摘要的过期时间；pending、unknown 和 hash-only tombstone 必须为 NULL |
+| `expires_at` | SQL 清理列。D-1 的 `idempotent_write`、`non_idempotent_write` 从预留到完整终态和 hash-only tombstone 一律为 NULL；只有无副作用的 `read_only` 终态可以使用非 NULL 值 |
 
 `result_json` 至少包含：
 
@@ -100,6 +100,7 @@ request_hash = SHA-256(canonical JSON {
   "schema": 1,
   "intent": "non_idempotent_write",
   "outcome": "applied",
+  "summary_expires_at_ms": 1760000000000,
   "delivery_state": "delivered",
   "safe_retry_mode": "none",
   "idempotency_persisted": true,
@@ -122,7 +123,8 @@ request_hash = SHA-256(canonical JSON {
 
 ```text
 reserved/pending
-  ├─ 已证明未送达 → settled/complete + outcome=not_delivered
+  ├─ 预送达控制面拒绝 → 释放 reservation，不留下可执行记录
+  ├─ 已结算且证明未送达 → settled/complete + outcome=not_delivered
   ├─ 已有成功终态 → settled/complete + outcome=applied
   ├─ 已有拒绝终态 → settled/complete + outcome=rejected
   └─ 送达或结算不明 → settled/unknown + outcome=unknown
@@ -139,7 +141,7 @@ reserved/pending
 | 终态已应用、已拒绝或已证明未送达 | `none` | 同键只返回第一次摘要；新尝试必须使用新键 |
 | pending 或 unknown | `inspect_before_retry` | 先查 session、进程、文件或外部系统；Runtime 不重新投递 |
 | `read_only` 无记录 | `retry_safe_read_only` | 可以重新执行只读查询，不把它当成变更重试 |
-| 预送达控制面拒绝且没有副作用 | `retry_after_resource_release` | 可在资源恢复后重试；该请求没有取得可执行的持久化结果 |
+| 预送达控制面拒绝且没有副作用、且 reservation 已原子释放 | `retry_after_resource_release` | 资源恢复后可以用同一个键重新预留；数据库中没有该次失败的终态记录 |
 | durable store 不可用 | `retry_after_durable_store_recovery` | 不执行写命令，待账本恢复后重新提交 |
 
 对 `non_idempotent_write`，永远不产生 `retry_now` 或等价值。对 `idempotent_write`，即使命令理论上可重复，`pending`/`unknown` 也保持 `inspect_before_retry`，除非后续设计增加了可验证的外部 postcondition；D-1 不凭 intent 名称推断外部状态。
@@ -148,15 +150,14 @@ reserved/pending
 
 建议的 D-1 保留政策：
 
-- `complete` 终态的完整摘要保留 24 小时。这个窗口覆盖常见的重启、网络恢复和人工重试间隔，比当前内存账本 30 分钟和现有 `herdr_exec` 终态 60 分钟更能满足“重启后同键返回第一次摘要”的目标。
-- 对 `idempotent_write` 和 `non_idempotent_write`，24 小时后把结果正文投影压缩成只含 key digest、request hash、intent、终态和 `expired=true` 的 hash-only tombstone；tombstone 的 `expires_at` 恒为 NULL，不删除键占位。旧键在 tombstone 存在时返回 `idempotency_key_expired` 或等价的不可重试冲突，不得再次执行。这样可以缩短敏感摘要保留期，同时保持写入键不会因为清理而重新获得执行资格，也不会被旧二进制的通用 prune 删除。
+- `read_only` 的完整摘要保留 30 分钟，使用 `operations.expires_at` 做可删除的 SQL 清理。这个终态没有写副作用，过期后可以整行删除并重新读取。
+- 对 `idempotent_write` 和 `non_idempotent_write`，从第一次写入 `complete` 终态起，`operations.expires_at` 恒为 NULL。完整摘要内部写入 `summary_expires_at_ms = settled_at + 24h`，这个逻辑截止时间不参与通用 SQL prune。24 小时后，新 operation kind 的清理事务把结果正文原地压缩成只含 key digest、request hash、intent、终态和 `expired=true` 的 hash-only tombstone，并继续保持 `operations.expires_at=NULL`。旧键在 tombstone 存在时返回 `idempotency_key_expired` 或等价的不可重试冲突，不得再次执行。这样可以缩短敏感摘要保留期，同时保持写入键不会因为新旧二进制的通用 prune 而重新获得执行资格。
 - `pending` 和 `unknown` 的 `expires_at` 永远为 NULL，不参与自动清理。清除它们会重新打开重复副作用的窗口。
-- `read_only` 终态可使用 30 分钟较短保留；过期后可以删除整行并重新读取，因为没有写副作用。
-- 清理只能删除 `read_only` 的终态行，或把写入终态压缩为 hash-only tombstone；写入 kind 的 tombstone 由该 kind 的清理函数保留，不能依赖 `task_decision_gates`。D-1 不为新 kind 创建 task gate，现有 gate 保护只适用于已经与 `herdr_prompt_task` 行关联的任务。新 kind 的清理事务必须检查 operation kind 和 state，并保证 tombstone、pending、unknown 永不进入可删除集合。不能通过删除旧行来释放一个尚未结算的键，也不能把写入终态直接删除后当作新请求。
+- 清理只能删除 `read_only` 的终态行，或把写入终态压缩为 hash-only tombstone；写入 kind 的 tombstone 由该 kind 的清理函数保留，不能依赖 `task_decision_gates`。D-1 不为新 kind 创建 task gate，现有 gate 保护只适用于已经与 `herdr_prompt_task` 行关联的任务。新 kind 的清理事务必须检查 operation kind 和 state，并保证写入 tombstone、pending、unknown 永不进入可删除集合。不能通过删除旧行来释放一个尚未结算的键，也不能把写入终态直接删除后当作新请求。
 - 每个新 kind 设置有限容量，建议先沿用现有 1024 条的上限作为最小值，评估后再提高。达到上限时只能淘汰只读终态或完整摘要已压缩且允许删除的记录；写入 tombstone、pending 和 unknown 都不可淘汰。如果剩下的全是这些不可淘汰记录，返回 `client_request_ledger_full`，不丢记录、不执行新写命令。
 - 清理、容量拒绝和 replay 都必须保留同一个 key digest 的冲突语义，不能因清理路径把相同键当成新请求。
 
-实现时优先复用 `StateStore::reserve_operation` 的事务、唯一索引和现有清理框架。现有 `operations` 的唯一索引按 `(kind, idempotency_key)` 约束，正好可以让 `herdr_exec` 和 `herdr_exec.client_request.v1` 使用不同命名空间而互不碰撞。
+实现时优先复用 `StateStore::reserve_operation` 的事务、唯一索引和现有清理框架，但 D-1 写入 kind 每次调用必须传入 `expires_at=NULL`，包括首次预留和 complete 结算。完整摘要的 24 小时逻辑截止时间只存在 `result_json.summary_expires_at_ms`，kind-specific cleanup 只更新 `result_json`，不设置 SQL `expires_at`，也不依赖通用 prune 的排除列表。现有 `operations` 的唯一索引按 `(kind, idempotency_key)` 约束，正好可以让 `herdr_exec` 和 `herdr_exec.client_request.v1` 使用不同命名空间而互不碰撞。
 
 ## schema 16、v1.1.x 回滚和兼容
 
@@ -167,14 +168,14 @@ D-1 需要的列已经存在于 schema 16 的 `operations` 表，因此推荐：
 - `SCHEMA_VERSION` 继续为 16。
 - 不新建 `client_request_ledger` 表。
 - 不修改已应用的 migration，只新增新的 operation kind 和运行时逻辑。
-- 新 row 的 `phase`、`state`、`expires_at` 使用现有通用值，让旧二进制可以打开数据库并忽略未知 kind。
+- 新 row 的 `phase`、`state` 使用现有通用值，D-1 写入 kind 的 `expires_at` 从始至终为 NULL，让旧二进制可以打开数据库并且通用 prune 不会删除未知 kind 的写入键。
 
 这样保留了数据库层面的 v1.1.x 回滚兼容：旧二进制打开同一个 state.db 不会因为版本号更高而 fail closed。旧二进制仍然不认识新的 `client_request_id` 语义，所以语义兼容必须单独声明：
 
 - 旧二进制继续支持已有 `herdr_exec.idempotency_key`，这条路径已在 schema 16 上持久化。
-- 旧二进制不得把 D-1 的 `client_request_id` 当作没有键的新写请求。部署或回滚门禁应在检测到 D-1 请求字段时返回 `unsupported_client_request_id`，或要求先由新二进制完成 reconciliation；绝不静默执行。
+- 旧二进制不得把 D-1 的 `client_request_id` 当作没有键的新写请求。负责边界是 caller-boundary adapter 与发布/回滚流量门禁：能力协商确认目标 runtime 支持 D-1 前，adapter 不得把字段发送给 v1.1.x；本地直连入口在回滚期间必须被门禁阻断。不能依赖 v1.1.x 对未知可选 JSON 字段的行为来推断拒绝，无法证明所有入口都被阻断时禁止回滚。新 runtime 的入口在检测到不支持的字段时返回 `unsupported_client_request_id`，绝不静默执行。
 - 回滚到 v1.1.x 前，如果存在 D-1 的 pending/unknown 行，必须停止回滚或要求人工确认。它们代表可能已经发生的副作用，不能因为旧二进制看不懂 kind 就再次投递。
-- 终态摘要行可以留在 schema 16 的 `operations` 中；旧二进制忽略未知 kind，不得删除 pending/unknown，也不会删除 `expires_at=NULL` 的写入 tombstone。恢复到新二进制后，原记录仍可用于 replay/status。
+- 终态摘要行可以留在 schema 16 的 `operations` 中；D-1 写入终态和 tombstone 的 `expires_at` 都是 NULL，因此旧二进制的 `DELETE ... expires_at <= now` 不会删除它们。恢复到新二进制后，原记录仍可用于 replay/status。
 
 ### 如果未来必须升到 schema 17
 
@@ -198,6 +199,7 @@ D-1 设计阶段不改 Rust，不改 `contracts/`，不改变当前 epoch 6 和 
 - 旧客户端省略新字段时行为完全不变。
 - 旧 Runtime 收到新字段时必须拒绝并返回 `unsupported_client_request_id`，不能丢字段后执行。
 - 新 Runtime 不能把 `client_request_id` 和 `idempotency_key` 解释成两个独立的执行槽位。
+- 发布与回滚门禁必须覆盖 caller-boundary adapter、HTTP/IPC 入口和本地直连入口；若不能证明旧 Runtime 的所有入口都会在执行前拒绝 D-1 字段，则该版本不具备可接受的回滚路径。
 
 在这个 contract 变更获批前，直接 `herdr_exec` 的稳定键名仍是 `idempotency_key`；`client_request_id` 的重启验收应通过计划中的 caller-boundary 适配层验证，不能把文档目标误写成当前已存在的字段。
 
@@ -208,13 +210,15 @@ D-1 设计阶段不改 Rust，不改 `contracts/`，不改变当前 epoch 6 和 
 - 创建临时 schema 16 state.db，提交一个带 `client_request_id` 的 `non_idempotent_write`，让命令写入唯一外部计数器并返回完整摘要。
 - 关闭第一进程，重新打开同一个 state.db，使用相同 caller scope、相同 request fingerprint 和相同 key 重试。
 - 断言返回第一次记录的 `op_id`、摘要 digest、状态和 `safe_retry_mode=none`，外部计数器仍为 1，第二次没有启动子进程、没有发送到 utility pane、没有创建新 session。
+- 断言写入 `complete` 终态时 `operations.expires_at IS NULL`，`result_json.summary_expires_at_ms` 是 24 小时逻辑摘要截止时间；推进时钟到该时间后，在新 kind 的压缩任务运行前先触发旧版通用 `reserve_operation` prune，记录仍存在且同键仍只返回第一次摘要。
 - 变更命令、root、workspace、intent 或 caller scope 后复用同一 key，断言 `idempotency_conflict`，且外部计数器不变。
 - 重启后查询 `request.status`，断言同一 scope 能读到记录，其他 scope 得到 `found:false`，不泄露 key 是否存在。
+- 没有 `edge_device_id` 或持久浏览器 caller session 时，D-1 在预留前返回 `durable_caller_scope_unavailable`，不创建 pending 行，也不执行写命令。
 
 ### 不确定结果和安全重试
 
 - 在命令已经可能送达、结算前强制结束 Runtime，重启后断言同 key 返回 `delivery_unknown` 或 `request_in_flight`，`safe_retry_mode=inspect_before_retry`，不二次执行。
-- 在预送达控制面失败时，断言结果为 `not_delivered`、`retry_after_resource_release`，没有持久化可执行的副作用；恢复资源后可以用同一请求重新预留，或按实现约定要求新 key，但不能复制一条 pending 记录。
+- 在预送达控制面失败时，断言 reservation 被原子释放、结果为 `not_delivered`、`retry_after_resource_release`，没有持久化终态行；恢复资源后使用同一请求重新预留只会产生一次执行。凡已经写入 `settled/complete + outcome=not_delivered` 的记录都固定 `safe_retry_mode=none`，只能换新 key，不能两种语义并存。
 - 模拟 durable store 不可用，断言写命令不执行，结果使用 `retry_after_durable_store_recovery`。
 
 ### 三种 intent
@@ -227,7 +231,7 @@ D-1 设计阶段不改 Rust，不改 `contracts/`，不改变当前 epoch 6 和 
 
 ### 账本和清理
 
-- 终态记录在保留期内可重启 replay；写入终态过期后变成 tombstone，旧 key 返回过期冲突而不是重新执行。只有新 key 才能开始新请求。只读终态被清理后，`request.status` 返回未知并允许重新读取。
+- 终态记录在保留期内可重启 replay；写入终态的 SQL `expires_at` 从不设置，逻辑摘要截止后只变成 tombstone，旧 key 返回过期冲突而不是重新执行。只有新 key 才能开始新请求。只读终态被清理后，`request.status` 返回未知并允许重新读取。
 - pending/unknown 行经过多次清理和重启仍存在，容量达到上限时拒绝新写入而不淘汰它们。
 - 结果摘要不包含 stdout、stderr、prompt、文件内容、token、lease token 或其他秘密，只包含状态、digest、字节数和必要的 session/op 标识。
 - 两个并发进程使用同一 key 时只有一个获得 `Reserved`，另一个得到 replay 或 in-flight，不能各自执行一次。
@@ -236,6 +240,7 @@ D-1 设计阶段不改 Rust，不改 `contracts/`，不改变当前 epoch 6 和 
 
 - schema 16 的旧数据库在新实现中可读，新增 operation kind 不影响已有 `herdr_exec` replay。
 - v1.1.x 打开同一个 state.db 不报高版本错误；遇到 D-1 字段时拒绝，不静默执行。
+- 回滚门禁在 caller-boundary adapter、HTTP/IPC 和本地直连入口都阻断 D-1 字段；无法证明入口全部阻断时拒绝回滚。
 - 有 pending/unknown D-1 记录时回滚门禁拒绝，或要求人工 reconciliation；回滚过程中不能删除这些行。
 - v1.1.x 已有 `herdr_exec.idempotency_key` 的成功 replay 继续通过；这与新的 caller-level `client_request_id` 语义分开验证。
 
