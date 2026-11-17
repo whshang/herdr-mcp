@@ -277,7 +277,7 @@ test("initialize negotiates unknown protocol versions down to SDK wire", async (
   assert.equal(r.body.result.protocolVersion, "2025-11-25");
 });
 
-test("retired Node epoch1 profile keeps its frozen 17-tool contract identity", () => {
+test("user keeps the retired Node epoch1 contract | Given the legacy profile is fixed | When the profile is inspected | Then its 17-tool identity and missing herdr_skill remain unchanged", () => {
   assert.equal(EPOCH1_CONTRACT.contract_epoch, 1);
   assert.equal(EPOCH1_CONTRACT.contract_hash, "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d");
   assert.equal(EPOCH1_CONTRACT.tool_count, 17);
