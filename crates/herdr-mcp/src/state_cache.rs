@@ -919,6 +919,14 @@ impl EventCache {
             })
     }
 
+    pub fn current_cursor(&self) -> u64 {
+        self.shared
+            .state
+            .read()
+            .map(|state| state.digest_cursor)
+            .unwrap_or(0)
+    }
+
     pub fn snapshot(&self) -> Value {
         self.shared
             .state
@@ -1541,6 +1549,33 @@ mod tests {
 
         publish_cursor(&cache.shared);
         assert!(!receiver.has_changed().unwrap());
+    }
+
+    #[test]
+    fn cursor_captured_before_later_event_is_consumable_by_since() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        let cursor = cache.current_cursor();
+        assert_eq!(cursor, 0);
+
+        cache.shared.state.write().unwrap().apply_event(
+            json!({
+                "event": "pane_updated",
+                "type": "pane_updated",
+                "pane": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "cwd": "/tmp/demo",
+                    "agent_status": "working",
+                    "state_change_seq": 9
+                }
+            }),
+            "2026-08-25T04:30:00Z".to_owned(),
+        );
+
+        let digest = cache.digest_since(cursor);
+        assert_eq!(digest.cursor, 1);
+        assert_eq!(digest.events.len(), 1);
+        assert_eq!(digest.events[0]["cursor"], 1);
     }
 
     fn fixture() -> Value {
