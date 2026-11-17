@@ -261,6 +261,80 @@ struct AppState {
     admitted_config: crate::runtime_adapter::AdmittedBackendConfig,
 }
 
+/// #768 Phase 2 slice 2b: the TUI-dependent background workers a candidate
+/// builds. A `herdr-core` candidate constructs and starts none of them; the
+/// admission fence in `candidate_startup` stays in place until this isolation is
+/// proven, so this plan is the single place that decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CandidateWorkerPlan {
+    /// Long-lived TUI snapshot/event-cursor worker (`EventCache::start`).
+    pub tui_event_cache: bool,
+    /// Exec sessions attach a TUI client for pane-backed sessions.
+    pub tui_exec_client: bool,
+    /// The agent-task tracker is woken by the TUI cache cursor.
+    pub tui_prompt_tracker: bool,
+    /// Work compaction reads the TUI cache.
+    pub work_compactor: bool,
+    /// Schema prewarm shells out to the Herdr TUI `api schema`.
+    pub tui_schema_prewarm: bool,
+}
+
+impl CandidateWorkerPlan {
+    pub(crate) fn for_backend(backend: crate::runtime_adapter::RuntimeBackend) -> Self {
+        let tui = backend != crate::runtime_adapter::RuntimeBackend::HerdrCore;
+        Self {
+            tui_event_cache: tui,
+            tui_exec_client: tui,
+            tui_prompt_tracker: tui,
+            work_compactor: tui,
+            tui_schema_prewarm: tui,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn starts_tui_workers(&self) -> bool {
+        self.tui_event_cache
+            || self.tui_exec_client
+            || self.tui_prompt_tracker
+            || self.work_compactor
+            || self.tui_schema_prewarm
+    }
+}
+
+/// Build exactly the workers the plan allows. This is the only construction path
+/// `serve_candidate` uses, so a test can prove the Core plan never touches a TUI
+/// socket or starts a TUI tracker.
+fn candidate_workers(
+    plan: CandidateWorkerPlan,
+    client: &HerdrClient,
+    state_store: &Arc<Mutex<StateStore>>,
+    exec_state_dir: &std::path::Path,
+) -> Result<(Arc<EventCache>, ExecRegistry, PromptRegistry), String> {
+    let cache = Arc::new(if plan.tui_event_cache {
+        EventCache::start(client.clone())
+    } else {
+        EventCache::detached()
+    });
+    let exec = ExecRegistry::new_with_client(
+        exec_state_dir.to_path_buf(),
+        plan.tui_exec_client.then(|| client.clone()),
+    )?;
+    let prompt = if plan.tui_prompt_tracker {
+        PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone())
+    } else {
+        PromptRegistry::with_store_only(state_store.clone())
+    };
+    if plan.work_compactor
+        && let Ok(store) = state_store.lock()
+    {
+        crate::work_compactor::start_background(&store, cache.clone());
+    }
+    if plan.tui_schema_prewarm {
+        crate::schema::prewarm_async();
+    }
+    Ok((cache, exec, prompt))
+}
+
 pub fn serve_candidate(
     port: u16,
     runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
@@ -283,7 +357,7 @@ pub fn serve_candidate(
         .herdr_socket
         .ok_or_else(|| "candidate runtime requires a Herdr local transport".to_owned())?;
     let client = HerdrClient::new(socket);
-    let cache = Arc::new(EventCache::start(client.clone()));
+    let worker_plan = CandidateWorkerPlan::for_backend(runtime_backend.backend);
     let exec_state_dir = env::var_os("HERDR_MCP_STATE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
@@ -292,13 +366,9 @@ pub fn serve_candidate(
         "state",
     )?));
     runtime_started_at_ms();
-    let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
-    let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
-    if let Ok(store) = state_store.lock() {
-        crate::work_compactor::start_background(&store, cache.clone());
-    }
+    let (cache, exec, prompt) =
+        candidate_workers(worker_plan, &client, &state_store, &exec_state_dir)?;
     let skill = SkillService::new();
-    crate::schema::prewarm_async();
     // Herdr is a recoverable local dependency. EventCache owns reconnect/backoff,
     // so a temporarily absent Herdr server must not prevent the managed runtime
     // from starting or make installation transactional rollback permanent.
@@ -3983,6 +4053,100 @@ mod tests {
                 "diagnostic leaked {forbidden}"
             );
         }
+    }
+
+    /// user operator | Given a candidate backend | When the worker plan is
+    /// derived | Then only a TUI backend starts TUI workers, and `herdr-core`
+    /// starts none of them.
+    #[test]
+    fn candidate_worker_plan_starts_tui_workers_only_for_a_tui_backend() {
+        use crate::runtime_adapter::RuntimeBackend;
+        let core = CandidateWorkerPlan::for_backend(RuntimeBackend::HerdrCore);
+        assert_eq!(
+            core,
+            CandidateWorkerPlan {
+                tui_event_cache: false,
+                tui_exec_client: false,
+                tui_prompt_tracker: false,
+                work_compactor: false,
+                tui_schema_prewarm: false,
+            }
+        );
+        assert!(!core.starts_tui_workers());
+        assert!(CandidateWorkerPlan::for_backend(RuntimeBackend::Tui).starts_tui_workers());
+    }
+
+    /// user operator | Given a `herdr-core` candidate and a live TUI socket |
+    /// When the candidate workers are built | Then nothing connects to that
+    /// socket, no TUI tracker is started and the cache stays not-ready; the TUI
+    /// plan does connect, proving the sentinel observes real connections.
+    #[cfg(unix)]
+    #[test]
+    fn core_candidate_workers_open_no_tui_connection() {
+        use crate::runtime_adapter::RuntimeBackend;
+        use std::time::{Duration, Instant};
+
+        let root = test_root("s2b-candidate-workers");
+        std::fs::create_dir_all(&root).unwrap();
+        // A Unix socket path must stay under `SUN_LEN`; keep it in a short temp
+        // directory instead of the deep per-test root used for state files.
+        let socket_dir = std::env::temp_dir().join(format!(
+            "s2b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("h.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let store = Arc::new(Mutex::new(
+            StateStore::open_in_dir(&root, "state.db").unwrap(),
+        ));
+        let client = HerdrClient::new(socket_path.clone());
+
+        let (core_cache, _core_exec, core_prompt) = candidate_workers(
+            CandidateWorkerPlan::for_backend(RuntimeBackend::HerdrCore),
+            &client,
+            &store,
+            &root.join("exec-core"),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            listener.accept().is_err(),
+            "herdr-core must not connect to the TUI event socket"
+        );
+        assert!(!core_prompt.has_tui_runtime(), "no TUI tracker/client");
+        assert!(
+            !core_cache.wait_ready(Duration::from_millis(100)),
+            "the detached cache must stay not-ready"
+        );
+
+        // The same helper with the TUI plan really connects, so the sentinel is
+        // not vacuous.
+        let (_tui_cache, _tui_exec, tui_prompt) = candidate_workers(
+            CandidateWorkerPlan::for_backend(RuntimeBackend::Tui),
+            &client,
+            &store,
+            &root.join("exec-tui"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut connected = false;
+        while Instant::now() < deadline {
+            if listener.accept().is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "the TUI plan must connect to the TUI socket");
+        assert!(tui_prompt.has_tui_runtime());
+        std::fs::remove_dir_all(socket_dir).ok();
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -546,6 +546,35 @@ impl PromptRegistry {
         }
     }
 
+    /// #768 Phase 2 slice 2b: a store-backed registry for a runtime that has no
+    /// TUI event cache/client. Durable task facts and acknowledgements work; the
+    /// tracker thread is not started because it is woken by the TUI cache cursor
+    /// and would otherwise wait on a stream this runtime never has.
+    pub fn with_store_only(store: Arc<Mutex<StateStore>>) -> Self {
+        let registry = Self {
+            inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
+                #[cfg(test)]
+                clock: None,
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: None,
+                client: None,
+            }),
+        };
+        registry.reconcile_active_tasks();
+        registry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_tui_runtime(&self) -> bool {
+        self.inner.cache.is_some() || self.inner.client.is_some()
+    }
+
     pub fn with_runtime(
         store: Arc<Mutex<StateStore>>,
         cache: Arc<EventCache>,
