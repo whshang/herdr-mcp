@@ -119,7 +119,7 @@ Static evidence is kept in a bounded capability inventory under the herdr-mcp co
 
 ### Dynamic planning advice for the Web planner
 
-The current workstation Runtime Execution Contract is epoch 5 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 8 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
+The current workstation Runtime Execution Contract is epoch 6 / 18 tools and does not add a dedicated planning tool. The first-party public Edge contract is epoch 8 / 19 actions because `herdr_devices` is Edge-local. The progressive `herdr_skill` bootstrap advertises a read-only local method routed through the existing `herdr_call` tool:
 
 ```text
 herdr_call(
@@ -195,7 +195,14 @@ See [ChatGPT Connector](chatgpt-connector.md).
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 herdr-mcp status
-herdr-mcp logs
+```
+
+Runtime logs are files under `~/.config/herdr-mcp/`, not a `herdr-mcp logs` subcommand:
+
+```bash
+tail -f ~/.config/herdr-mcp/server.log                  # runtime server
+tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog probes
+tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link (macOS)
 ```
 
 A local HTTP `200` or `401` proves that the runtime is listening. A connection error indicates a process/port problem.
@@ -204,11 +211,13 @@ A local HTTP `200` or `401` proves that the runtime is listening. A connection e
 
 ## Watchdog
 
-macOS can install the runtime watchdog:
+macOS also supports an opt-in periodic health watchdog: the `dev.herdr-mcp.health-watchdog` LaunchAgent. `service install` does not install it; it is managed only by the `bin/watchdog.sh` helper in a source checkout (release binaries ship no such script) and by `service status`/`service uninstall`, which report and clean it up. `install` copies the script into `~/.config/herdr-mcp/health-watchdog.sh` and points the LaunchAgent at that managed path, never at a checkout:
 
 ```bash
-herdr-mcp watchdog install
-herdr-mcp watchdog status
+bin/watchdog.sh once        # run one /health probe now + update state file
+bin/watchdog.sh status      # read the saved state file; no new probe
+bin/watchdog.sh install     # install/reload the LaunchAgent
+bin/watchdog.sh uninstall   # unload and remove the LaunchAgent
 ```
 
 The watchdog protects herdr-mcp availability. It does not treat every transient Herdr TaskGroup/ExceptionGroup error as a reason to restart the Herdr daemon.
@@ -216,6 +225,7 @@ The watchdog protects herdr-mcp availability. It does not treat every transient 
 ## UI language
 
 ```bash
+herdr-mcp lang auto
 herdr-mcp lang en
 herdr-mcp lang zh
 herdr-mcp lang ja
@@ -317,7 +327,7 @@ The supervised updater reuses generation activation and must not be used to sile
 | `HERDR_MCP_READONLY` | off | disable mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | restrict writable projects |
 | `HERDR_MCP_AGENT_ALLOW` | all discovered agents | optionally restrict agent visibility in inspect/since |
-| `HERDR_MCP_ALL_TOOLS` | off | expose advanced/compatibility tools |
+| `HERDR_MCP_ALL_TOOLS` | off | legacy Node runtime only; ignored by the Rust runtime |
 | `HERDR_SKILL_NETWORK` | on | `0` uses bundled skill only |
 
 ## Quick command map
@@ -325,7 +335,7 @@ The supervised updater reuses generation activation and must not be used to sile
 | Goal | Command |
 |---|---|
 | runtime status | `herdr-mcp status` |
-| follow logs | `herdr-mcp logs -f` |
+| follow logs | `tail -f ~/.config/herdr-mcp/server.log` |
 | dogfood current source as DEV runtime | `herdr-mcp dev sync` |
 | inspect DEV/PROD provenance | `herdr-mcp dev status` |
 | return from DEV to pinned PROD | `herdr-mcp dev rollback` |
