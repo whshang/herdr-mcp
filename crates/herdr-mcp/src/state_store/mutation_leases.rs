@@ -1241,15 +1241,20 @@ impl StateStore {
         };
         let target_as_path = Path::new(&canonical_target);
 
-        let mut matched: Option<StoredMutationLeaseRow> = None;
-        for stored in active_rows {
-            if target_as_path.starts_with(Path::new(&stored.record.project_root)) {
-                matched = Some(stored);
-                break;
-            }
-        }
+        let matching = active_rows
+            .into_iter()
+            .filter(|stored| target_as_path.starts_with(Path::new(&stored.record.project_root)))
+            .collect::<Vec<_>>();
+        let stored = if let Some(write_lease) = matching
+            .iter()
+            .find(|stored| stored.record.intent != "read")
+        {
+            Some(write_lease.clone())
+        } else {
+            matching.into_iter().next()
+        };
 
-        let Some(stored) = matched else {
+        let Some(stored) = stored else {
             return Ok(MutationLeaseEnforcementVerdict::Allowed {
                 matched_lease: None,
             });

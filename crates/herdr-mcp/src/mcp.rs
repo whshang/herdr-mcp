@@ -1272,10 +1272,20 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call requires params.name".to_owned())?;
     let name = canonical_tool_name(raw_name);
-    let arguments = match normalize_tool_call_arguments(request.pointer("/params/arguments")) {
+    let mut arguments = match normalize_tool_call_arguments(request.pointer("/params/arguments")) {
         Ok(arguments) => arguments,
         Err(invalid) => return Ok(invalid),
     };
+    // 1.2 S1: resolve device-bound `herdr_ref_` values before any handler sees
+    // them. Local refs unwrap to bare workspace/pane ids; foreign-device,
+    // malformed, kind-mismatched, or unverifiable refs fail closed with
+    // `device_ref_conflict` — the same contract Edge enforces on relayed calls.
+    if let Value::Object(arguments_map) = &mut arguments
+        && let Err(conflict) =
+            crate::device_refs::resolve_local_device_refs(arguments_map, context.local_device_id)
+    {
+        return Ok(tool_result(conflict.into_result(), true));
+    }
     // #922 review 5870137915: the frozen catalog is admitted per selected
     // backend. `tui` (default) is unchanged; `herdr-core` and invalid
     // selections fail closed here, before any TUI snapshot/socket execution.
@@ -1355,6 +1365,23 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         Err(rejection) => return Ok(tool_result(rejection, true)),
     };
     // 1.2/S2: `client_request_id` dedupe wraps the whole admitted dispatch.
+    // D-1: one call never holds both idempotency slots; two ledgers would
+    // each reserve and one side could re-execute silently.
+    if name == "herdr_call"
+        && arguments.get("client_request_id").is_some()
+        && arguments.get("idempotency_key").is_some()
+    {
+        return Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "client_request_id and idempotency_key are mutually exclusive; submit exactly one idempotency key",
+            }),
+            true,
+        ));
+    }
     // Validation mirrors `idempotency_key` hygiene; an invalid key is rejected
     // before any backend work and is never recorded.
     if name == "herdr_call"
@@ -1395,30 +1422,185 @@ fn herdr_call_with_request_ledger(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    // Scope + request fingerprint: a `client_request_id` is only honored for
-    // the same request from the same caller scope; anything else under the
-    // key is an idempotency conflict, never a silent replay.
+    let params = arguments.get("params").cloned().unwrap_or(Value::Null);
+    // #332 D-2: with a resolvable persistent caller identity the key lives in
+    // the durable `operations` ledger; without one, read-intent methods keep
+    // the process-local fallback while writes are refused before executing.
+    let read_only = crate::durable_request_ledger::is_read_only_client_request_method(&method);
+    let mut store = context
+        .state_store
+        .lock()
+        .map_err(|_| "state store lock is poisoned".to_owned())?;
+    let Some(scope) = crate::durable_request_ledger::durable_caller_scope(context, &store) else {
+        if read_only {
+            return herdr_call_memory_request_ledger(
+                store,
+                client_request_id,
+                name,
+                arguments,
+                herdr_call_params,
+                context,
+                route,
+                &method,
+                now_ms,
+            );
+        }
+        return Ok(tool_result(
+            crate::durable_request_ledger::durable_scope_unavailable_response(client_request_id),
+            true,
+        ));
+    };
+    let request_id =
+        crate::durable_request_ledger::preferred_client_request_id(context.wire_request_id);
+    let ids = crate::durable_request_ledger::client_request_ids(
+        crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+        &scope,
+        &method,
+        &params,
+        client_request_id,
+        &request_id,
+        read_only,
+    );
+    match crate::durable_request_ledger::durable_begin_or_replay(
+        &mut store,
+        &ids,
+        client_request_id,
+        &scope,
+        &method,
+        &params,
+        read_only,
+        now_ms,
+    ) {
+        crate::durable_request_ledger::ClientRequestOutcome::Replay(replay) => {
+            let is_error = replay.get("ok").and_then(Value::as_bool) == Some(false);
+            Ok(tool_result(
+                model_visible_tool_output(name, &arguments, replay),
+                is_error,
+            ))
+        }
+        crate::durable_request_ledger::ClientRequestOutcome::Respond(body) => {
+            let is_error = body.get("ok").and_then(Value::as_bool) == Some(false);
+            Ok(tool_result(body, is_error))
+        }
+        crate::durable_request_ledger::ClientRequestOutcome::Execute { request_id } => {
+            drop(store);
+            let (mut output, is_error) = match admitted_tool_output(
+                name,
+                arguments.clone(),
+                herdr_call_params,
+                context,
+                route,
+            ) {
+                Ok(AdmittedToolResult::Raw { output, is_error }) => (output, is_error),
+                // Envelope results bypass the raw projection, so the ledger
+                // records only that the call ran and whether it was an error —
+                // honest classification, never a fabricated request_timeout.
+                Ok(AdmittedToolResult::Envelope(response)) => {
+                    let is_error = response
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if let Ok(mut store) = context.state_store.lock() {
+                        crate::durable_request_ledger::durable_settle_result(
+                            &mut store,
+                            &ids,
+                            &json!({"ok": !is_error, "code": if is_error { "envelope_error" } else { "ok" }}),
+                            read_only,
+                            mutation_lease_now_ms(),
+                        );
+                    }
+                    return Ok(response);
+                }
+                // The tool call itself failed before producing a result: the
+                // mutation may or may not have run, so the record settles as
+                // `unknown` — never left pending to pin the key.
+                Err(error) => {
+                    if let Ok(mut store) = context.state_store.lock() {
+                        crate::durable_request_ledger::durable_settle_result(
+                            &mut store,
+                            &ids,
+                            &json!({"ok": false, "code": "internal_error", "delivery_state": "delivery_unknown", "message": error}),
+                            read_only,
+                            mutation_lease_now_ms(),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(object) = output.as_object_mut() {
+                object.insert("request_id".to_owned(), json!(request_id));
+            }
+            if let Ok(mut store) = context.state_store.lock() {
+                let settled = crate::durable_request_ledger::durable_settle_result(
+                    &mut store,
+                    &ids,
+                    &output,
+                    read_only,
+                    mutation_lease_now_ms(),
+                );
+                // safe_retry_mode is a fact of the first settlement, recorded
+                // in the ledger; the live response carries the same value so
+                // callers see one authoritative retry vocabulary.
+                if let Some(object) = output.as_object_mut() {
+                    let mode = match settled {
+                        crate::durable_request_ledger::DurableSettle::Completed => "none",
+                        crate::durable_request_ledger::DurableSettle::RecordedUnknown => {
+                            "inspect_before_retry"
+                        }
+                        crate::durable_request_ledger::DurableSettle::Released => {
+                            if object
+                                .get("retryable")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                "retry_after_resource_release"
+                            } else {
+                                "none"
+                            }
+                        }
+                    };
+                    object.insert("safe_retry_mode".to_owned(), json!(mode));
+                }
+            }
+            Ok(tool_result(
+                model_visible_tool_output(name, &arguments, output),
+                is_error,
+            ))
+        }
+    }
+}
+
+/// Fallback path for a `client_request_id` read-intent call that has no
+/// resolvable durable caller scope: identical to the pre-D-2 in-memory
+/// ledger behavior. Writes never reach this path.
+#[allow(clippy::too_many_arguments)]
+fn herdr_call_memory_request_ledger(
+    mut store: std::sync::MutexGuard<'_, StateStore>,
+    client_request_id: &str,
+    name: &str,
+    arguments: Value,
+    herdr_call_params: Option<Value>,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+    method: &str,
+    now_ms: i64,
+) -> Result<Value, String> {
     let caller_scope = request_ledger_caller_scope(context);
     let identity = crate::request_ledger::LedgerIdentity::of(
-        &method,
+        method,
         arguments.get("params").unwrap_or(&Value::Null),
         &caller_scope,
     );
-    let begin = {
-        let mut store = context
-            .state_store
-            .lock()
-            .map_err(|_| "state store lock is poisoned".to_owned())?;
-        // The lookup and the pending insert must share one lock: two
-        // concurrent submissions of the same key can never both execute.
-        store.request_ledger_begin_or_replay(
-            client_request_id,
-            &method,
-            &identity,
-            context.wire_request_id,
-            now_ms,
-        )
-    };
+    // The lookup and the pending insert must share one lock: two concurrent
+    // submissions of the same key can never both execute.
+    let begin = store.request_ledger_begin_or_replay(
+        client_request_id,
+        method,
+        &identity,
+        context.wire_request_id,
+        now_ms,
+    );
+    drop(store);
     match begin {
         crate::request_ledger::LedgerBegin::Replay(record) => {
             let replay = crate::request_ledger::replay_response(&record);
@@ -1463,9 +1645,6 @@ fn herdr_call_with_request_ledger(
                 route,
             ) {
                 Ok(AdmittedToolResult::Raw { output, is_error }) => (output, is_error),
-                // Envelope results bypass the raw projection, so the ledger
-                // records only that the call ran and whether it was an error —
-                // honest classification, never a fabricated request_timeout.
                 Ok(AdmittedToolResult::Envelope(response)) => {
                     let is_error = response
                         .get("isError")
@@ -1480,9 +1659,6 @@ fn herdr_call_with_request_ledger(
                     }
                     return Ok(response);
                 }
-                // The tool call itself failed before producing a result: the
-                // mutation may or may not have run, so the record settles as
-                // `unknown` — never left pending to pin the key for the TTL.
                 Err(error) => {
                     if let Ok(mut store) = context.state_store.lock() {
                         store.request_ledger_settle(
@@ -1540,11 +1716,24 @@ fn request_status_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
         });
     };
     match context.state_store.lock() {
-        Ok(mut store) => store.request_ledger_status(
-            key,
-            &request_ledger_caller_scope(context),
-            mutation_lease_now_ms(),
-        ),
+        Ok(mut store) => {
+            // Durable ledger first: a record only answers for the caller
+            // scope embedded in its request_hash; foreign scopes get the same
+            // miss as an unknown key, then fall through to the memory ledger.
+            if let Some(scope) =
+                crate::durable_request_ledger::durable_caller_scope(context, &store)
+                && let Some(status) = crate::durable_request_ledger::durable_client_request_status(
+                    &store, key, &scope,
+                )
+            {
+                return status;
+            }
+            store.request_ledger_status(
+                key,
+                &request_ledger_caller_scope(context),
+                mutation_lease_now_ms(),
+            )
+        }
         Err(_) => json!({
             "ok": false,
             "code": "state_store_unavailable",
@@ -1649,7 +1838,22 @@ fn admitted_tool_output(
             herdr_core,
         ),
         "herdr_since" => {
-            let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+            let cursor = match arguments.get("cursor") {
+                None => 0,
+                Some(value) => match value.as_u64() {
+                    Some(cursor) => cursor,
+                    None => {
+                        return Ok(AdmittedToolResult::Raw {
+                            output: json!({
+                                "ok": false,
+                                "code": "invalid_params",
+                                "message": "cursor must be a non-negative integer",
+                            }),
+                            is_error: true,
+                        });
+                    }
+                },
+            };
             let workspace = arguments.get("workspace").and_then(Value::as_str);
             let transition = context
                 .state_store
@@ -2783,6 +2987,14 @@ pub(crate) fn format_mutation_lease_conflict(
         payload.insert("project_root".to_owned(), json!(lease.project_root));
         payload.insert("lane_key".to_owned(), json!(lease.lane_key));
         payload.insert("intent".to_owned(), json!(lease.intent));
+        payload.insert(
+            "busy_kind".to_owned(),
+            json!(if lease.intent == "read" {
+                "readers_only"
+            } else {
+                "writers"
+            }),
+        );
         payload.insert("readers".to_owned(), json!(lease.readers));
         payload.insert("holder_id".to_owned(), json!(lease.holder_id));
         payload.insert("lease_epoch".to_owned(), json!(lease.lease_epoch));
@@ -3504,10 +3716,26 @@ fn work_pickup_call(
     let Some(object) = params.as_object() else {
         return json!({"ok": false, "code": "work_pickup_params_invalid"});
     };
-    const ALLOWED: &[&str] = &["worktree", "project_root", "project_ref", "cwd", "pane"];
+    const ALLOWED: &[&str] = &[
+        "worktree",
+        "project_root",
+        "project_ref",
+        "cwd",
+        "pane",
+        "limit_per_section",
+        "sections",
+        "query",
+        "include_archived",
+        "include_markdown",
+        "max_bytes",
+    ];
     if object.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
         return json!({"ok": false, "code": "work_pickup_params_invalid"});
     }
+    let options = match parse_pickup_options(object) {
+        Ok(options) => options,
+        Err(error) => return error,
+    };
     let bounded_str = |key: &str, max: usize| -> Result<Option<String>, Value> {
         match object.get(key) {
             None => Ok(None),
@@ -3557,7 +3785,7 @@ fn work_pickup_call(
         // recorded (capture validated it against the topology); never for an
         // arbitrary caller-supplied path.
         let root = state.as_ref().map(|state| state.worktree.clone());
-        return pickup_response(state, root.as_deref());
+        return pickup_response(state, root.as_deref(), &options);
     }
 
     // Caller-context resolution: a cwd (or the pane's cwd) that resolves to a
@@ -3611,7 +3839,7 @@ fn work_pickup_call(
         let root = resolved
             .map(|root| root.to_string_lossy().into_owned())
             .or_else(|| state.as_ref().map(|state| state.worktree.clone()));
-        return pickup_response(state, root.as_deref());
+        return pickup_response(state, root.as_deref(), &options);
     }
 
     // No selector at all: list projects that have a handoff so the caller can
@@ -3657,35 +3885,322 @@ fn pickup_state(
         .max_by_key(|state| state.updated_at))
 }
 
-/// The resolved handoff payload: rendered markdown, the structured sections
-/// (when the document carries a decodable relay-memory block), and the
-/// agent-instruction reference report for the project root.
+/// Bounded `work.pickup` projection (#H1).
+///
+/// The stored handoff can be megabytes (rendered markdown plus a trailing
+/// `<!-- relay-memory: ... -->` JSON block), which overflows the Link frame and
+/// wastes a model's context on one call. The projection returns the structured
+/// sections under an explicit per-section limit and byte budget, drops the JSON
+/// comment, and reports what it trimmed. Nothing here mutates the stored state.
+const PICKUP_SECTIONS: [&str; 4] = ["goals", "preferences", "mistakes", "tasks"];
+const PICKUP_DEFAULT_LIMIT: usize = 20;
+const PICKUP_MAX_LIMIT: usize = 50;
+const PICKUP_QUERY_MAX_BYTES: usize = 512;
+/// Default projection budget: keeps the default response far below the 256 KiB
+/// Link frame even when the stored handoff is several megabytes.
+const PICKUP_DEFAULT_MAX_BYTES: usize = 32 * 1024;
+/// Hard ceiling for a caller-supplied budget; leaves room for frame overhead.
+const PICKUP_MAX_BYTES_CEILING: usize = 240 * 1024;
+const PICKUP_ITEM_TEXT_MAX: usize = 512;
+
+#[derive(Debug, Clone)]
+struct PickupOptions {
+    limit_per_section: usize,
+    sections: Option<Vec<String>>,
+    query: Option<String>,
+    include_archived: bool,
+    include_markdown: bool,
+    max_bytes: usize,
+}
+
+impl Default for PickupOptions {
+    fn default() -> Self {
+        Self {
+            limit_per_section: PICKUP_DEFAULT_LIMIT,
+            sections: None,
+            query: None,
+            include_archived: false,
+            include_markdown: false,
+            max_bytes: PICKUP_DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+fn pickup_params_invalid() -> Value {
+    json!({"ok": false, "code": "work_pickup_params_invalid"})
+}
+
+/// Strict, explicit parsing: an out-of-range or wrongly-typed projection option
+/// is an `invalid_params` refusal, never silently clamped.
+fn parse_pickup_options(object: &serde_json::Map<String, Value>) -> Result<PickupOptions, Value> {
+    let mut options = PickupOptions::default();
+    if let Some(value) = object.get("limit_per_section") {
+        let limit = value.as_u64().ok_or_else(pickup_params_invalid)?;
+        if limit == 0 || limit > PICKUP_MAX_LIMIT as u64 {
+            return Err(pickup_params_invalid());
+        }
+        options.limit_per_section = limit as usize;
+    }
+    if let Some(value) = object.get("sections") {
+        let list = value.as_array().ok_or_else(pickup_params_invalid)?;
+        if list.is_empty() {
+            return Err(pickup_params_invalid());
+        }
+        let mut names: Vec<String> = Vec::new();
+        for entry in list {
+            let name = entry.as_str().ok_or_else(pickup_params_invalid)?;
+            if !PICKUP_SECTIONS.contains(&name) {
+                return Err(pickup_params_invalid());
+            }
+            if !names.iter().any(|seen| seen == name) {
+                names.push(name.to_owned());
+            }
+        }
+        options.sections = Some(names);
+    }
+    if let Some(value) = object.get("query") {
+        let text = value.as_str().ok_or_else(pickup_params_invalid)?;
+        let text = text.trim();
+        if text.is_empty() || text.len() > PICKUP_QUERY_MAX_BYTES {
+            return Err(pickup_params_invalid());
+        }
+        options.query = Some(text.to_lowercase());
+    }
+    if let Some(value) = object.get("include_archived") {
+        options.include_archived = value.as_bool().ok_or_else(pickup_params_invalid)?;
+    }
+    if let Some(value) = object.get("include_markdown") {
+        options.include_markdown = value.as_bool().ok_or_else(pickup_params_invalid)?;
+    }
+    if let Some(value) = object.get("max_bytes") {
+        let bytes = value.as_u64().ok_or_else(pickup_params_invalid)?;
+        if bytes == 0 || bytes > PICKUP_MAX_BYTES_CEILING as u64 {
+            return Err(pickup_params_invalid());
+        }
+        options.max_bytes = bytes as usize;
+    }
+    Ok(options)
+}
+
+/// UTF-8 safe prefix: never splits a multi-byte character.
+fn utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+fn pickup_item_matches(id: &str, text: &str, query: Option<&String>) -> bool {
+    match query {
+        None => true,
+        Some(query) => id.to_lowercase().contains(query) || text.to_lowercase().contains(query),
+    }
+}
+
+fn pickup_section_items(
+    memory: &crate::work_compactor::RelayMemory,
+    name: &str,
+    options: &PickupOptions,
+) -> (Vec<Value>, usize, bool) {
+    let query = options.query.as_ref();
+    let mut items: Vec<Value> = Vec::new();
+    match name {
+        "goals" => {
+            for item in &memory.goals {
+                if pickup_item_matches(&item.id, &item.text, query) {
+                    items.push(json!({"id": item.id, "text": item.text}));
+                }
+            }
+        }
+        "preferences" => {
+            for item in &memory.preferences {
+                if pickup_item_matches(&item.id, &item.text, query) {
+                    items.push(json!({"id": item.id, "text": item.text}));
+                }
+            }
+        }
+        "mistakes" => {
+            for item in &memory.mistakes {
+                if pickup_item_matches(&item.id, &item.text, query) {
+                    items.push(json!({"id": item.id, "text": item.text}));
+                }
+            }
+        }
+        "tasks" => {
+            for item in &memory.tasks {
+                if pickup_item_matches(&item.id, &item.text, query) {
+                    items.push(json!({
+                        "id": item.id,
+                        "text": item.text,
+                        "status": item.status,
+                    }));
+                }
+            }
+        }
+        _ => {}
+    }
+    let total = items.len();
+    let mut truncated = false;
+    for item in items.iter_mut() {
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            let (prefix, cut) = utf8_prefix(text, PICKUP_ITEM_TEXT_MAX);
+            if cut {
+                truncated = true;
+                item["text"] = json!(prefix);
+            }
+        }
+    }
+    if total > options.limit_per_section {
+        items.truncate(options.limit_per_section);
+        truncated = true;
+    }
+    (items, total, truncated)
+}
+
+/// Remove one trailing item from the largest section; `false` when nothing is
+/// left to trim.
+fn trim_largest_section(sections: &mut serde_json::Map<String, Value>) -> bool {
+    let mut best: Option<(String, usize)> = None;
+    for (name, value) in sections.iter() {
+        let Some(items) = value.as_array() else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
+        }
+        let len = serde_json::to_string(items)
+            .map(|text| text.len())
+            .unwrap_or(0);
+        if best.as_ref().is_none_or(|(_, best_len)| len > *best_len) {
+            best = Some((name.clone(), len));
+        }
+    }
+    let Some((name, _)) = best else {
+        return false;
+    };
+    if let Some(items) = sections.get_mut(&name).and_then(Value::as_array_mut) {
+        items.pop();
+        return true;
+    }
+    false
+}
+
+/// The stored handoff without its trailing `<!-- relay-memory: ... -->` JSON
+/// comment (which is machine state, not context for the caller).
+fn pickup_markdown(handoff_md: &str) -> &str {
+    let trimmed = handoff_md.trim_end();
+    let body = trimmed.strip_suffix("-->").unwrap_or(trimmed);
+    match body.rfind("<!-- relay-memory: ") {
+        Some(start) => body[..start].trim_end(),
+        None => trimmed,
+    }
+}
+
 fn pickup_response(
     state: Option<crate::state_store::work_journal::WorkState>,
     root: Option<&str>,
+    options: &PickupOptions,
 ) -> Value {
     let _ = root;
     let handoff_md = state
         .as_ref()
         .map(|state| state.handoff_md.clone())
         .unwrap_or_default();
-    let sections = crate::work_compactor::parsed_memory(&handoff_md)
-        .and_then(|memory| serde_json::to_value(memory).ok())
-        .unwrap_or(Value::Null);
-    let response = json!({
+    let memory = crate::work_compactor::parsed_memory(&handoff_md);
+    let mut truncated = false;
+
+    let mut sections = serde_json::Map::new();
+    let mut total_counts = serde_json::Map::new();
+    let mut archived_counts = serde_json::Map::new();
+    if let Some(memory) = memory.as_ref() {
+        for name in PICKUP_SECTIONS {
+            if let Some(wanted) = options.sections.as_ref()
+                && !wanted.iter().any(|section| section == name)
+            {
+                continue;
+            }
+            let (items, total, cut) = pickup_section_items(memory, name, options);
+            truncated |= cut;
+            total_counts.insert(name.to_owned(), json!(total));
+            // No archive marker exists yet (H3b adds it); every item is live.
+            archived_counts.insert(name.to_owned(), json!(0));
+            sections.insert(name.to_owned(), json!(items));
+        }
+        total_counts.insert(
+            "current_state".to_owned(),
+            json!(usize::from(!memory.current_state.trim().is_empty())),
+        );
+        archived_counts.insert("current_state".to_owned(), json!(0));
+        let (current_state, cut) = utf8_prefix(memory.current_state.trim(), PICKUP_ITEM_TEXT_MAX);
+        truncated |= cut;
+        sections.insert("current_state".to_owned(), json!(current_state));
+    }
+
+    let mut markdown = String::new();
+    if options.include_markdown {
+        let rendered = pickup_markdown(&handoff_md);
+        let (prefix, cut) = utf8_prefix(rendered, options.max_bytes / 2);
+        truncated |= cut;
+        markdown = prefix.to_owned();
+    }
+
+    let mut response = json!({
         "ok": true,
-        "handoff_md": handoff_md,
+        "projection": {"v": 1},
+        "sections": if memory.is_some() { Value::Object(sections) } else { Value::Null },
+        "total_counts": if memory.is_some() { Value::Object(total_counts) } else { Value::Null },
+        "archived_counts": if memory.is_some() { Value::Object(archived_counts) } else { Value::Null },
+        "include_archived": options.include_archived,
+        "limit_per_section": options.limit_per_section,
+        "max_bytes": options.max_bytes,
+        "handoff_md": markdown,
         "through_event_id": state.as_ref().map_or(0, |state| state.through_event_id),
         "updated_at": state.as_ref().map_or(0, |state| state.updated_at),
         "updated_at_local": state
             .as_ref()
             .map(|state| crate::work_compactor::relay_time(state.updated_at)),
-        "sections": sections,
         // Live git context (branch, changed files, next step) of the worktree.
         "workspace": state
             .as_ref()
             .and_then(|state| crate::work_compactor::git_context(std::path::Path::new(&state.worktree))),
     });
+
+    // Enforce the byte budget on the whole projection: trim section items
+    // first, then the optional markdown.
+    loop {
+        let size = serde_json::to_string(&response)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if size <= options.max_bytes {
+            break;
+        }
+        let trimmed_sections = response
+            .get_mut("sections")
+            .and_then(Value::as_object_mut)
+            .map(trim_largest_section)
+            .unwrap_or(false);
+        if trimmed_sections {
+            truncated = true;
+            continue;
+        }
+        let current = response
+            .get("handoff_md")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if current.is_empty() {
+            break;
+        }
+        let keep = current.len().saturating_sub(current.len() / 4 + 1);
+        let (prefix, _) = utf8_prefix(&current, keep);
+        response["handoff_md"] = json!(prefix);
+        truncated = true;
+    }
+    response["truncated"] = json!(truncated);
     response
 }
 
@@ -16022,7 +16537,7 @@ mod tests {
             .unwrap();
         let found = work_pickup_call(
             &store,
-            &json!({"project_root": "/repo", "project_ref": "project-a"}),
+            &json!({"project_root": "/repo", "project_ref": "project-a", "include_markdown": true}),
             None,
         );
         assert_eq!(found["ok"], true);
@@ -16050,6 +16565,206 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// user agent | Given a multi-megabyte handoff with 1,000 tasks | When
+    /// work.pickup runs with default options | Then the response is a bounded
+    /// projection (< 32 KB, far below the 256 KiB Link frame) that reports its
+    /// own truncation instead of shipping the whole document.
+    #[test]
+    fn work_pickup_default_projection_bounds_a_multi_megabyte_handoff() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        // A real git worktree, so the projection must still carry the full
+        // workspace GitContext.
+        let root = std::env::temp_dir().join(format!("h1-pickup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "base").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(root.join("README.md"), "changed").unwrap();
+
+        let memory = crate::work_compactor::RelayMemory {
+            tasks: (0..1_000)
+                .map(|index| crate::work_compactor::RelayTask {
+                    id: format!("task-{index}"),
+                    text: format!("bounded pickup task {index}"),
+                    status: "todo".to_owned(),
+                    updated_ms: None,
+                })
+                .collect(),
+            ..crate::work_compactor::RelayMemory::default()
+        };
+        let huge_markdown = format!("# Huge handoff\n\n{}\n", "x".repeat(3 * 1024 * 1024));
+        let handoff_md = format!(
+            "{huge_markdown}<!-- relay-memory: {} -->",
+            serde_json::to_string(&memory).unwrap()
+        );
+        assert!(handoff_md.len() > 3 * 1024 * 1024);
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "git:example/h1".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md,
+                through_event_id: 12,
+                updated_at: 34,
+                ..WorkState::default()
+            })
+            .unwrap();
+
+        let response = work_pickup_call(&store, &json!({"worktree": root.to_string_lossy()}), None);
+        assert_eq!(response["ok"], true);
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(
+            encoded.len() < 32 * 1024,
+            "default response is {}",
+            encoded.len()
+        );
+        assert!(encoded.len() < 256 * 1024, "Link frame bound");
+        assert_eq!(response["projection"]["v"], 1);
+        assert_eq!(response["total_counts"]["tasks"], 1_000);
+        assert_eq!(response["archived_counts"]["tasks"], 0);
+        assert_eq!(response["truncated"], true);
+        assert_eq!(response["limit_per_section"], 20);
+        assert_eq!(response["sections"]["tasks"].as_array().unwrap().len(), 20);
+        assert_eq!(response["sections"]["tasks"][0]["id"], "task-0");
+        assert_eq!(response["workspace"]["branch"], "main");
+        assert_eq!(response["workspace"]["changed_files"][0], "README.md");
+        // The trailing relay-memory JSON comment is never part of the default
+        // projection, and the markdown is empty unless explicitly requested.
+        assert_eq!(response["handoff_md"], "");
+        assert!(!encoded.contains("relay-memory"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// user agent | Given a stored handoff | When work.pickup filters sections
+    /// and text, or returns the markdown | Then only matching, live items are
+    /// projected and the relay-memory JSON comment is stripped.
+    #[test]
+    fn work_pickup_projects_requested_sections_queries_and_markdown() {
+        use crate::state_store::work_journal::WorkState;
+        use std::sync::{Arc, Mutex};
+
+        let memory = crate::work_compactor::RelayMemory {
+            goals: vec![
+                crate::work_compactor::RelayItem {
+                    id: "goal-1".to_owned(),
+                    text: format!("Ship H1 projection {}", "y".repeat(240)),
+                },
+                crate::work_compactor::RelayItem {
+                    id: "goal-2".to_owned(),
+                    text: "Unrelated chore".to_owned(),
+                },
+            ],
+            tasks: vec![crate::work_compactor::RelayTask {
+                id: "task-9".to_owned(),
+                text: "Wire work.pickup".to_owned(),
+                status: "todo".to_owned(),
+                updated_ms: None,
+            }],
+            ..crate::work_compactor::RelayMemory::default()
+        };
+        let handoff_md = format!(
+            "# Handoff\n\nvisible body\n<!-- relay-memory: {} -->",
+            serde_json::to_string(&memory).unwrap()
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        store
+            .lock()
+            .unwrap()
+            .put_work_state(&WorkState {
+                project_ref: "dir:/h1".to_owned(),
+                worktree: "/h1".to_owned(),
+                handoff_md,
+                updated_at: 1,
+                ..WorkState::default()
+            })
+            .unwrap();
+
+        let tasks_only = work_pickup_call(
+            &store,
+            &json!({"worktree": "/h1", "sections": ["tasks"], "query": "wire"}),
+            None,
+        );
+        assert_eq!(tasks_only["ok"], true);
+        assert_eq!(tasks_only["sections"]["tasks"].as_array().unwrap().len(), 1);
+        assert!(tasks_only["sections"].get("goals").is_none());
+        assert_eq!(tasks_only["total_counts"]["tasks"], 1);
+        assert_eq!(tasks_only["truncated"], false);
+
+        let queried = work_pickup_call(
+            &store,
+            &json!({"worktree": "/h1", "query": "SHIP h1"}),
+            None,
+        );
+        assert_eq!(queried["sections"]["goals"].as_array().unwrap().len(), 1);
+        assert_eq!(queried["sections"]["goals"][0]["id"], "goal-1");
+        assert_eq!(queried["total_counts"]["goals"], 1);
+        assert_eq!(queried["total_counts"]["preferences"], 0);
+
+        let markdown = work_pickup_call(
+            &store,
+            &json!({"worktree": "/h1", "include_markdown": true}),
+            None,
+        );
+        let handoff = markdown["handoff_md"].as_str().unwrap();
+        assert!(handoff.contains("visible body"), "{handoff}");
+        assert!(!handoff.contains("relay-memory"), "{handoff}");
+        assert!(!handoff.contains("goal-1"), "{handoff}");
+
+        // Out-of-range or wrongly-typed projection options are explicit
+        // invalid-params refusals, never silently clamped or ignored.
+        for bad in [
+            json!({"worktree": "/h1", "limit_per_section": 0}),
+            json!({"worktree": "/h1", "limit_per_section": 51}),
+            json!({"worktree": "/h1", "limit_per_section": "20"}),
+            json!({"worktree": "/h1", "sections": ["goals", "nope"]}),
+            json!({"worktree": "/h1", "sections": []}),
+            json!({"worktree": "/h1", "sections": "goals"}),
+            json!({"worktree": "/h1", "query": 7}),
+            json!({"worktree": "/h1", "query": "   "}),
+            json!({"worktree": "/h1", "include_archived": "yes"}),
+            json!({"worktree": "/h1", "include_markdown": 1}),
+            json!({"worktree": "/h1", "max_bytes": 0}),
+            json!({"worktree": "/h1", "max_bytes": 245761}),
+            json!({"worktree": "/h1", "unknown_projection": true}),
+        ] {
+            assert_eq!(
+                work_pickup_call(&store, &bad, None)["code"],
+                "work_pickup_params_invalid",
+                "{bad}"
+            );
+        }
+
+        // A caller-supplied byte budget is honoured down to the fixed envelope
+        // (keys + counts); below that the projection reports truncation rather
+        // than dropping the mandatory metadata.
+        let tiny = work_pickup_call(&store, &json!({"worktree": "/h1", "max_bytes": 700}), None);
+        assert!(serde_json::to_string(&tiny).unwrap().len() <= 700, "{tiny}");
+        assert_eq!(tiny["truncated"], true);
+        assert_eq!(tiny["total_counts"]["goals"], 2);
     }
 
     /// user pickup without selectors | Given recorded handoffs | When
@@ -16148,7 +16863,7 @@ mod tests {
         // cwd resolution through the topology project root.
         let by_cwd = work_pickup_call(
             &store,
-            &json!({"cwd": root.join("src").to_string_lossy()}),
+            &json!({"cwd": root.join("src").to_string_lossy(), "include_markdown": true}),
             Some(&snapshot),
         );
         assert_eq!(by_cwd["ok"], true);
@@ -16157,7 +16872,11 @@ mod tests {
         assert_eq!(by_cwd["sections"]["goals"][0]["text"], "ship relay");
 
         // pane resolution goes through the pane's live cwd the same way.
-        let by_pane = work_pickup_call(&store, &json!({"pane": "w1:p1"}), Some(&snapshot));
+        let by_pane = work_pickup_call(
+            &store,
+            &json!({"pane": "w1:p1", "include_markdown": true}),
+            Some(&snapshot),
+        );
         assert_eq!(by_pane["handoff_md"], by_cwd["handoff_md"]);
 
         // A cwd that resolves to no project and no recorded worktree is an
@@ -31710,7 +32429,7 @@ mod client_request_shape_matrix_tests {
                     "name": "herdr_call",
                     "arguments": {
                         "method": "work.pickup",
-                        "params": {"worktree": "/repo"}
+                        "params": {"worktree": "/repo", "include_markdown": true}
                     }
                 }
             }),
@@ -31731,7 +32450,7 @@ mod client_request_shape_matrix_tests {
                     "name": "herdr_call",
                     "arguments": {
                         "method": "work.pickup",
-                        "params": "{\"worktree\":\"/repo\"}"
+                        "params": "{\"worktree\":\"/repo\",\"include_markdown\":true}"
                     }
                 }
             }),
@@ -31826,8 +32545,11 @@ mod client_request_shape_matrix_tests {
         // The stored unicode worktree only matches when the decoded value is
         // byte-exact, so a returned handoff proves verbatim delivery.
         for params in [
-            json!({"worktree": "/unicode-repo/中文 emoji 🚀\t\n"}),
-            json!(json!({"worktree": "/unicode-repo/中文 emoji 🚀\t\n"}).to_string()),
+            json!({"worktree": "/unicode-repo/中文 emoji 🚀\t\n", "include_markdown": true}),
+            json!(
+                json!({"worktree": "/unicode-repo/中文 emoji 🚀\t\n", "include_markdown": true})
+                    .to_string()
+            ),
         ] {
             let unicode_params_resp = handle(
                 &json!({
@@ -31894,6 +32616,28 @@ mod client_request_shape_matrix_tests {
             assert_eq!(resp.pointer("/result/isError"), Some(&json!(true)));
             assert_eq!(parse_tool_payload(&resp)["code"], "invalid_params");
         }
+
+        let invalid_cursor_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 70,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_since",
+                    "arguments": {"cursor": "not-a-cursor"}
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_cursor_resp.pointer("/result/isError"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            parse_tool_payload(&invalid_cursor_resp)["code"],
+            "invalid_params"
+        );
 
         // 3. Namespaced tool names + stringified arguments + device: null
         for namespaced in [
@@ -32142,6 +32886,7 @@ mod client_request_shape_matrix_tests {
             conflict["code"], "single_writer_lease_conflict",
             "{conflict}"
         );
+        assert_eq!(conflict["busy_kind"], "readers_only", "{conflict}");
         assert_eq!(conflict["intent"], "read");
         let readers = conflict["readers"].as_array().unwrap();
         assert_eq!(readers.len(), 2);
@@ -32273,6 +33018,7 @@ mod client_request_shape_matrix_tests {
         let conflict_payload = parse_tool_payload(&conflict_acq);
         assert_eq!(conflict_payload["ok"], false);
         assert_eq!(conflict_payload["code"], "single_writer_lease_conflict");
+        assert_eq!(conflict_payload["busy_kind"], "writers");
         assert_eq!(conflict_payload["holder_id"], "lane-a");
         assert_eq!(conflict_payload["lease_epoch"], 1);
         assert!(conflict_payload.get("lease_token").is_none());
@@ -32408,7 +33154,8 @@ mod client_request_shape_matrix_tests {
                     "project_root": repo_str,
                     "command": "echo should-not-run > hacked.txt",
                     "intent": "non_idempotent_write",
-                    "idempotency_key": "exec-conflict-1"
+                    "idempotency_key": "exec-conflict-1",
+                    "confirm_busy": true
                 }),
             ),
             (
@@ -32462,6 +33209,7 @@ mod client_request_shape_matrix_tests {
                 payload["delivery_state"], "not_delivered",
                 "{tool_name} ({req_id})"
             );
+            assert_eq!(payload["busy_kind"], "writers", "{tool_name} ({req_id})");
             assert_eq!(payload["holder_id"], "lane-a", "{tool_name} ({req_id})");
             assert_eq!(payload["lease_epoch"], 1, "{tool_name} ({req_id})");
             assert!(payload.get("lease_token").is_none());
@@ -33585,5 +34333,431 @@ mod text_transfer_safety_tests {
             assert!(!preflight_propagates_core_failure(Some(code)), "{code}");
         }
         assert!(!preflight_propagates_core_failure(None));
+    }
+}
+
+/// #332 D-2: end-to-end coverage for the durable `client_request_id` path
+/// through the real `tool_call` boundary. `request_ledger_tests` keeps the
+/// in-memory fallback coverage; these exercise the `operations` ledger,
+/// including the file-backed reopen that simulates a restart.
+#[cfg(all(test, unix))]
+mod durable_client_request_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[allow(clippy::too_many_arguments)]
+    fn durable_context<'a>(
+        client: &'a HerdrClient,
+        cache: &'a EventCache,
+        exec: &'a ExecRegistry,
+        prompt: &'a PromptRegistry,
+        skill: &'a SkillService,
+        state_store: &'a Arc<Mutex<StateStore>>,
+        backend: &'a crate::runtime_adapter::RuntimeBackendSelection,
+        local_device_id: Option<&'a str>,
+    ) -> RuntimeContext<'a> {
+        RuntimeContext {
+            client,
+            cache,
+            exec,
+            prompt,
+            skill,
+            state_store,
+            caller_webchat_control_grants: &[],
+            caller_webchat_authorization: None,
+            caller_browser_session: None,
+            caller_page_assist_grants: &[],
+            caller_browser_on_other_device: false,
+            caller_relayed_source_turn: None,
+            caller_lease_holder_id: None,
+            caller_lease_epoch: None,
+            caller_lease_token: None,
+            local_device_id,
+            browser_actuator: None,
+            browser_mutation_gate: None,
+            browser_mutation_admission: None,
+            runtime_backend: backend,
+            trusted_local_ipc: true,
+            wire_request_id: None,
+        }
+    }
+
+    fn call_body(result: &Value) -> Value {
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    fn herdr_call_request(method: &str, params: Value, client_request_id: &str) -> Value {
+        json!({"params": {"name": "herdr_call", "arguments": {
+            "method": method,
+            "params": params,
+            "client_request_id": client_request_id
+        }}})
+    }
+
+    fn status_request(client_request_id: &str) -> Value {
+        json!({"params": {"name": "herdr_call", "arguments": {
+            "method": "herdr_mcp.request.status",
+            "params": {"client_request_id": client_request_id}
+        }}})
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-durable-e2e-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// user caller | Given no resolvable durable caller identity | When a
+    /// mutating method carries client_request_id | Then the call is refused
+    /// before execution and no durable row exists; a read-only method still
+    /// falls back to the in-memory ledger.
+    #[test]
+    fn user_submit_given_no_durable_scope_when_mutating_then_refused_without_row() {
+        let root = temp_dir("scope");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            None,
+        );
+
+        let body = call_body(
+            &tool_call(
+                &herdr_call_request(
+                    "pane.split",
+                    json!({"workspace": "ws", "target": "w1", "direction": "right"}),
+                    "cr-noscope",
+                ),
+                &context,
+            )
+            .unwrap(),
+        );
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "durable_caller_scope_unavailable", "{body}");
+        assert_eq!(body["delivery_state"], "not_delivered", "{body}");
+        assert_eq!(body["fallback_allowed"], false, "{body}");
+        // Nothing was reserved.
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                "cr-noscope",
+            );
+            assert!(
+                store
+                    .client_request_record(
+                        crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                        &digest,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // A read-only method under the same scope keeps the memory fallback.
+        let read = call_body(
+            &tool_call(
+                &herdr_call_request(
+                    "herdr_mcp.request.status",
+                    json!({"client_request_id": "anything"}),
+                    "cr-noscope-read",
+                ),
+                &context,
+            )
+            .unwrap(),
+        );
+        assert_eq!(read["ok"], true, "{read}");
+        assert_eq!(read["found"], false, "{read}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given a durable-scoped read request | When the runtime
+    /// restarts and the same key retries | Then the first recorded result
+    /// replays deduplicated and request.status sees the durable row.
+    #[test]
+    fn user_retry_given_durable_read_when_store_reopened_then_replays_first_result() {
+        let root = temp_dir("replay");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let request = herdr_call_request(
+            "herdr_mcp.request.status",
+            json!({"request_id": "never-recorded"}),
+            "cr-replay-1",
+        );
+        let first = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(first["ok"], true, "{first}");
+        let request_id = first["request_id"].as_str().unwrap().to_owned();
+
+        // The write/read row is durable: a same-scope row exists with a 30min
+        // expiry (read intent).
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                "cr-replay-1",
+            );
+            let record = store
+                .client_request_record(
+                    crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                    &digest,
+                )
+                .unwrap()
+                .expect("durable row missing");
+            assert_eq!(record.state.as_deref(), Some("complete"));
+            assert!(record.expires_at.is_some(), "read rows carry a TTL");
+        }
+
+        // Restart: swap in a fresh store over the same file.
+        *state_store.lock().unwrap() = StateStore::open_in_dir(&root, "state").unwrap();
+
+        let replay = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(replay["deduplicated"], true, "{replay}");
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["request_id"].as_str().unwrap(), request_id);
+        assert_eq!(replay["safe_retry_mode"], "none", "{replay}");
+
+        let status = call_body(&tool_call(&status_request("cr-replay-1"), &context).unwrap());
+        assert_eq!(status["found"], true, "{status}");
+        assert_eq!(status["durable"], true, "{status}");
+        assert_eq!(status["state"], "complete", "{status}");
+        assert_eq!(status["request_id"].as_str().unwrap(), request_id);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given a durable-scoped write that settled | When the
+    /// same key retries after restart | Then the row is a non-expiring
+    /// complete record and the replay reports the first summary.
+    #[test]
+    fn user_submit_given_durable_write_when_settled_then_complete_unexpiring_row() {
+        let root = temp_dir("write");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let bind_params = json!({
+            "continuity_id": "wm:durable-e2e",
+            "project_ref": "project:herdr-mcp",
+            "repo_id": "github.com/whshang/herdr-mcp",
+            "work_chain_id": "wc_cccccccccccccccccccccccccccccccc",
+            "provider": "chatgpt",
+            "account_ref": "account-a",
+            "space_ref": "project-space",
+            "session_ref": "session-a",
+            "bound_at": 100,
+        });
+        let request = herdr_call_request("work_memory.bind", bind_params, "cr-write-1");
+        let first = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["safe_retry_mode"], "none", "{first}");
+
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                "cr-write-1",
+            );
+            let record = store
+                .client_request_record(
+                    crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                    &digest,
+                )
+                .unwrap()
+                .expect("durable write row missing");
+            assert_eq!(record.state.as_deref(), Some("complete"));
+            // Write intents never carry SQL expiry: only the logical 24h
+            // summary deadline inside result_json applies.
+            assert_eq!(record.expires_at, None, "{record:?}");
+            let result = record.result();
+            assert_eq!(result["outcome"], "applied", "{result}");
+            assert_eq!(result["safe_retry_mode"], "none", "{result}");
+            assert!(result["summary_expires_at_ms"].is_i64(), "{result}");
+            let summary = &result["result_summary"];
+            assert!(summary["result_digest"].is_string(), "{summary}");
+            assert!(summary["result_bytes"].is_u64(), "{summary}");
+        }
+
+        // Restart then replay: no second bind is performed.
+        *state_store.lock().unwrap() = StateStore::open_in_dir(&root, "state").unwrap();
+        let replay = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(replay["deduplicated"], true, "{replay}");
+        assert_eq!(replay["ok"], true, "{replay}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given one settled key under scope A | When a different
+    /// caller scope reuses the key | Then one uniform idempotency_conflict
+    /// answers and the record stays invisible to that scope.
+    #[test]
+    fn user_retry_given_foreign_scope_same_key_when_retried_then_conflict() {
+        let root = temp_dir("conflict");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context_a = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-a"),
+        );
+        let context_b = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-b"),
+        );
+
+        let request = herdr_call_request(
+            "herdr_mcp.request.status",
+            json!({"request_id": "probe"}),
+            "cr-shared-key",
+        );
+        let first = call_body(&tool_call(&request, &context_a).unwrap());
+        assert_eq!(first["ok"], true, "{first}");
+
+        let conflict = call_body(&tool_call(&request, &context_b).unwrap());
+        assert_eq!(conflict["ok"], false, "{conflict}");
+        assert_eq!(conflict["code"], "idempotency_conflict", "{conflict}");
+        assert_eq!(conflict["retryable"], false, "{conflict}");
+        assert_eq!(conflict["fallback_allowed"], false, "{conflict}");
+        let text = conflict.to_string();
+        for leaked in ["edge-device-a", "edge-device-b", "result_summary"] {
+            assert!(!text.contains(leaked), "conflict echoes {leaked}: {text}");
+        }
+
+        // Scope B cannot prove the record exists; scope A still can.
+        let foreign = call_body(&tool_call(&status_request("cr-shared-key"), &context_b).unwrap());
+        assert_eq!(foreign["found"], false, "{foreign}");
+        let own = call_body(&tool_call(&status_request("cr-shared-key"), &context_a).unwrap());
+        assert_eq!(own["found"], true, "{own}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given both client_request_id and idempotency_key | When
+    /// submitted | Then the call is rejected before any ledger reservation.
+    #[test]
+    fn user_submit_given_both_idempotency_slots_when_submitted_then_invalid_params() {
+        let root = temp_dir("dual");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let request = json!({"params": {"name": "herdr_call", "arguments": {
+            "method": "herdr_mcp.request.status",
+            "params": {},
+            "client_request_id": "cr-dual",
+            "idempotency_key": "idem-dual"
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "invalid_params", "{body}");
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                "cr-dual",
+            );
+            assert!(
+                store
+                    .client_request_record(
+                        crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                        &digest,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
