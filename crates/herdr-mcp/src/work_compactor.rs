@@ -766,8 +766,16 @@ pub(crate) fn render_handoff_markdown(memory: &RelayMemory) -> String {
     // Only rules, the task list and source session paths; newest first.
     // Agents may edit items in place (`- [id] text`, tasks
     // `- [id] (status) text`); edits are folded back on the next tick.
-    let mut out =
-        format!("# HANDOFF\n\n## 规则\n\n> {RULES_SCOPE_NOTE}\n>\n> {RULES_EXECUTABLE_NOTE}\n");
+    let mut out = "# HANDOFF\n\n".to_owned();
+    // #H3a: the live git context is page-level state, rendered exactly once.
+    // Repeating it under every open task made the budget depend on the task
+    // count and let an eviction pass drop evidence instead of derived text.
+    if let Some(context) = &memory.workspace {
+        out.push_str(&format!("## 工作区\n\n{}\n\n", render_git_context(context)));
+    }
+    out.push_str(&format!(
+        "## 规则\n\n> {RULES_SCOPE_NOTE}\n>\n> {RULES_EXECUTABLE_NOTE}\n"
+    ));
     render_items(&mut out, RULES_HEADING, &memory.preferences);
     render_items(&mut out, MISTAKES_HEADING, &memory.mistakes);
     out.push_str(&format!("\n\n## {TASKS_HEADING}\n"));
@@ -785,10 +793,6 @@ pub(crate) fn render_handoff_markdown(memory: &RelayMemory) -> String {
             task.status,
             single_line(&task.text)
         ));
-        // Indented, non-list line: ignored when agent edits are folded back.
-        if let Some(context) = &memory.workspace {
-            out.push_str(&format!("\n  ↳ {}", render_git_context(context)));
-        }
     }
     out.push_str("\n\n## 历史会话路径\n");
     for line in memory.sources.iter().rev() {
@@ -1060,6 +1064,79 @@ fn apply_memory_ops(memory: &mut RelayMemory, ops: HandoffOps, now_ms: i64) {
     dedupe_tasks(&mut memory.tasks);
 }
 
+/// Budget for one rule/mistake item written by the summarizer. A longer text is
+/// not a durable rule but a narrative, so it belongs in the task list (#H3a).
+const LONG_ITEM_MAX_CHARS: usize = 280;
+
+/// Does this text name concrete bound work (a PR, a run, a temporary path)?
+/// Manual scanning keeps the crate dependency-free; the patterns are the ones
+/// the relay actually writes.
+fn names_bound_work(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let digits_after = |marker: &str| -> bool {
+        lower.match_indices(marker).any(|(start, _)| {
+            lower[start + marker.len()..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+        })
+    };
+    // "#123", "pr #123", "pr 123", "run 456", "run#7", "attempt 3"
+    if digits_after("#") || digits_after("pr ") || digits_after("pr#") {
+        return true;
+    }
+    if digits_after("run ") || digits_after("run#") || digits_after("runs/") {
+        return true;
+    }
+    // Temporary paths are re-derivable and never durable rules.
+    lower.contains("/tmp/")
+        || lower.contains("/var/folders/")
+        || lower.contains("/temporaryitems/")
+        || lower.contains("\\temp\\")
+        || lower.contains("%temp%")
+        || lower.contains(".tmp")
+        || lower.contains("/private/tmp/")
+}
+
+/// #H3a entry guard: a summarizer item that is long or names bound work is not
+/// a durable rule/mistake. Move it into `tasks` (never drop the text) so it is
+/// visible with the work it belongs to and cannot crowd the rules section.
+fn reclassify_bound_items(memory: &mut RelayMemory, now_ms: i64) {
+    let mut moved: Vec<String> = Vec::new();
+    let spill = |items: &mut Vec<RelayItem>, moved: &mut Vec<String>| {
+        let mut kept = Vec::with_capacity(items.len());
+        for item in items.drain(..) {
+            if item.text.chars().count() > LONG_ITEM_MAX_CHARS || names_bound_work(&item.text) {
+                moved.push(item.text);
+            } else {
+                kept.push(item);
+            }
+        }
+        *items = kept;
+    };
+    spill(&mut memory.preferences, &mut moved);
+    spill(&mut memory.mistakes, &mut moved);
+    for text in moved {
+        // Reuse the text verbatim: a reclassified item must not lose detail.
+        let ids: Vec<RelayItem> = memory
+            .tasks
+            .iter()
+            .map(|task| RelayItem {
+                id: task.id.clone(),
+                text: String::new(),
+            })
+            .collect();
+        let id = next_id(&ids, "t");
+        memory.tasks.push(RelayTask {
+            id,
+            text,
+            status: "todo".to_owned(),
+            updated_ms: Some(now_ms),
+        });
+    }
+    dedupe_tasks(&mut memory.tasks);
+}
+
 /// One bounded, provider-prefixed rolling-log line for the fallback path.
 fn recent_line(event: &WorkEvent) -> String {
     clip_chars(
@@ -1101,8 +1178,10 @@ fn apply_fallback(memory: &mut RelayMemory, legacy: &str, events: &[WorkEvent]) 
 
 /// Enforce the rendered budget without ever cutting item text: a clipped rule
 /// is a lost rule. Only derived, droppable things go — the rolling log, extra
-/// source paths, closed tasks, the git context. If the document still does not
-/// fit, it is written over budget with complete items.
+/// source paths, closed tasks. The git context is **never** evicted (#H3a): it
+/// is one page-level line and the only live workspace evidence, so an oversized
+/// memory elides whole items in the disk view instead (see
+/// `render_handoff_markdown_bounded`).
 fn enforce_budget(memory: &mut RelayMemory) {
     for _ in 0..200 {
         if render_handoff_markdown(memory).chars().count() <= HANDOFF_MAX_CHARS {
@@ -1118,10 +1197,6 @@ fn enforce_budget(memory: &mut RelayMemory) {
         }
         if memory.tasks.iter().any(|task| task.status == "done") {
             memory.tasks.retain(|task| task.status != "done");
-            continue;
-        }
-        // Derived git context is re-derivable; drop it before anything else.
-        if memory.workspace.take().is_some() {
             continue;
         }
         return;
@@ -1377,6 +1452,7 @@ fn compact_scope(
             memory.workspace = workspace.clone();
             if let Some(ops) = ops {
                 apply_memory_ops(&mut memory, ops.clone(), now_ms);
+                reclassify_bound_items(&mut memory, now_ms);
                 // Never lose a pre-upgrade free-form handoff: keep it in
                 // 当前状态 unless the model already restated state.
                 if !legacy.trim().is_empty() && memory.current_state.trim().is_empty() {
@@ -4544,10 +4620,11 @@ mod tests {
         assert!(memory.current_state.contains("mid-implementation"));
     }
 
-    /// relay memory budget | Given 300 long preferences plus a rolling log and
-    /// closed tasks | When the budget is enforced and the document rendered |
-    /// Then only droppable things go (recent lines, extra sources, closed
-    /// tasks) and every item keeps its complete text — no "…" is appended.
+    /// relay memory budget | Given 300 long preferences, a rolling log, closed
+    /// tasks and a git context | When the budget is enforced and the document
+    /// rendered | Then only droppable things go, the git context survives, the
+    /// disk view fits the budget by omitting whole items, and no item text is
+    /// ever cut.
     #[test]
     fn budget_never_truncates_item_text() {
         let mut memory = memory_with_sections();
@@ -4580,39 +4657,153 @@ mod tests {
             status: "todo".to_owned(),
             updated_ms: None,
         });
+        memory.workspace = Some(GitContext {
+            branch: "feat/budget".to_owned(),
+            worktree: "/repo".to_owned(),
+            changed_files: vec!["base.txt".to_owned()],
+            changed_total: 1,
+            next_step: "run the gate".to_owned(),
+        });
 
         enforce_budget(&mut memory);
-        let rendered = render_handoff(&memory);
+        let stored = render_handoff(&memory);
 
         // Droppable state is gone and the open task survives whole.
         assert!(memory.recent.is_empty());
         assert!(memory.sources.len() <= 5);
         assert!(memory.tasks.iter().all(|task| task.status != "done"));
         assert_eq!(memory.tasks.len(), 1);
-        assert!(rendered.contains(&"z".repeat(80)));
-        // Item text is never shortened: the document stays over budget instead
-        // of clipping a rule into a fragment.
-        assert!(rendered.chars().count() > HANDOFF_MAX_CHARS);
+        assert!(stored.contains(&"z".repeat(80)));
+        // #H3a: the git context is page-level evidence and is never evicted.
+        assert!(memory.workspace.is_some());
+        assert_eq!(stored.matches("branch `feat/budget`").count(), 1);
+        // Item text is never shortened: items are either complete or omitted.
         assert_eq!(memory.preferences.len(), 301);
         for item in &memory.preferences {
             assert!(
-                rendered.contains(&format!("[{}] {}", item.id, single_line(&item.text))),
+                stored.contains(&format!("[{}] {}", item.id, single_line(&item.text))),
                 "item text was altered: {}",
                 item.id
             );
         }
-        assert_eq!(
-            memory.mistakes[0].text,
-            "edited an applied migration once; never again"
-        );
         assert!(
-            rendered
+            stored
                 .lines()
                 .filter(|line| line.starts_with("- ["))
                 .all(|line| !line.ends_with('…')),
             "an item line was truncated"
         );
-        assert!(parsed_memory(&rendered).is_some());
+        // The full memory does not fit; the disk view does, by whole-item
+        // omission, and still carries the git context exactly once.
+        assert!(stored.chars().count() > HANDOFF_MAX_CHARS);
+        let disk = render_handoff_markdown_bounded(&memory);
+        assert!(
+            disk.chars().count() <= HANDOFF_MAX_CHARS,
+            "disk view is {} chars",
+            disk.chars().count()
+        );
+        assert_eq!(disk.matches("branch `feat/budget`").count(), 1);
+        assert!(disk.contains("已省略"));
+        for line in disk.lines().filter(|line| line.starts_with("- [")) {
+            assert!(!line.ends_with('…'), "disk item truncated: {line}");
+        }
+        assert!(parsed_memory(&stored).is_some());
+    }
+
+    /// relay memory entry guard | Given summarizer output that names a PR, a
+    /// run or a temporary path, or writes an over-long rule | When the ops are
+    /// applied | Then those texts move into the task list verbatim instead of
+    /// crowding the durable rules.
+    #[test]
+    fn long_or_bound_summarizer_items_move_to_tasks() {
+        let mut memory = RelayMemory::default();
+        let long_rule = "r".repeat(LONG_ITEM_MAX_CHARS + 1);
+        let ops: HandoffOps = serde_json::from_value(serde_json::json!({
+            "preferences": [
+                {"op": "add", "id": "p1", "text": "never force-push main"},
+                {"op": "add", "id": "p2", "text": "wait for PR #4321 to merge"},
+                {"op": "add", "id": "p3", "text": long_rule},
+                {"op": "add", "id": "p4", "text": "artifact lives in /tmp/run-9/output.log"}
+            ],
+            "mistakes": [
+                {"op": "add", "id": "m1", "text": "run 77 timed out; raise the budget"},
+                {"op": "add", "id": "m2", "text": "clipped a rule instead of moving it"}
+            ]
+        }))
+        .unwrap();
+        apply_memory_ops(&mut memory, ops, 5);
+        reclassify_bound_items(&mut memory, 5);
+
+        let rule_texts: Vec<&str> = memory.preferences.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(rule_texts, vec!["never force-push main"]);
+        let mistake_texts: Vec<&str> = memory.mistakes.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            mistake_texts,
+            vec!["clipped a rule instead of moving it"],
+            "a clipped rule must stay a rule"
+        );
+        // Every moved text is kept verbatim as an open task.
+        let mut task_texts: Vec<&str> = memory.tasks.iter().map(|t| t.text.as_str()).collect();
+        task_texts.sort_unstable();
+        let mut expected = vec![
+            "wait for PR #4321 to merge",
+            "artifact lives in /tmp/run-9/output.log",
+            "run 77 timed out; raise the budget",
+        ];
+        expected.sort_unstable();
+        let mut moved: Vec<&str> = task_texts
+            .iter()
+            .copied()
+            .filter(|text| expected.contains(text))
+            .collect();
+        moved.sort_unstable();
+        assert_eq!(moved, expected, "{task_texts:?}");
+        assert!(
+            memory
+                .tasks
+                .iter()
+                .any(|t| t.text == long_rule && t.status == "todo"),
+            "over-long rule moved with its full text"
+        );
+        // Idempotent: a second pass changes nothing.
+        let before = memory.clone();
+        reclassify_bound_items(&mut memory, 9);
+        assert_eq!(memory.preferences, before.preferences);
+        assert_eq!(memory.mistakes, before.mistakes);
+        assert_eq!(memory.tasks.len(), 4);
+    }
+
+    /// relay memory entry guard | Given ops whose rule text is exactly at the
+    /// limit and a task list already using generated ids | When the guard runs
+    /// | Then nothing is reclassified silently (no error, no text loss, no id
+    /// collision).
+    #[test]
+    fn entry_guard_boundaries_do_not_fail_silently() {
+        let mut memory = RelayMemory {
+            tasks: vec![RelayTask {
+                id: "t1".to_owned(),
+                text: "existing".to_owned(),
+                status: "todo".to_owned(),
+                updated_ms: None,
+            }],
+            ..RelayMemory::default()
+        };
+        let at_limit = "a".repeat(LONG_ITEM_MAX_CHARS);
+        memory.preferences.push(RelayItem {
+            id: "p1".to_owned(),
+            text: at_limit.clone(),
+        });
+        memory.mistakes.push(RelayItem {
+            id: "m1".to_owned(),
+            text: "see runs/9 for the flake".to_owned(),
+        });
+        reclassify_bound_items(&mut memory, 7);
+        assert_eq!(memory.preferences.len(), 1, "at-limit rule stays a rule");
+        assert_eq!(memory.preferences[0].text, at_limit);
+        assert!(memory.mistakes.is_empty());
+        let ids: Vec<&str> = memory.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["t1", "t2"], "no id collision: {ids:?}");
+        assert_eq!(memory.tasks[1].updated_ms, Some(7));
     }
 
     /// relay memory legacy migration | Given a legacy free-form handoff |
@@ -5008,13 +5199,13 @@ mod tests {
             ..RelayMemory::default()
         };
         let rendered = render_handoff(&memory);
-        // Only the open task is rendered, so only it carries the context line.
+        // Only the open task is rendered; the git context is page-level state
+        // and appears exactly once, regardless of how many tasks are open.
         assert!(!rendered.contains("[t2]"), "{rendered}");
-        assert_eq!(
-            rendered.matches("↳ branch `feat/x`").count(),
-            1,
-            "{rendered}"
-        );
+        let context_line = "branch `feat/x`";
+        assert_eq!(rendered.matches(context_line).count(), 1, "{rendered}");
+        assert!(rendered.contains("## 工作区"), "{rendered}");
+        assert!(!rendered.contains("↳"), "{rendered}");
         assert!(rendered.contains("files(12): base.txt, new.md"));
         assert!(rendered.contains(RULES_EXECUTABLE_NOTE));
         // The context line is not folded back as a task.
