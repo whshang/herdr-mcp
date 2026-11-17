@@ -1649,7 +1649,22 @@ fn admitted_tool_output(
             herdr_core,
         ),
         "herdr_since" => {
-            let cursor = arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+            let cursor = match arguments.get("cursor") {
+                None => 0,
+                Some(value) => match value.as_u64() {
+                    Some(cursor) => cursor,
+                    None => {
+                        return Ok(AdmittedToolResult::Raw {
+                            output: json!({
+                                "ok": false,
+                                "code": "invalid_params",
+                                "message": "cursor must be a non-negative integer",
+                            }),
+                            is_error: true,
+                        });
+                    }
+                },
+            };
             let workspace = arguments.get("workspace").and_then(Value::as_str);
             let transition = context
                 .state_store
@@ -32404,6 +32419,28 @@ mod client_request_shape_matrix_tests {
             assert_eq!(resp.pointer("/result/isError"), Some(&json!(true)));
             assert_eq!(parse_tool_payload(&resp)["code"], "invalid_params");
         }
+
+        let invalid_cursor_resp = handle(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 70,
+                "method": "tools/call",
+                "params": {
+                    "name": "herdr_since",
+                    "arguments": {"cursor": "not-a-cursor"}
+                }
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_cursor_resp.pointer("/result/isError"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            parse_tool_payload(&invalid_cursor_resp)["code"],
+            "invalid_params"
+        );
 
         // 3. Namespaced tool names + stringified arguments + device: null
         for namespaced in [
