@@ -21,6 +21,43 @@ The required gates are:
 
 `production_ready` must remain false until every gate is true and the operator explicitly seals the cutover. Code must never infer the independent verification gate from process state alone.
 
+## 1.2 Node Link and Server retirement
+
+Starting with 1.2, the production Node Link and Node Server are retired. The
+retired source surfaces are `src/server.ts`, `src/link/**`, `src/relay/**`, and
+`bin/herdr-link`; PR-a records the boundary and ports the Node-only assertions,
+while PR-b and PR-c remove the source and compatibility entrypoints. Within the
+legacy Node runtime surface, only `bin/herdr-extension-host` remains retained.
+Rust keeps the recognition and cleanup state machine for historical Node
+production plists and `ServiceRollbackRecord` entries so old installation state
+can be handled safely.
+
+Production rollback moves between already installed Rust runtime generations
+using recorded service state. It never rebuilds or starts `dist/` Node code and
+never treats a source-tree Node process as a rollback target. This retirement
+declaration does not unload, delete, rewrite, or otherwise mutate any existing
+Node plist or daemon on a device.
+
+The following table is the PR-a migration ledger. A row names the Node
+assertions that depended on the retired implementation and the Rust or Edge
+test that now owns the observable contract. Tests that only inspect a
+retired wrapper or packaging path remain retirement canaries until PR-b/PR-c
+remove that source.
+
+| Node test and assertion group | Rust / Edge owner after PR-a |
+| --- | --- |
+| `tests/link-client.test.mjs`: canonical hello/tool result/tool error/cancel frames, request correlation, delivery states, queue bounds, duplicate IDs, frame limits, reconnect, fatal refusal, shutdown, foreign workstation filtering, and credential secrecy | `crates/herdr-mcp/src/link/socket_driver.rs` helper, handshake, frame, and channel tests; `crates/herdr-mcp/src/link/runner.rs` dispatch, cancel, timeout, generation, queue, foreign-workstation, and delivery-state tests; `crates/herdr-mcp/src/link/io_loop.rs` lifecycle and shutdown tests |
+| `tests/link-local-mcp-transport.test.mjs`: loopback-only endpoint, epoch/hash validation, bearer handling, JSON/SSE parsing, ID correlation, timeout/cancel, malformed and oversized bodies, HTTP/JSON-RPC error sanitization, health probing, and token secrecy | `crates/herdr-mcp/src/link/local_mcp.rs::pure_helpers_match_node_oracle`, `construction_is_loopback_epoch_and_secret_fail_closed`, `dispatch_posts_exact_tools_call_and_preserves_full_result_envelope`, `jsonrpc_and_http_failures_are_sanitized`, `timeout_and_cancel_are_request_scoped`, `response_budget_and_health_version_cache_are_bounded` |
+| `tests/link-daemon.test.mjs`: daemon defaults, missing credentials, WSS and contract-pair rejection, workstation ID validation, runtime identity, and frozen epoch-1 refusal/acceptance | `crates/herdr-mcp/src/link/daemon.rs` config, credential, contract, identity, and staged epoch-1 tests; `crates/herdr-mcp/src/link/edge_contract.rs::refuses_epoch1_dev_health` |
+| `tests/link-lifecycle-policy-batch5.test.mjs`: phase set/order, hello-ack refusal classification, close-code policy, reconnect cap, heartbeat gate, and silence expiry/recycle | `crates/herdr-mcp/src/link/lifecycle.rs`, `policy.rs`, `heartbeat.rs`, and `io_loop.rs` shared batch-5 fixture tests |
+| `tests/link-backoff.test.mjs` and `tests/link-reliability-batch4.test.mjs`: option sanitization, jitter/attempt/reset, runtime-generation ownership, drain, stale lease, and rollback-on-health-failure | `crates/herdr-mcp/src/link/backoff.rs`, `generation_fence.rs`, and `runtime_generation.rs` shared batch-4 and generation safety tests |
+| `tests/runtime-generation.test.mjs`: candidate registration, exact contract/version checks, activation drain, stale lease fencing, and health failure rollback | `crates/herdr-mcp/src/link/runtime_generation.rs` candidate registration, activation, lease, managed-current, and rollback tests |
+| `tests/link-relay-adapter-inbound.test.mjs`: canonical `tool_request` and `cancel` frames preserve every field when projected into the internal request shape | `crates/herdr-mcp/src/relay/wire.rs::shared_node_adapter_inbound_fixture_remains_valid_for_typed_decode`, including the exact internal projection from `tests/fixtures/relay-adapter-builders.json` |
+| `tests/epoch1-runtime-profile.test.mjs`: frozen 17-tool count/hash and absence of `herdr_skill` | `edge/cloudflare/tests/mcp-handler.test.mjs::retired Node epoch1 profile keeps its frozen 17-tool contract identity`; Rust retains the supervised epoch-1 rollback identity checks in `link/daemon.rs` |
+| `tests/epoch2-runtime-profile.test.mjs`: frozen 18-tool identity, `herdr_skill` presence, and all-tools incompatibility | Edge `mcp-handler.test.mjs` exercises all 18 epoch-2 tools; `crates/herdr-mcp/src/relay/contract.rs` pins the epoch-2 hash and `crates/herdr-mcp/src/contract.rs` pins the current 18-tool catalog. `HERDR_MCP_ALL_TOOLS` is a retired Node-only switch and has no Rust production equivalent. |
+| `tests/self-update.test.mjs`: Node plist transformation and source-tree `dist/` exclusion assertions | Rust service-manager, updater, runtime-generation, and `ServiceRollbackRecord` tests own immutable installed-generation activation, rollback, legacy Node plist recognition/cleanup, and the prohibition on checkout or `dist/` ownership |
+| `tests/agent-install-doc.test.mjs`, `tests/docs-command-contract.test.mjs`, `tests/release-surface.test.mjs`, and `tests/ci-test-selection.test.mjs`: legacy wrapper, documentation, packaging, and CI classification checks | The retirement and rollback boundary is declared above and in `AGENTS.md`; these tests remain source-removal and packaging canaries until PR-b/PR-c. They do not define a Rust or Edge runtime contract. |
+
 ## Cutover transaction
 
 `herdr-mcp link cutover --execute` is a bounded ownership transaction:

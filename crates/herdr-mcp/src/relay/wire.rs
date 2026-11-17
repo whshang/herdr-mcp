@@ -782,6 +782,32 @@ mod tests {
             let decoded = decode_relay_value(input, None)
                 .unwrap_or_else(|error| panic!("{name}: decode failed: {error:?}"));
             assert_eq!(decoded.to_value(), *input, "{name}: typed round trip");
+
+            let internal = entry.get("internal").expect("internal projection");
+            let projected = match &decoded {
+                RelayMessage::ToolRequest(message) => json!({
+                    "v": 1,
+                    "type": "request",
+                    "workstation_id": message.envelope.workstation_id,
+                    "request_id": message.request_id,
+                    "operation": message.operation,
+                    "arguments": message.arguments,
+                    "timeout_ms": message.timeout_ms,
+                    "contract_epoch": message.contract_epoch,
+                    "contract_hash": message.contract_hash,
+                    "idempotency_key": message.idempotency_key,
+                    "trace": message.trace,
+                }),
+                RelayMessage::Cancel(message) => json!({
+                    "v": 1,
+                    "type": "cancel",
+                    "workstation_id": message.envelope.workstation_id,
+                    "request_id": message.request_id,
+                    "reason": message.reason,
+                }),
+                other => panic!("{name}: expected inbound request or cancel, got {other:?}"),
+            };
+            assert_eq!(projected, *internal, "{name}: internal adapter projection");
         }
     }
 
