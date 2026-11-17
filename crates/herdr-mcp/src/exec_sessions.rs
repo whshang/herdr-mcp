@@ -49,11 +49,19 @@ impl PaneStartStage {
     }
 }
 
-/// Typed utility-pane start failure carrying the stage that produced it.
+/// Typed utility-pane start failure carrying the stage that produced it and,
+/// for task-owned panes, what happened to the pane afterwards.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PaneStartError {
     pub stage: PaneStartStage,
     pub message: String,
+    /// Session registered to keep an uncertain-delivery task-owned pane
+    /// inspectable and reclaimable through `herdr_exec_read`/`herdr_exec_kill`.
+    pub tracked_session_id: Option<String>,
+    /// `Some` only when the pane had to be reclaimed without a session:
+    /// `true` when `pane.close` succeeded, `false` when it failed and the
+    /// pane may remain orphaned.
+    pub pane_reclaimed: Option<bool>,
 }
 
 impl PaneStartError {
@@ -61,6 +69,8 @@ impl PaneStartError {
         Self {
             stage: PaneStartStage::BeforeSend,
             message: message.into(),
+            tracked_session_id: None,
+            pane_reclaimed: None,
         }
     }
 
@@ -68,7 +78,24 @@ impl PaneStartError {
         Self {
             stage: PaneStartStage::AfterSend,
             message: message.into(),
+            tracked_session_id: None,
+            pane_reclaimed: None,
         }
+    }
+
+    fn with_tracked_session(mut self, session_id: &str) -> Self {
+        self.tracked_session_id = Some(session_id.to_owned());
+        self
+    }
+
+    pub(crate) fn with_pane_reclaimed(mut self, reclaimed: bool) -> Self {
+        self.pane_reclaimed = Some(reclaimed);
+        self
+    }
+
+    pub(crate) fn with_pane_reclaimed_opt(mut self, reclaimed: Option<bool>) -> Self {
+        self.pane_reclaimed = reclaimed;
+        self
     }
 }
 
@@ -79,6 +106,27 @@ impl std::fmt::Display for PaneStartError {
 }
 
 impl std::error::Error for PaneStartError {}
+
+/// Outcome of the pane-level reclaim step a pane-backed termination performs.
+/// produce `Closed`/`Failed`; every other backend reports `NotApplicable`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum PaneReclaimOutcome {
+    NotApplicable,
+    Closed,
+    Failed(String),
+}
+
+impl PaneReclaimOutcome {
+    /// `Some(true)`/`Some(false)` when a pane-close was attempted; `None` when
+    /// the session did not own a pane to close.
+    fn reclaimed(&self) -> Option<bool> {
+        match self {
+            PaneReclaimOutcome::Closed => Some(true),
+            PaneReclaimOutcome::Failed(_) => Some(false),
+            PaneReclaimOutcome::NotApplicable => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum StreamKind {
@@ -108,6 +156,11 @@ struct SessionStatus {
     exit_code: Option<i32>,
     signal: Option<String>,
     ended_at_ms: Option<u64>,
+    /// `Some(true)`/`Some(false)` once a close-on-complete pane's reclaim was
+    /// attempted; `None` when no reclaim was attempted (still open or not
+    /// pane-owned).
+    pane_reclaimed: Option<bool>,
+    pane_reclaim_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -435,6 +488,8 @@ fn load_session_from_spool_or_record(
         exit_code: record.exit_code,
         signal: record.signal.clone(),
         ended_at_ms: record.ended_at_ms,
+        pane_reclaimed: None,
+        pane_reclaim_error: None,
     };
     Arc::new(Session {
         id: record.session_id.clone(),
@@ -699,6 +754,24 @@ impl ExecRegistry {
         let spool = pane_spool_paths(&id);
         write_pane_script(&script_path, cwd, command, &spool)
             .map_err(PaneStartError::before_send)?;
+        let session = Arc::new(Session {
+            id: id.clone(),
+            cwd: cwd.to_path_buf(),
+            command: command.to_owned(),
+            started_at_ms: now_ms(),
+            pid: None,
+            backend: SessionBackend::Pane {
+                client: client.clone(),
+                pane_id: pane_id.to_owned(),
+                script_path: script_path.clone(),
+                spool: spool.clone(),
+                stdout_offset: Mutex::new(0),
+                stderr_offset: Mutex::new(0),
+                close_on_complete,
+            },
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus::default()),
+        });
         let launch_line = format!(
             "{} {}",
             shell_quote(resolve_exec_shell().to_string_lossy().as_ref()),
@@ -709,37 +782,37 @@ impl ExecRegistry {
             json!({"pane_id": pane_id, "text": format!("{launch_line}\n")}),
             PANE_RPC_TIMEOUT,
         ) {
-            cleanup_pane_files(&script_path, &spool);
             if close_on_complete {
-                let _ = client.call_with_timeout(
-                    "pane.close",
-                    json!({"pane_id": pane_id}),
-                    PANE_RPC_TIMEOUT,
-                );
+                // The launch line may already have reached the task-owned
+                // pane. Register it as a trackable session so
+                // `herdr_exec_read`/`herdr_exec_kill` can inspect or reclaim
+                // it; only fall back to pane.close when tracking itself
+                // failed.
+                if let Err(tracking_error) = self.track_orphan_pane_session(&session) {
+                    cleanup_pane_files(&script_path, &spool);
+                    let pane_reclaimed = client
+                        .call_with_timeout(
+                            "pane.close",
+                            json!({"pane_id": pane_id}),
+                            PANE_RPC_TIMEOUT,
+                        )
+                        .is_ok();
+                    return Err(PaneStartError::after_send(format!(
+                        "cannot start pane command: {error}; pane session tracking failed: {tracking_error}"
+                    ))
+                    .with_pane_reclaimed(pane_reclaimed));
+                }
+                return Err(PaneStartError::after_send(format!(
+                    "cannot start pane command: {error}"
+                ))
+                .with_tracked_session(&id));
             }
+            cleanup_pane_files(&script_path, &spool);
             return Err(PaneStartError::after_send(format!(
                 "cannot start pane command: {error}"
             )));
         }
-        let started_at_ms = now_ms();
-        let session = Arc::new(Session {
-            id: id.clone(),
-            cwd: cwd.to_path_buf(),
-            command: command.to_owned(),
-            started_at_ms,
-            pid: None,
-            backend: SessionBackend::Pane {
-                client,
-                pane_id: pane_id.to_owned(),
-                script_path,
-                spool,
-                stdout_offset: Mutex::new(0),
-                stderr_offset: Mutex::new(0),
-                close_on_complete,
-            },
-            buffers: Mutex::new(Buffers::default()),
-            status: Mutex::new(SessionStatus::default()),
-        });
+        let started_at_ms = session.started_at_ms;
         if let Err(error) = self
             .inner
             .state_store
@@ -747,12 +820,21 @@ impl ExecRegistry {
             .map_err(|_| "exec state store lock poisoned".to_owned())
             .and_then(|store| store.record_pane_exec_running(&id, started_at_ms))
         {
-            terminate_session(&session, true, None);
+            let outcome = terminate_session(&session, true, None);
             // The launch line already reached the pane, so the caller must not
-            // be told that nothing ran.
+            // be told that nothing ran. Report whether the owned pane was
+            // actually closed instead of claiming it unconditionally.
             return Err(PaneStartError::after_send(format!(
-                "cannot durably register pane exec session; pane was closed before return: {error}"
-            )));
+                "cannot durably register pane exec session; session terminated before return{}: {error}",
+                match &outcome {
+                    PaneReclaimOutcome::Closed => " and its pane was closed",
+                    PaneReclaimOutcome::Failed(_) => {
+                        "; the owned pane could not be closed"
+                    }
+                    PaneReclaimOutcome::NotApplicable => "",
+                }
+            ))
+            .with_pane_reclaimed_opt(outcome.reclaimed()));
         }
         self.inner
             .sessions
@@ -760,8 +842,9 @@ impl ExecRegistry {
             .map_err(|_| {
                 // The launch line was already delivered before this registry
                 // bookkeeping step.
-                terminate_session(&session, true, None);
+                let outcome = terminate_session(&session, true, None);
                 PaneStartError::after_send("exec registry lock poisoned")
+                    .with_pane_reclaimed_opt(outcome.reclaimed())
             })?
             .insert(id.clone(), Arc::clone(&session));
         spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
@@ -781,6 +864,27 @@ impl ExecRegistry {
                 "elapsed_ms": 0,
             },
         }))
+    }
+
+    /// Register a task-owned pane whose `pane.send_text` failed after bytes may
+    /// already have been delivered. The command outcome is unknown, so the
+    /// pane keeps running under a real session id: the monitor reaps it when
+    /// the launch line completes, and `herdr_exec_kill` reclaims the pane if it
+    /// never does. Without this the pane would be unaddressable forever.
+    #[cfg(unix)]
+    fn track_orphan_pane_session(&self, session: &Arc<Session>) -> Result<(), String> {
+        self.inner
+            .state_store
+            .lock()
+            .map_err(|_| "exec state store lock poisoned".to_owned())
+            .and_then(|store| store.record_pane_exec_running(&session.id, session.started_at_ms))?;
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "exec registry lock poisoned".to_owned())?
+            .insert(session.id.clone(), Arc::clone(session));
+        spawn_monitor(Arc::clone(session), Arc::downgrade(&self.inner));
+        Ok(())
     }
 
     pub fn read(&self, id: &str, stream: &str, offset: usize, limit: usize) -> Value {
@@ -846,6 +950,13 @@ impl ExecRegistry {
                 "elapsed_ms": elapsed_ms,
             }),
         );
+
+        if let Some(pane_reclaimed) = status.pane_reclaimed {
+            result.insert("pane_reclaimed".to_owned(), json!(pane_reclaimed));
+        }
+        if let Some(error) = &status.pane_reclaim_error {
+            result.insert("pane_reclaim_error".to_owned(), json!(error));
+        }
         if status.closed {
             result.insert(
                 "completion".to_owned(),
@@ -868,15 +979,21 @@ impl ExecRegistry {
         };
         let status = session_status(&session);
         if status.closed {
-            return json!({
-                "ok": true,
-                "session_id": id,
-                "killed": false,
-                "exit_code": status.exit_code,
-                "signal": status.signal,
-            });
+            let mut result = Map::new();
+            result.insert("ok".to_owned(), json!(true));
+            result.insert("session_id".to_owned(), json!(id));
+            result.insert("killed".to_owned(), json!(false));
+            result.insert("exit_code".to_owned(), json!(status.exit_code));
+            result.insert("signal".to_owned(), json!(status.signal));
+            if let Some(pane_reclaimed) = status.pane_reclaimed {
+                result.insert("pane_reclaimed".to_owned(), json!(pane_reclaimed));
+            }
+            if let Some(error) = status.pane_reclaim_error {
+                result.insert("pane_reclaim_error".to_owned(), json!(error));
+            }
+            return Value::Object(result);
         }
-        terminate_session(&session, false, Some(&self.inner));
+        let outcome = terminate_session(&session, false, Some(&self.inner));
         let weak = Arc::downgrade(&session);
         thread::spawn(move || {
             thread::sleep(KILL_GRACE);
@@ -886,13 +1003,23 @@ impl ExecRegistry {
                 terminate_session(&session, true, None);
             }
         });
-        json!({
-            "ok": true,
-            "session_id": id,
-            "killed": true,
-            "exit_code": Value::Null,
-            "signal": Value::Null,
-        })
+        let mut result = Map::new();
+        result.insert("ok".to_owned(), json!(true));
+        result.insert("session_id".to_owned(), json!(id));
+        result.insert("killed".to_owned(), json!(true));
+        result.insert("exit_code".to_owned(), Value::Null);
+        result.insert("signal".to_owned(), Value::Null);
+        match outcome {
+            PaneReclaimOutcome::Closed => {
+                result.insert("pane_reclaimed".to_owned(), json!(true));
+            }
+            PaneReclaimOutcome::Failed(error) => {
+                result.insert("pane_reclaimed".to_owned(), json!(false));
+                result.insert("pane_reclaim_error".to_owned(), json!(error));
+            }
+            PaneReclaimOutcome::NotApplicable => {}
+        }
+        Value::Object(result)
     }
 
     pub fn list_views(&self) -> Vec<Value> {
@@ -1166,12 +1293,16 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             exit_code: None,
             signal: None,
             ended_at_ms: Some(now_ms()),
+            pane_reclaimed: None,
+            pane_reclaim_error: None,
         },
         |status| SessionStatus {
             closed: status.closed,
             exit_code: status.exit_code,
             signal: status.signal.clone(),
             ended_at_ms: status.ended_at_ms,
+            pane_reclaimed: status.pane_reclaimed,
+            pane_reclaim_error: status.pane_reclaim_error.clone(),
         },
     )
 }
@@ -1448,17 +1579,28 @@ fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>
     drain_spool_file(session, &spool.stdout, StreamKind::Stdout, stdout_offset);
     drain_spool_file(session, &spool.stderr, StreamKind::Stderr, stderr_offset);
     let Some(exit_code) = read_pane_exit_code(&spool.status) else {
+        // A task-owned pane whose launch never produced an exit marker would
+        // poll forever; bound the session so the monitor eventually reclaims
+        // the pane instead of keeping an unaddressable pane open.
+        if *close_on_complete && now_ms().saturating_sub(session.started_at_ms) > SESSION_TTL_MS {
+            terminate_session(session, false, registry);
+            return true;
+        }
         return false;
     };
     let transitioned = complete_session(session, registry, Some(exit_code), None);
     if transitioned {
         cleanup_pane_files(script_path, spool);
         if *close_on_complete {
-            let _ = client.call_with_timeout(
+            let outcome = match client.call_with_timeout(
                 "pane.close",
                 json!({"pane_id": pane_id}),
                 PANE_RPC_TIMEOUT,
-            );
+            ) {
+                Ok(_) => PaneReclaimOutcome::Closed,
+                Err(error) => PaneReclaimOutcome::Failed(error.message),
+            };
+            record_pane_reclaim(session, &outcome);
         }
     }
     true
@@ -1636,9 +1778,32 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
-fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&RegistryInner>) {
+fn record_pane_reclaim(session: &Arc<Session>, outcome: &PaneReclaimOutcome) {
+    let (reclaimed, error) = match outcome {
+        PaneReclaimOutcome::Closed => (Some(true), None),
+        PaneReclaimOutcome::Failed(error) => (Some(false), Some(error.clone())),
+        PaneReclaimOutcome::NotApplicable => (None, None),
+    };
+    if reclaimed.is_none() {
+        return;
+    }
+    if let Ok(mut status) = session.status.lock() {
+        status.pane_reclaimed = reclaimed;
+        status.pane_reclaim_error = error;
+    }
+}
+
+/// Terminate one session and, for close-on-complete pane sessions, reclaim the
+/// task-owned pane. The pane-level outcome is returned and recorded on the
+/// session status: a failed `pane.close` is never folded into the session
+/// close, because the session and the pane it ran in are separate resources.
+fn terminate_session(
+    session: &Arc<Session>,
+    force: bool,
+    registry: Option<&RegistryInner>,
+) -> PaneReclaimOutcome {
     match &session.backend {
-        SessionBackend::Completed => {}
+        SessionBackend::Completed => return PaneReclaimOutcome::NotApplicable,
         SessionBackend::Native { child, .. } => {
             #[cfg(unix)]
             {
@@ -1657,35 +1822,46 @@ fn terminate_session(session: &Arc<Session>, force: bool, registry: Option<&Regi
                     let _ = child.kill();
                 }
             }
+            return PaneReclaimOutcome::NotApplicable;
         }
-        SessionBackend::Pane {
-            client,
-            pane_id,
-            script_path,
-            spool,
-            close_on_complete,
-            ..
-        } => {
-            let method = if *close_on_complete {
-                "pane.close"
-            } else {
-                "pane.send_keys"
-            };
-            let params = if *close_on_complete {
-                json!({"pane_id": pane_id})
-            } else {
-                json!({"pane_id": pane_id, "keys": ["C-c"]})
-            };
-            let _ = client.call_with_timeout(method, params, PANE_RPC_TIMEOUT);
-            cleanup_pane_files(script_path, spool);
-            let signal = if *close_on_complete {
-                if force { "SIGKILL" } else { "SIGTERM" }
-            } else {
-                "SIGINT"
-            };
-            complete_session(session, registry, None, Some(signal));
-        }
+        SessionBackend::Pane { .. } => {}
     }
+    let SessionBackend::Pane {
+        client,
+        pane_id,
+        script_path,
+        spool,
+        close_on_complete,
+        ..
+    } = &session.backend
+    else {
+        return PaneReclaimOutcome::NotApplicable;
+    };
+    let outcome = if *close_on_complete {
+        match client.call_with_timeout("pane.close", json!({"pane_id": pane_id}), PANE_RPC_TIMEOUT)
+        {
+            Ok(_) => PaneReclaimOutcome::Closed,
+            Err(error) => PaneReclaimOutcome::Failed(error.message),
+        }
+    } else {
+        // Shared utility pane: interrupt the command but keep the pane
+        // alive; it is not owned by this exec session.
+        let _ = client.call_with_timeout(
+            "pane.send_keys",
+            json!({"pane_id": pane_id, "keys": ["C-c"]}),
+            PANE_RPC_TIMEOUT,
+        );
+        PaneReclaimOutcome::NotApplicable
+    };
+    cleanup_pane_files(script_path, spool);
+    let signal = if *close_on_complete {
+        if force { "SIGKILL" } else { "SIGTERM" }
+    } else {
+        "SIGINT"
+    };
+    complete_session(session, registry, None, Some(signal));
+    record_pane_reclaim(session, &outcome);
+    outcome
 }
 
 fn terminate_and_wait(session: &Arc<Session>) {
@@ -1947,6 +2123,105 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         ));
         ExecRegistry::new(path).unwrap()
+    }
+
+    /// #967: a failed `pane.close` during termination is reported and recorded
+    /// on the session status instead of being folded into the session close.
+    #[cfg(unix)]
+    #[test]
+    fn pane_kill_reports_close_failure_instead_of_claiming_reclaim() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let id = format!(
+            "es_pane_close_fail_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session(&id);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_str(
+                BufReader::new(stream.try_clone().unwrap())
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            assert_eq!(request["method"], "pane.close");
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"].clone(), "error": {"code": "close_failed", "message": "pane already gone"}})
+            )
+            .unwrap();
+        });
+
+        let outcome = terminate_session(&session, false, None);
+        assert!(matches!(outcome, PaneReclaimOutcome::Failed(_)));
+        let status = session_status(&session);
+        assert!(status.closed);
+        assert_eq!(status.pane_reclaimed, Some(false));
+        assert!(
+            status
+                .pane_reclaim_error
+                .as_deref()
+                .is_some_and(|error| error.contains("pane already gone")),
+            "{:?}",
+            status.pane_reclaim_error
+        );
+        server.join().unwrap();
+        fs::remove_file(socket).ok();
+    }
+
+    /// #967: a failed `pane.close` on the completion path is recorded on the
+    /// session status so reads do not claim a reclaimed pane.
+    #[cfg(unix)]
+    #[test]
+    fn pane_completion_close_failure_is_recorded_on_status() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let id = format!(
+            "es_pane_done_close_fail_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let (session, socket) = pane_session(&id);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Value = serde_json::from_str(
+                BufReader::new(stream.try_clone().unwrap())
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+            )
+            .unwrap();
+            assert_eq!(request["method"], "pane.close");
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"].clone(), "error": {"code": "close_failed", "message": "pane already gone"}})
+            )
+            .unwrap();
+        });
+        let spool = pane_spool(&session).clone();
+        fs::write(&spool.status, "0\n").unwrap();
+
+        assert!(refresh_pane_session(&session, None));
+        let status = session_status(&session);
+        assert!(status.closed);
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.pane_reclaimed, Some(false));
+        assert!(status.pane_reclaim_error.is_some());
+        server.join().unwrap();
+        fs::remove_file(socket).ok();
     }
 
     #[cfg(unix)]
@@ -2985,6 +3260,7 @@ mod tests {
                     exit_code: Some(0),
                     signal: None,
                     ended_at_ms: Some(now + 10),
+                    ..SessionStatus::default()
                 }),
             };
             write_session_spool(&path, &spool_session).unwrap();
@@ -3035,6 +3311,7 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 ended_at_ms: Some(ended_at_ms),
+                ..SessionStatus::default()
             }),
         })
     }

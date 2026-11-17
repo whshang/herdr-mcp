@@ -788,17 +788,27 @@ pub(crate) fn start_private_pane_session(
             }
         };
         let Some(pane_id) = extract_pane_id(&pane) else {
-            return private_pane_control_plane_error(
+            // The split may have created a pane whose id the response does not
+            // expose; without an id nothing can be closed or tracked, so the
+            // result must say so instead of claiming a clean start.
+            let mut result = private_pane_control_plane_error(
                 workspace_id,
                 command,
-                "pane.split returned no pane id".to_owned(),
+                "pane.split returned no pane id; the created pane is unaddressable and may remain open".to_owned(),
             );
+            if let Some(object) = result.as_object_mut() {
+                object.insert("created_exec_pane".to_owned(), json!(true));
+                object.insert("pane_reclaimed".to_owned(), json!(false));
+            }
+            return result;
         };
-        let _ = client.call_with_timeout(
-            "pane.rename",
-            json!({"pane_id": pane_id, "label": "herdr-mcp:exec"}),
-            PRE_SEND_TIMEOUT,
-        );
+        let pane_renamed = client
+            .call_with_timeout(
+                "pane.rename",
+                json!({"pane_id": pane_id, "label": "herdr-mcp:exec"}),
+                PRE_SEND_TIMEOUT,
+            )
+            .is_ok();
         if let Err(error) = client.call_with_timeout(
             "pane.wait_for_output",
             json!({
@@ -809,12 +819,10 @@ pub(crate) fn start_private_pane_session(
             }),
             Duration::from_secs(6),
         ) {
-            let _ = client.call_with_timeout(
-                "pane.close",
-                json!({"pane_id": pane_id}),
-                PRE_SEND_TIMEOUT,
-            );
-            return private_pane_control_plane_error(
+            let pane_reclaimed = client
+                .call_with_timeout("pane.close", json!({"pane_id": pane_id}), PRE_SEND_TIMEOUT)
+                .is_ok();
+            let mut result = private_pane_control_plane_error(
                 workspace_id,
                 command,
                 format!(
@@ -822,6 +830,12 @@ pub(crate) fn start_private_pane_session(
                     error.message
                 ),
             );
+            if let Some(object) = result.as_object_mut() {
+                object.insert("created_exec_pane".to_owned(), json!(true));
+                object.insert("pane_id".to_owned(), json!(pane_id));
+                object.insert("pane_reclaimed".to_owned(), json!(pane_reclaimed));
+            }
+            return result;
         }
 
         match registry.start_in_private_pane(effective_root, command, &pane_id) {
@@ -829,15 +843,24 @@ pub(crate) fn start_private_pane_session(
                 if let Some(object) = value.as_object_mut() {
                     object.insert("workspace".to_owned(), json!(workspace_id));
                     object.insert("created_exec_pane".to_owned(), json!(true));
+                    object.insert("pane_renamed".to_owned(), json!(pane_renamed));
                 }
                 value
             }
             Err(error) => {
                 if error.stage.proves_nothing_delivered() {
-                    let _ = client.call_with_timeout(
-                        "pane.close",
-                        json!({"pane_id": pane_id}),
-                        PRE_SEND_TIMEOUT,
+                    let pane_reclaimed = client
+                        .call_with_timeout(
+                            "pane.close",
+                            json!({"pane_id": pane_id}),
+                            PRE_SEND_TIMEOUT,
+                        )
+                        .is_ok();
+                    return private_pane_start_failure(
+                        workspace_id,
+                        &pane_id,
+                        command,
+                        error.with_pane_reclaimed(pane_reclaimed),
                     );
                 }
                 private_pane_start_failure(workspace_id, &pane_id, command, error)
@@ -904,6 +927,10 @@ fn run_oneshot_readonly(
             result.insert("pane_id".to_owned(), json!(pane_id));
             result.insert("created_exec_pane".to_owned(), json!(true));
             result.insert("one_shot_pane".to_owned(), json!(true));
+
+            if let Some(pane_renamed) = start.get("pane_renamed") {
+                result.insert("pane_renamed".to_owned(), pane_renamed.clone());
+            }
             result.insert("command".to_owned(), json!(command));
             result.insert("session_id".to_owned(), json!(session_id));
             result.insert("op_id".to_owned(), json!(session_id));
@@ -921,7 +948,14 @@ fn run_oneshot_readonly(
                 "project_root".to_owned(),
                 json!(effective_root.to_string_lossy()),
             );
-            for key in ["progress", "truncated", "compacted", "counts"] {
+            for key in [
+                "progress",
+                "truncated",
+                "compacted",
+                "counts",
+                "pane_reclaimed",
+                "pane_reclaim_error",
+            ] {
                 if let Some(value) = read.get(key) {
                     result.insert(key.to_owned(), value.clone());
                 }
@@ -933,17 +967,34 @@ fn run_oneshot_readonly(
             return Value::Object(result);
         }
         if started.elapsed() >= deadline {
-            // Reclaim the one-shot pane: the caller declared no side effect, so
-            // the command is terminated rather than left running in a pane no
-            // later call will address.
+            // Terminate and reclaim the one-shot pane: the caller declared no
+            // side effect, so the command is stopped rather than left running
+            // in a pane no later call will address. The pane-close outcome is
+            // reported verbatim; a control-plane failure must not be folded
+            // into "reclaimed".
             let killed = registry.kill(&session_id);
-            if killed.get("ok").and_then(Value::as_bool) != Some(true) {
-                let _ = client.call_with_timeout(
-                    "pane.close",
-                    json!({"pane_id": pane_id}),
-                    PRE_SEND_TIMEOUT,
-                );
-            }
+            let kill_closed_pane =
+                killed.get("pane_reclaimed").and_then(Value::as_bool) == Some(true);
+            let reclaim_attempted = killed.get("pane_reclaimed").and_then(Value::as_bool)
+                == Some(false)
+                || killed.get("ok").and_then(Value::as_bool) != Some(true);
+            // Kill only leaves the pane closed when its own pane.close
+            // succeeded; any other kill outcome gets one direct pane.close
+            // fallback, and the response reports the final observed state.
+            let fallback_close_error = (!kill_closed_pane && reclaim_attempted)
+                .then(|| {
+                    client
+                        .call_with_timeout(
+                            "pane.close",
+                            json!({"pane_id": pane_id}),
+                            PRE_SEND_TIMEOUT,
+                        )
+                        .err()
+                        .map(|error| error.message)
+                })
+                .flatten();
+            let pane_reclaimed =
+                kill_closed_pane || (reclaim_attempted && fallback_close_error.is_none());
             let mut result = Map::new();
             result.insert("ok".to_owned(), json!(false));
             result.insert("code".to_owned(), json!("exec_timeout"));
@@ -952,6 +1003,15 @@ fn run_oneshot_readonly(
             result.insert("pane_id".to_owned(), json!(pane_id));
             result.insert("created_exec_pane".to_owned(), json!(true));
             result.insert("one_shot_pane".to_owned(), json!(true));
+            if let Some(pane_renamed) = start.get("pane_renamed") {
+                result.insert("pane_renamed".to_owned(), pane_renamed.clone());
+            }
+            result.insert("pane_reclaimed".to_owned(), json!(pane_reclaimed));
+            if let Some(error) = fallback_close_error {
+                result.insert("pane_reclaim_error".to_owned(), json!(error));
+            } else if !pane_reclaimed && let Some(error) = killed.get("pane_reclaim_error") {
+                result.insert("pane_reclaim_error".to_owned(), error.clone());
+            }
             result.insert("command".to_owned(), json!(command));
             result.insert("session_id".to_owned(), json!(session_id));
             result.insert("op_id".to_owned(), json!(session_id));
@@ -972,7 +1032,11 @@ fn run_oneshot_readonly(
             add_working_warning(&mut result, working);
             result.insert(
                 "hint".to_owned(),
-                json!("the declared read-only command exceeded timeout_ms; its one-shot pane was terminated and reclaimed (no retained session). Re-run a bounded read-only command instead of reading this session."),
+                if pane_reclaimed {
+                    json!("the declared read-only command exceeded timeout_ms; its one-shot pane was terminated and reclaimed (no retained session). Re-run a bounded read-only command instead of reading this session.")
+                } else {
+                    json!("the declared read-only command exceeded timeout_ms and was terminated, but the one-shot pane could not be reclaimed; it may remain open. Inspect and close it via the returned pane_id before re-running.")
+                },
             );
             return Value::Object(result);
         }
@@ -1385,6 +1449,22 @@ fn private_pane_start_failure(
     } else {
         result.insert("delivery_state".to_owned(), json!("unknown"));
         exec_evidence::insert_uncertain_start(&mut result);
+    }
+    if let Some(session_id) = error.tracked_session_id {
+        result.insert("session_id".to_owned(), json!(session_id));
+        result.insert(
+            "hint".to_owned(),
+            json!("Command start outcome is uncertain; the one-shot pane is still running under the returned session_id, which herdr_exec_read/herdr_exec_kill can inspect or reclaim."),
+        );
+    }
+    if let Some(pane_reclaimed) = error.pane_reclaimed {
+        result.insert("pane_reclaimed".to_owned(), json!(pane_reclaimed));
+        if !pane_reclaimed {
+            result.insert(
+                "pane_reclaim_error".to_owned(),
+                json!("pane.close failed; the one-shot pane may remain orphaned"),
+            );
+        }
     }
     Value::Object(result)
 }
@@ -2441,6 +2521,322 @@ mod tests {
             1,
             "the one-shot pane must be reclaimed exactly once: {observed:?}"
         );
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// #967: when `pane.send_text` fails after bytes may have been delivered,
+    /// the one-shot pane is not abandoned: the start error stays
+    /// `delivery_state: unknown` and carries a `session_id` that
+    /// `herdr_exec_read`/`herdr_exec_kill` can inspect and reclaim.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_shot_send_text_failure_registers_a_trackable_pane_session() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&methods);
+        let server = thread::spawn(move || {
+            // split, rename, wait_for_output, send_text (error), then one
+            // pane.close from the kill that proves the session is tracked.
+            let mut closes = 0;
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(method.clone());
+                match method.as_str() {
+                    "pane.split" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"pane": {"pane_id": "w1:p9"}}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.send_text" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "error": {"code": "send_failed", "message": "pane socket closed mid-send"}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.close" => {
+                        closes += 1;
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"ok": true}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.rename" | "pane.wait_for_output" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"ok": true}})
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected Herdr method: {other}"),
+                }
+            }
+            assert_eq!(closes, 1);
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home
+            .join("Documents")
+            .join(format!("herdr-readonly-sendfail-{}", std::process::id()));
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+
+        let start =
+            start_private_pane_session(&client, &registry, "w1", &root, "printf 'read-only\\n'");
+
+        assert_eq!(start["ok"], false, "{start}");
+        assert_eq!(start["code"], "exec_start_failed", "{start}");
+        assert_eq!(start["delivery_state"], "unknown", "{start}");
+        let session_id = start["session_id"]
+            .as_str()
+            .expect("an after-send failure must return a trackable session_id")
+            .to_owned();
+        // The uncertain-delivery pane is addressable: reads see the session
+        // rather than session_not_found, and kill reclaims the owned pane.
+        let read = registry.read(&session_id, "both", 0, 65_536);
+        assert_eq!(read["ok"], true, "{read}");
+        assert_eq!(read["phase"], "running", "{read}");
+        let killed = registry.kill(&session_id);
+        assert_eq!(killed["ok"], true, "{killed}");
+        assert_eq!(killed["pane_reclaimed"], true, "{killed}");
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// #967: when the timeout kill's own `pane.close` fails and the direct
+    /// fallback close also fails, the timeout result reports
+    /// `pane_reclaimed: false` instead of claiming the pane was reclaimed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_shot_timeout_reports_unreclaimed_pane_when_close_fails() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            // split, rename, wait_for_output, send_text, then two pane.close
+            // failures (the kill's own close and the direct fallback).
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                match method.as_str() {
+                    "pane.split" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"pane": {"pane_id": "w1:p9"}}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.close" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "error": {"code": "close_failed", "message": "pane already gone"}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.rename" | "pane.wait_for_output" | "pane.send_text" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"ok": true}})
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected Herdr method: {other}"),
+                }
+            }
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home
+            .join("Documents")
+            .join(format!("herdr-readonly-closefail-{}", std::process::id()));
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &test_store(),
+            &json!({
+                "workspace": "w1",
+                "command": "printf 'read-only\\n'",
+                "intent": "read_only",
+                "timeout_ms": 300,
+            }),
+        );
+
+        assert_eq!(result["code"], "exec_timeout", "{result}");
+        assert_eq!(result["one_shot_pane"], true, "{result}");
+        assert_eq!(result["pane_reclaimed"], false, "{result}");
+        assert!(result["pane_reclaim_error"].is_string(), "{result}");
+        assert!(
+            result["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("could not be reclaimed")),
+            "{result}"
+        );
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// #967: a `pane.split` response without a pane id leaves the new pane
+    /// unaddressable; the result must say it could not be reclaimed instead of
+    /// pretending the start failed cleanly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_shot_split_without_pane_id_reports_unreclaimed_pane() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "pane.split");
+            writeln!(
+                stream,
+                "{}",
+                json!({"id": request["id"].clone(), "result": {"ok": true}})
+            )
+            .unwrap();
+        });
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+
+        let result =
+            start_private_pane_session(&client, &registry, "w1", &base, "printf 'read-only\\n'");
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["code"], "private_pane_unavailable", "{result}");
+        assert_eq!(result["created_exec_pane"], true, "{result}");
+        assert_eq!(result["pane_reclaimed"], false, "{result}");
+        assert!(
+            result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("unaddressable")),
+            "{result}"
+        );
+        server.join().unwrap();
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// #967: a failed `pane.rename` stays observable on the result; it must not
+    /// fail the start, but it must not be invisible either.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_shot_pane_rename_failure_is_observable_on_timeout() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            // split, rename (error), wait_for_output, send_text, pane.close.
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                match method.as_str() {
+                    "pane.split" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"pane": {"pane_id": "w1:p9"}}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.rename" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "error": {"code": "rename_failed", "message": "rename rejected"}})
+                        )
+                        .unwrap();
+                    }
+                    "pane.wait_for_output" | "pane.send_text" | "pane.close" => {
+                        writeln!(
+                            stream,
+                            "{}",
+                            json!({"id": request["id"].clone(), "result": {"ok": true}})
+                        )
+                        .unwrap();
+                    }
+                    other => panic!("unexpected Herdr method: {other}"),
+                }
+            }
+        });
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set on macOS"));
+        let root = home
+            .join("Documents")
+            .join(format!("herdr-readonly-rename-{}", std::process::id()));
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &test_store(),
+            &json!({
+                "workspace": "w1",
+                "command": "printf 'read-only\\n'",
+                "intent": "read_only",
+                "timeout_ms": 300,
+            }),
+        );
+
+        assert_eq!(result["code"], "exec_timeout", "{result}");
+        assert_eq!(result["pane_renamed"], false, "{result}");
+        assert_eq!(result["pane_reclaimed"], true, "{result}");
         server.join().unwrap();
         drop(registry);
         let _ = fs::remove_dir_all(base);
