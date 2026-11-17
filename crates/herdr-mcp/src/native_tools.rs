@@ -15,9 +15,13 @@ pub fn inspect(
     cache: Option<&EventCache>,
     exec: Option<&ExecRegistry>,
 ) -> Value {
+    // Capture the cursor before reading any cached or live snapshot. Events
+    // arriving after this point are intentionally returned by herdr_since.
+    let since_cursor = cache.map(EventCache::current_cursor).unwrap_or(0);
     let cached_snapshot = cache.and_then(EventCache::fresh_snapshot);
     let mut view = inspect::inspect_core(client, cached_snapshot);
     runtime_meta::augment_inspect(&mut view, cache, exec);
+    annotate_since_cursor(&mut view, since_cursor);
     view
 }
 
@@ -28,6 +32,9 @@ pub fn inspect_with_selection(
     selection: &crate::runtime_adapter::RuntimeBackendSelection,
     core_client: Option<&crate::runtime_adapter::HerdrCoreClient>,
 ) -> Value {
+    // Capture the cursor before reading any cached or live snapshot. Events
+    // arriving after this point are intentionally returned by herdr_since.
+    let since_cursor = cache.map(EventCache::current_cursor).unwrap_or(0);
     let cached_snapshot = cache.and_then(EventCache::fresh_snapshot);
     let mut view = match core_client {
         Some(core_client)
@@ -38,7 +45,14 @@ pub fn inspect_with_selection(
         _ => inspect::inspect_core_with_selection(client, cached_snapshot, selection),
     };
     runtime_meta::augment_inspect(&mut view, cache, exec);
+    annotate_since_cursor(&mut view, since_cursor);
     view
+}
+
+fn annotate_since_cursor(view: &mut Value, since_cursor: u64) {
+    if let Some(object) = view.as_object_mut() {
+        object.insert("since_cursor".to_owned(), json!(since_cursor));
+    }
 }
 
 pub fn since(
@@ -692,6 +706,15 @@ mod tests {
         let result = call(&client, "ping", json!([1, 2, 3]));
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "invalid_params");
+    }
+
+    #[test]
+    fn inspect_cursor_is_directly_consumable_by_since() {
+        let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
+        let cursor = cache.current_cursor();
+        let result = since(&cache, cursor, None, Ok(None));
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["cursor"], cursor);
     }
 
     #[test]

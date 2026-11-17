@@ -9,7 +9,9 @@ Own: `herdr_methods`, `herdr_inspect`, `herdr_call`, `herdr_since`.
 
 ## State and targets
 
-Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Prefer `herdr_since(cursor)` for incremental changes. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
+Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Save its `since_cursor` and pass that exact integer to `herdr_since(cursor)` for incremental changes; the cursor is captured before the inspect snapshot, so events arriving during snapshot assembly are included by the following since call. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
+
+The compatibility fields `semantic_judgment` and `workstation_info.native_migration` are deprecated duplicates. Read the top-level `semantic` and top-level `native_migration` fields instead; the duplicate fields remain in the full inspect view for existing clients.
 
 Connected-tool shape:
 
