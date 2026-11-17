@@ -18,6 +18,7 @@ mod contract;
 mod credential_store;
 mod dev;
 mod device_name;
+mod device_refs;
 mod events;
 mod exec_compact;
 mod exec_evidence;

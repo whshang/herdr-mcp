@@ -107,8 +107,22 @@ export function isDeviceAwareRef(value: unknown): boolean {
 
 /** Workspace fields must carry workspace refs; pane fields must carry pane refs. */
 export const WORKSPACE_REF_FIELDS = new Set(["workspace", "workspace_id"]);
-export const PANE_REF_FIELDS = new Set(["pane_id", "pane", "target"]);
+export const PANE_REF_FIELDS = new Set(["pane_id", "pane", "target", "split_from", "parent_target"]);
+/**
+ * Scan-only fields contribute device evidence for routing and conflict
+ * detection but are never unwrapped: `repair_of` carries a receipt id whose
+ * bare form is not a workspace/pane id, so a ref here is routing evidence
+ * only, and a malformed or foreign-device value still fails closed.
+ */
+const SCAN_ONLY_REF_FIELDS = new Set(["repair_of"]);
 const REF_FIELDS = new Set([...WORKSPACE_REF_FIELDS, ...PANE_REF_FIELDS]);
+const ALL_SCANNED_FIELDS = new Set([...REF_FIELDS, ...SCAN_ONLY_REF_FIELDS]);
+/**
+ * Nested containers whose own ref fields are scanned one level deep:
+ * dispatch `spawn` objects carry `workspace_id` / `split_from` which may be
+ * device-aware refs exactly like their top-level counterparts.
+ */
+const NESTED_REF_CONTAINERS = new Set(["spawn"]);
 
 export type RefKind = "workspace" | "pane";
 export function refPayloadKind(payload: DeviceRefPayload): RefKind | null {
@@ -129,27 +143,51 @@ function fieldRefKind(field: string): RefKind | null {
   return null;
 }
 
-function extractFromObject(args: Record<string, unknown>): { deviceId: string; field: string; raw: string; kind: "ref" } | null {
-  let refCandidate: { deviceId: string; field: string; raw: string } | null = null;
+type RefHit = { deviceId: string; field: string; raw: string };
 
-  for (const [key, value] of Object.entries(args)) {
+/**
+ * Scan one flat object level for ref fields. Returns a failure marker on the
+ * first malformed prefix or kind mismatch, otherwise the first decoded hit and
+ * every decoded device id (for cross-device conflict detection).
+ */
+function scanRefFields(
+  obj: Record<string, unknown>,
+  fieldPrefix: string,
+): { failure: RefHit | null; first: RefHit | null; devices: string[] } {
+  let first: RefHit | null = null;
+  const devices: string[] = [];
+  for (const [key, value] of Object.entries(obj)) {
     if (typeof value !== "string") continue;
-    if (!REF_FIELDS.has(key)) continue;
+    if (!ALL_SCANNED_FIELDS.has(key)) continue;
+    const field = `${fieldPrefix}${key}`;
     const decoded = decodeDeviceRef(value);
     if (!decoded) {
-      if (value.startsWith(REF_PREFIX)) return { deviceId: "__malformed__", field: key, raw: value, kind: "ref" };
+      if (value.startsWith(REF_PREFIX)) {
+        return { failure: { deviceId: "__malformed__", field, raw: value }, first, devices };
+      }
       continue;
     }
     const expected = fieldRefKind(key);
     const actual = refPayloadKind(decoded);
     // Wrong ref type for the target field must fail closed, not silently coerce
     if (expected && actual && expected !== actual) {
-      return { deviceId: "__type_mismatch__", field: key, raw: value, kind: "ref" };
+      return { failure: { deviceId: "__type_mismatch__", field, raw: value }, first, devices };
     }
-    if (!refCandidate) refCandidate = { deviceId: decoded.d, field: key, raw: value };
+    devices.push(decoded.d);
+    if (!first) first = { deviceId: decoded.d, field, raw: value };
   }
+  return { failure: null, first, devices };
+}
 
-  // Also check herdr_call params (JSON string or object) for embedded pane/workspace
+/**
+ * Iterate every scanned level of a call argument object: the top level, the
+ * `params` object (JSON string or object), and one level of `spawn` inside
+ * either. Yields `[object, fieldPrefix]` pairs for `scanRefFields`.
+ */
+function* scannedLevels(
+  args: Record<string, unknown>,
+): Generator<[Record<string, unknown>, string]> {
+  yield [args, ""];
   const parsedParams: Record<string, unknown> | null = (() => {
     if (typeof args.params === "string") {
       try {
@@ -166,42 +204,36 @@ function extractFromObject(args: Record<string, unknown>): { deviceId: string; f
     }
     return null;
   })();
-  if (parsedParams) {
-    for (const [k, v] of Object.entries(parsedParams)) {
-      if (typeof v !== "string") continue;
-      if (!REF_FIELDS.has(k)) continue;
-      const decoded = decodeDeviceRef(v);
-      if (!decoded) {
-        if (v.startsWith(REF_PREFIX)) return { deviceId: "__malformed__", field: `params.${k}`, raw: v, kind: "ref" };
-        continue;
+  if (parsedParams) yield [parsedParams, "params."];
+  for (const [obj, prefix] of [[args, ""] as const, [parsedParams, "params."] as const]) {
+    if (!obj) continue;
+    for (const container of NESTED_REF_CONTAINERS) {
+      const nested = obj[container];
+      if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+        yield [nested as Record<string, unknown>, `${prefix}${container}.`];
       }
-      const expected = fieldRefKind(k);
-      const actual = refPayloadKind(decoded);
-      if (expected && actual && expected !== actual) {
-        return { deviceId: "__type_mismatch__", field: `params.${k}`, raw: v, kind: "ref" };
-      }
-      if (!refCandidate) refCandidate = { deviceId: decoded.d, field: `params.${k}`, raw: v };
+    }
+  }
+}
+
+function extractFromObject(args: Record<string, unknown>): { deviceId: string; field: string; raw: string; kind: "ref" } | null {
+  let refCandidate: { deviceId: string; field: string; raw: string } | null = null;
+  const devices = new Set<string>();
+
+  for (const [obj, prefix] of scannedLevels(args)) {
+    const scan = scanRefFields(obj, prefix);
+    if (scan.failure) {
+      return { deviceId: scan.failure.deviceId, field: scan.failure.field, raw: scan.failure.raw, kind: "ref" };
+    }
+    for (const d of scan.devices) devices.add(d);
+    if (!refCandidate && scan.first) {
+      refCandidate = { deviceId: scan.first.deviceId, field: scan.first.field, raw: scan.first.raw };
     }
   }
 
   if (refCandidate) {
-    // Detect conflicting device_ids among all ref fields
-    const devices = new Set<string>();
-    for (const [k, v] of Object.entries(args)) {
-      if (!REF_FIELDS.has(k) || typeof v !== "string") continue;
-      const d = decodeDeviceRef(v);
-      if (d) devices.add(d.d);
-    }
-    // Include params-embedded refs
-    if (parsedParams) {
-      for (const [k, v] of Object.entries(parsedParams)) {
-        if (!REF_FIELDS.has(k) || typeof v !== "string") continue;
-        const d = decodeDeviceRef(v);
-        if (d) devices.add(d.d);
-      }
-    }
+    // Conflicting refs fail closed as ambiguous before any routing
     if (devices.size > 1) {
-      // Conflicting refs fail closed as ambiguous before any routing
       return { deviceId: "__conflict__", field: refCandidate.field, raw: refCandidate.raw, kind: "ref" };
     }
     return { deviceId: refCandidate.deviceId, field: refCandidate.field, raw: refCandidate.raw, kind: "ref" };
@@ -220,64 +252,58 @@ export function extractDeviceIdFromArgs(args: Record<string, unknown>): { device
  * Strict: workspace fields unwrap only w-payloads, pane fields only p-payloads.
  * Mismatched types are left intact here – the caller must have already failed
  * closed via extractDeviceIdFromArgs type-mismatch detection; we avoid silent coerce.
+ *
+ * One flat object level plus `spawn` containers one level deep. Nested
+ * containers are cloned before mutation so caller-owned objects are never
+ * written. Mutates `obj`; returns true when anything changed.
  */
-export function unwrapDeviceRefs(args: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...args };
+function unwrapRefFieldsInPlace(obj: Record<string, unknown>): boolean {
+  let changed = false;
   for (const key of WORKSPACE_REF_FIELDS) {
-    const value = out[key];
+    const value = obj[key];
     if (typeof value !== "string") continue;
     const decoded = decodeDeviceRef(value);
     if (!decoded) continue;
-    if (decoded.w) out[key] = decoded.w;
+    if (decoded.w) {
+      obj[key] = decoded.w;
+      changed = true;
+    }
     // pane payload in workspace field is type-mismatch – do not coerce
   }
   for (const key of PANE_REF_FIELDS) {
-    const value = out[key];
+    const value = obj[key];
     if (typeof value !== "string") continue;
     const decoded = decodeDeviceRef(value);
     if (!decoded) continue;
-    if (decoded.p) out[key] = decoded.p;
+    if (decoded.p) {
+      obj[key] = decoded.p;
+      changed = true;
+    }
     // workspace payload in pane field is type-mismatch – do not coerce
   }
+  for (const container of NESTED_REF_CONTAINERS) {
+    const nested = obj[container];
+    if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+      const copy: Record<string, unknown> = { ...(nested as Record<string, unknown>) };
+      obj[container] = copy;
+      if (unwrapRefFieldsInPlace(copy)) changed = true;
+    }
+  }
+  return changed;
+}
+
+export function unwrapDeviceRefs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...args };
+  unwrapRefFieldsInPlace(out);
   // Handle herdr_call params (string or object) with same strictness
   if (typeof out.params === "string") {
     try {
       const parsed = JSON.parse(out.params as string) as Record<string, unknown>;
-      let changed = false;
-      for (const k of WORKSPACE_REF_FIELDS) {
-        const v = parsed[k];
-        if (typeof v !== "string") continue;
-        const d = decodeDeviceRef(v);
-        if (!d || !d.w) continue;
-        parsed[k] = d.w;
-        changed = true;
-      }
-      for (const k of PANE_REF_FIELDS) {
-        const v = parsed[k];
-        if (typeof v !== "string") continue;
-        const d = decodeDeviceRef(v);
-        if (!d || !d.p) continue;
-        parsed[k] = d.p;
-        changed = true;
-      }
-      if (changed) out.params = JSON.stringify(parsed);
+      if (unwrapRefFieldsInPlace(parsed)) out.params = JSON.stringify(parsed);
     } catch {}
   } else if (out.params !== null && typeof out.params === "object" && !Array.isArray(out.params)) {
     const parsed: Record<string, unknown> = { ...(out.params as Record<string, unknown>) };
-    for (const k of WORKSPACE_REF_FIELDS) {
-      const v = parsed[k];
-      if (typeof v !== "string") continue;
-      const d = decodeDeviceRef(v);
-      if (!d || !d.w) continue;
-      parsed[k] = d.w;
-    }
-    for (const k of PANE_REF_FIELDS) {
-      const v = parsed[k];
-      if (typeof v !== "string") continue;
-      const d = decodeDeviceRef(v);
-      if (!d || !d.p) continue;
-      parsed[k] = d.p;
-    }
+    unwrapRefFieldsInPlace(parsed);
     out.params = parsed;
   }
   // Strip legacy untrusted binding keys if present (caller-controlled, not trusted for routing)
