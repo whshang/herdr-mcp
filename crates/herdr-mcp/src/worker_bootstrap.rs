@@ -1022,6 +1022,61 @@ fn ensure_worker_version_can_advance(current: &str, target: &str) -> Result<(), 
     Ok(())
 }
 
+fn same_bootstrap_origin(left: Option<&str>, right: Option<&str>) -> bool {
+    let normalize = |value: Option<&str>| -> Option<String> {
+        let mut config = crate::config::Config::default();
+        config.set_edge_public_origin(value?).ok()?;
+        config.edge_public_origin
+    };
+    match (normalize(left), normalize(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn validate_local_bootstrap_binding(
+    journal: Option<&BootstrapJournal>,
+    config: &crate::config::Config,
+) -> Result<(), String> {
+    match journal.and_then(|value| value.canonical_device_id.as_deref()) {
+        Some(device) => {
+            let journal = journal.unwrap();
+            if journal.phase < Phase::SecretsProvisioned
+                || journal.phase >= Phase::OperationalReady
+                || journal.workers_dev_origin.as_deref().is_none()
+                || config.edge_device_id.as_deref() != Some(device)
+                || !same_bootstrap_origin(
+                    config.edge_public_origin.as_deref(),
+                    journal.workers_dev_origin.as_deref(),
+                )
+            {
+                return Err("bootstrap journal and local device binding are incomplete or do not match; refusing recovery".to_owned());
+            }
+        }
+        None if config.edge_device_id.is_some() => {
+            return Err("this computer is already enrolled or has an incomplete bootstrap journal; refusing first-Worker enrollment".to_owned());
+        }
+        None if journal.is_some_and(|value| value.phase >= Phase::DeviceEnrolled) => {
+            return Err(
+                "bootstrap journal is missing its canonical device; refusing recovery".to_owned(),
+            );
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn resume_persisted_bootstrap<L, V, A>(load: L, verify: V, activate: A) -> Result<(), String>
+where
+    L: FnOnce() -> Result<crate::worker::EnrolledCredential, String>,
+    V: FnOnce(&crate::worker::EnrolledCredential) -> Result<(), String>,
+    A: FnOnce(&str) -> Result<(), String>,
+{
+    let enrolled = load()?;
+    verify(&enrolled)?;
+    activate(&enrolled.device_id)
+}
+
 fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String> {
     let source_commit = crate::runtime_meta::compiled_source_commit()
         .filter(|value| valid_source_commit(value))
@@ -1035,21 +1090,7 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
 
     let local_config =
         crate::config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
-    if let Some(device_id) = local_config.edge_device_id.as_deref() {
-        let resumable = existing_journal
-            .as_ref()
-            .and_then(|journal| journal.canonical_device_id.as_deref())
-            == Some(device_id)
-            && existing_journal
-                .as_ref()
-                .map(|journal| journal.phase < Phase::OperationalReady)
-                .unwrap_or(false);
-        if !resumable {
-            return Err(format!(
-                "this computer is already enrolled as {device_id}; use `herdr-mcp worker pair` to add another computer instead of first-Worker bootstrap"
-            ));
-        }
-    }
+    validate_local_bootstrap_binding(existing_journal.as_ref(), &local_config)?;
 
     println!(
         "{}",
@@ -1209,6 +1250,9 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
         });
     }
     write_journal(&journal_path, &journal)?;
+    if journal.phase == Phase::SecretsProvisioned && journal.canonical_device_id.is_none() {
+        return Err("bootstrap enrollment state is ambiguous; refusing to reprovision secrets or create another device".to_owned());
+    }
 
     let subdomain = match existing_subdomain {
         Some(value) => value,
@@ -1224,6 +1268,14 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
         }
     };
     let edge_origin = format!("https://{worker_name}.{subdomain}.workers.dev");
+    if journal.canonical_device_id.is_some()
+        && !same_bootstrap_origin(journal.workers_dev_origin.as_deref(), Some(&edge_origin))
+    {
+        return Err(
+            "bootstrap journal origin does not match the Cloudflare Worker; refusing recovery"
+                .to_owned(),
+        );
+    }
     journal.workers_dev_origin = Some(edge_origin.clone());
     journal.advance(Phase::SubdomainReady);
     write_journal(&journal_path, &journal)?;
@@ -1297,7 +1349,23 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
         )
     );
 
-    if journal.phase < Phase::DeviceEnrolled {
+    if journal.phase < Phase::DeviceEnrolled && journal.canonical_device_id.is_some() {
+        let device_id = journal.canonical_device_id.as_deref().unwrap();
+        resume_persisted_bootstrap(
+            || crate::worker::stored_bootstrap_credential(paths, &edge_origin, device_id),
+            |enrolled| verify_device_fleet_admin(&edge_http, &edge_origin, enrolled),
+            |device| crate::worker::resume_bootstrap_activation(paths, device),
+        )?;
+        journal.advance(Phase::DeviceEnrolled);
+        write_journal(&journal_path, &journal)?;
+    } else if journal.phase >= Phase::DeviceEnrolled {
+        let device_id = journal
+            .canonical_device_id
+            .as_deref()
+            .ok_or_else(|| "bootstrap journal is missing its canonical device".to_owned())?;
+        let enrolled = crate::worker::stored_bootstrap_credential(paths, &edge_origin, device_id)?;
+        verify_device_fleet_admin(&edge_http, &edge_origin, &enrolled)?;
+    } else if journal.phase < Phase::DeviceEnrolled {
         let pepper = random_secret(32)?;
         let operator = random_secret(32)?;
         let operator_expiry = SecretBytes::from_string(temporary_operator_expiry_ms().to_string())?;
@@ -1343,6 +1411,10 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
         let enrolled =
             create_and_consume_first_pairing(&edge_http, &edge_origin, &operator, name.as_deref())?;
         verify_device_fleet_admin(&edge_http, &edge_origin, &enrolled)?;
+        // Record the intended device before binding it locally. If this write or
+        // the process fails, an incomplete binding is never treated as an empty fleet.
+        journal.canonical_device_id = Some(enrolled.device_id.clone());
+        write_journal(&journal_path, &journal)?;
         let code =
             crate::worker::adopt_bootstrap_enrollment(paths, &edge_origin, enrolled.clone())?;
         if code != ExitCode::SUCCESS {
@@ -1350,7 +1422,7 @@ fn run_inner(paths: &RuntimePaths, language: Locale) -> Result<ExitCode, String>
                 "local canonical-device activation did not complete successfully".to_owned(),
             );
         }
-        journal.canonical_device_id = Some(enrolled.device_id.clone());
+        // The identity was journaled before local credential/config persistence.
         journal.advance(Phase::DeviceEnrolled);
         write_journal(&journal_path, &journal)?;
     }
@@ -3214,6 +3286,27 @@ fn verify_device_fleet_admin(
                 .to_owned(),
         );
     }
+    verify_active_device_row(&payload, &enrolled.device_id)?;
+    Ok(())
+}
+
+fn verify_active_device_row(payload: &Value, expected: &str) -> Result<(), String> {
+    let devices = payload
+        .get("devices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "authenticated device registry is missing".to_owned())?;
+    let mut matching = devices
+        .iter()
+        .filter(|row| row.get("device_id").and_then(Value::as_str) == Some(expected));
+    let active = matching
+        .next()
+        .is_some_and(|row| row.get("authorization").and_then(Value::as_str) == Some("active"));
+    if !active || matching.next().is_some() {
+        return Err(
+            "authenticated registry does not contain exactly one active canonical device"
+                .to_owned(),
+        );
+    }
     Ok(())
 }
 
@@ -4114,6 +4207,12 @@ fn write_journal(path: &Path, journal: &BootstrapJournal) -> Result<(), String> 
     write_private_file(&tmp, &bytes)?;
     fs::rename(&tmp, path)
         .map_err(|error| format!("cannot atomically replace bootstrap journal: {error}"))?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("cannot sync bootstrap journal directory: {error}"))?;
+    }
     Ok(())
 }
 
@@ -4356,6 +4455,130 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_registry_requires_unique_active_canonical_device() {
+        let id = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let active = json!({"device_id": id, "authorization": "active"});
+        assert!(verify_active_device_row(&json!({"devices": [active.clone()]}), id).is_ok());
+        assert!(verify_active_device_row(&json!({"devices": []}), id).is_err());
+        assert!(
+            verify_active_device_row(&json!({"devices": [active.clone(), active]}), id).is_err()
+        );
+        assert!(
+            verify_active_device_row(
+                &json!({"devices": [{"device_id": id, "authorization": "revoked"}]}),
+                id
+            )
+            .is_err()
+        );
+        assert!(verify_active_device_row(&json!({"devices": [{"device_id": "dev_01ARZ3NDEKTSV4RRFFQ69G5FAW", "authorization": "active"}]}), id).is_err());
+    }
+
+    #[test]
+    fn bootstrap_journal_records_only_device_linkage_and_propagates_write_failure() {
+        let mut journal = BootstrapJournal::new(
+            "a".repeat(40),
+            "1.0.0".into(),
+            "account".into(),
+            "herdr-edge".into(),
+        );
+        journal.phase = Phase::SecretsProvisioned;
+        journal.workers_dev_origin = Some("https://edge.example".into());
+        journal.canonical_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+        let json = serde_json::to_string(&journal).unwrap();
+        assert!(json.contains("dev_01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+        assert!(!json.contains("devsec_"));
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-journal-failure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("not-a-directory");
+        fs::write(&parent, b"file").unwrap();
+        assert!(write_journal(&parent.join("journal.json"), &journal).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bootstrap_resume_requires_exact_complete_local_binding() {
+        let device = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let origin = "https://herdr-edge.example.workers.dev";
+        let mut journal = BootstrapJournal::new(
+            "a".repeat(40),
+            "1.0.0".into(),
+            "account".into(),
+            "herdr-edge".into(),
+        );
+        journal.phase = Phase::SecretsProvisioned;
+        journal.workers_dev_origin = Some(origin.into());
+        journal.canonical_device_id = Some(device.into());
+        let mut config = crate::config::Config {
+            edge_device_id: Some(device.into()),
+            edge_public_origin: Some(origin.into()),
+            ..crate::config::Config::default()
+        };
+        assert!(validate_local_bootstrap_binding(Some(&journal), &config).is_ok());
+        config.edge_public_origin = Some("https://foreign.example".into());
+        assert!(validate_local_bootstrap_binding(Some(&journal), &config).is_err());
+        config.edge_public_origin = Some(origin.into());
+        config.edge_device_id = None;
+        assert!(validate_local_bootstrap_binding(Some(&journal), &config).is_err());
+        config.edge_device_id = Some("dev_01ARZ3NDEKTSV4RRFFQ69G5FAW".into());
+        assert!(validate_local_bootstrap_binding(Some(&journal), &config).is_err());
+        assert!(validate_local_bootstrap_binding(None, &config).is_err());
+    }
+
+    #[test]
+    fn bootstrap_retry_authenticates_before_activation_and_fails_closed() {
+        use std::cell::Cell;
+        let device = "dev_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let credential = || crate::worker::EnrolledCredential {
+            device_id: device.into(),
+            workstation_id: device.into(),
+            device_secret: "test-secret".into(),
+            recovered_existing: false,
+        };
+        let activations = Cell::new(0);
+        let load = || Ok(credential());
+        let verify = |value: &crate::worker::EnrolledCredential| {
+            assert_eq!(value.device_id, device);
+            Ok(())
+        };
+        let first = resume_persisted_bootstrap(load, verify, |_| {
+            activations.set(activations.get() + 1);
+            Err("access denied".into())
+        });
+        assert!(first.unwrap_err().contains("access denied"));
+        resume_persisted_bootstrap(
+            || Ok(credential()),
+            verify,
+            |id| {
+                assert_eq!(id, device);
+                activations.set(activations.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(activations.get(), 2);
+        assert!(
+            resume_persisted_bootstrap(
+                || Err("missing credential".into()),
+                verify,
+                |_| panic!("activation must not run")
+            )
+            .is_err()
+        );
+        assert!(
+            resume_persisted_bootstrap(
+                || Ok(credential()),
+                |_| Err("foreign device".into()),
+                |_| panic!("activation must not run")
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn first_worker_bootstrap_supports_desktop_platforms() {

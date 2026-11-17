@@ -64,6 +64,8 @@ herdr-mcp worker bootstrap
 
 This command owns Cloudflare API preflight, Account/`workers.dev` resolution, existing-Worker detection, release manifest + `herdr-edge-<version>.mjs` artifact attestation, Worker/DO bootstrap, device enrollment, credentials, and production Link reconciliation. It does not run Wrangler or require a source checkout.
 
+If first-device enrollment saved the credential and configuration but local activation failed, fix the reported local error and rerun `worker bootstrap` on the same computer and OS account. The retry authenticates the exact journal-bound device before activation; do not delete its credential or journal, re-pair, or provision the fleet secrets again. Missing, revoked, or mismatched credentials fail closed; this retry cannot restore a credential already revoked or deleted by an earlier runtime.
+
 Choose the public origin once, before Connector creation:
 
 - If the Account has one clearly suitable active zone, prefer a dedicated Custom Domain such as `https://herdr-mcp.example.com/mcp`.
