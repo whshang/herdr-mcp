@@ -439,7 +439,7 @@ test("mcp handler exposes device metadata in ChatGPT text", async () => {
   assert.equal(decodeDeviceRef(text.result.workspaces[0].workspace_ref).d, DEV_A, "workspace ref must retain device affinity");
 });
 
-test("nested spawn ref fields are scanned for routing and conflicts", async () => {
+test("user routes nested spawn refs | Given spawn fields carry device-bound refs | When extractDeviceIdFromArgs scans args | Then evidence, mismatches and conflicts surface from spawn.*", async () => {
   const refA = encodeDeviceRef(DEV_A, "w1");
   const paneA = encodeDeviceRef(DEV_A, undefined, "w1:p1");
   const refB = encodeDeviceRef(DEV_B, "w2");
@@ -466,7 +466,7 @@ test("nested spawn ref fields are scanned for routing and conflicts", async () =
   assert.equal(ext6.deviceId, "__malformed__");
 });
 
-test("split_from / parent_target / repair_of are ref-scanned fields", async () => {
+test("user gets ref scanning on pane and repair fields | Given split_from/parent_target/repair_of args | When they carry herdr_ref values | Then device evidence resolves and conflicts fail closed", async () => {
   const paneA = encodeDeviceRef(DEV_A, undefined, "w1:p1");
   const refA = encodeDeviceRef(DEV_A, "w1");
   const refB = encodeDeviceRef(DEV_B, "w2");
@@ -484,7 +484,7 @@ test("split_from / parent_target / repair_of are ref-scanned fields", async () =
   assert.equal(ext.deviceId, "__conflict__");
 });
 
-test("unwrapDeviceRefs unwraps nested spawn refs strictly by type", async () => {
+test("user gets bare ids inside nested spawn | Given refs in spawn and params.spawn | When unwrapDeviceRefs forwards args | Then local refs become bare ids and caller objects stay unchanged", async () => {
   const refA = encodeDeviceRef(DEV_A, "w1");
   const paneA = encodeDeviceRef(DEV_A, undefined, "w1:p1");
   const out = unwrapDeviceRefs({ spawn: { kind: "pi", workspace_id: refA, split_from: paneA } });
