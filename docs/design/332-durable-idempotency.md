@@ -2,7 +2,7 @@
 
 状态：设计待批准，未改 schema，未改 Rust，未改变 Runtime Execution Contract。
 
-基线：`origin/main` `5d6a35c4b00a52ce30eeb9ded473b5057872d691`。
+基线：`origin/main` `83176c7b846c38b6397c7007bc76bf5951539782`。
 
 关联：issue #332，差距分析评论 `6937170052`。
 
@@ -20,7 +20,7 @@ D-1 只解决“调用者带着同一个键重试时，重启后的 Runtime 仍�
 - 账本记录了调用范围、请求摘要、状态、时间和结果摘要，但结果只保留 digest、字节数和错误码投影，避免把正文、输出或文件内容放回 `request.status`，见 `request_ledger.rs:130-239`。
 - 账本的 key 是 `HashMap` 内存项，容量为 1024，空闲 30 分钟后淘汰，见 `request_ledger.rs:19-22`、`:271-279`。`StateStore::open` 每次都会构造新的空账本，见 `state_store.rs:839-879`。
 - 当前 `request_ledger.rs:184-190` 的 `DefaultHasher` 只适合进程内摘要。D-1 的持久化 key 必须改用跨进程稳定的域隔离 SHA-256，不能把这个摘要直接写成跨重启协议。
-- `operations` 表在 schema 1 起就有 `op_id`、`kind`、`idempotency_key`、`request_hash`、`phase`、`state`、`runtime_generation`、`boot_id`、时间和过期字段；`op_id` 是全局主键（`state_store/schema.rs:47-49`），`result_json` 由 migration 2 追加，kind/key 唯一索引见 `state_store/schema.rs:90-92`。`SCHEMA_VERSION` 当前为 16，且代码要求高于已知 migration 的数据库直接拒绝，见 `state_store.rs:64-83`。
+- `operations` 表在 schema 1 起就有 `kind`、`idempotency_key`、`request_hash`、`phase`、`state`、`runtime_generation`、`boot_id`、时间和过期字段；`result_json` 由 migration 2 追加，见 `state_store/schema.rs:46-93`。`SCHEMA_VERSION` 当前为 16，且代码要求高于已知 migration 的数据库直接拒绝，见 `state_store.rs:64-83`。
 - 现有 `herdr_exec` 预留使用 `expires_at = NULL`，所以 pending 记录不会因为时间经过而释放；明确终态才使用 `EXEC_RECORD_TTL_MS = 60` 分钟，见 `utility_exec.rs:31-40`、`:291-294`、`:424-439`。
 - 当前 runtime contract 已是 epoch 6，epoch 5 是上一版带 `intent` 与 `idempotency_key` 的 `herdr_exec` 契约，见 `contract.rs:22-42`。D-1 文档不直接修改 frozen 18 工具目录或契约描述。
 
@@ -35,7 +35,7 @@ D-1 只解决“调用者带着同一个键重试时，重启后的 Runtime 仍�
 
 `idempotent_write` 是调用者对命令语义的声明，不是 Runtime 对任意 shell 命令的证明。Runtime 只保证同一个持久化键不会在同一个绑定请求上再次投递；命令本身是否能安全重复，仍由调用者负责。`non_idempotent_write` 更严格：只要第一次结果可能已经送达，重启后就不得因为没有完整结果而再次执行。
 
-同一个 caller scope 内的同一个键即使第一次结果是 `not_delivered`，重试也返回该第一次摘要。若调用者确实要发起新的尝试，必须生成新键，并重新通过当前的 lease、workspace、project root 和 busy 检查。不同 caller scope 的相同原始 `client_request_id` 属于不同持久命名空间，互不可见、互不 replay；跨身份写入互斥由 `mutation_leases` 负责，而不是由幂等键跨 scope 共享。这样可以避免把“第一次没有送达”误读成“旧键可以无限重用”。
+同一个键即使第一次结果是 `not_delivered`，重试也返回该第一次摘要。若调用者确实要发起新的尝试，必须生成新键，并重新通过当前的 lease、workspace、project root 和 busy 检查。这样可以避免把“第一次没有送达”误读成“旧键可以无限重用”。
 
 ## 键绑定和请求身份
 
@@ -46,17 +46,21 @@ D-1 同时保留两种键：
 
 同一次调用不得同时提供 `client_request_id` 和 `idempotency_key`。实现获批后应在参数层拒绝这种歧义，避免两个账本各自成功预留。现有 `idempotency_key` 的行为保持不变；新的 `client_request_id` 字段若要直接加入 `herdr_exec` 的公共输入，需要单独的 contract 变更和 N/N-1 评审，D-1 不偷偷扩展 frozen 18 工具契约。
 
-持久化 key 使用以下稳定构造，原始 key 不写入数据库。`operation_kind` 进入域分离，避免同一 caller scope 和原始 `client_request_id` 在 `herdr_exec.client_request.v1` 与 `herdr_call.client_request.v1` 之间复用内部主键：
+持久化 key 使用以下稳定构造，原始 key 不写入数据库：
 
 ```text
 key_digest = SHA-256(
-  "herdr-mcp/client-request/v2" || 0x00 ||
-  operation_kind || 0x00 ||
-  caller_scope_digest || 0x00 || client_request_id
+  "herdr-mcp/client-request/v1" || 0x00 ||
+  client_request_id
 )
 ```
 
-`key_digest` 是 64 个小写十六进制字符。`operations.idempotency_key` 使用完整 digest；`op_id` 只使用前 32 个小写十六进制字符，也就是 128 bit。`herdr_exec.client_request.v1` 的 `op_id` 前缀固定为 `op:herdr_exec_client_request:`，`herdr_call.client_request.v1` 固定为 `op:herdr_call_client_request:`。kind 前缀和 digest 域分离同时存在，避免全局 `operations.op_id` 主键碰撞。
+`key_digest` **不含** caller scope，这是刻意的：`operations` 的唯一索引只有 `(kind, idempotency_key)`（`state_store/schema.rs:90-92`），若把 scope 放进键里，同一个 `client_request_id` 在身份变化后会落到另一行，从而再次获得 reservation 并再次执行。D-1 选择“跨 scope 同键必须冲突”：
+
+1. 预留时以 `idempotency_key = key_digest` 做**全局占位**（同一 kind 下与 scope 无关），由 `(kind, idempotency_key)` 唯一索引裁决；只有一个调用者能得到 `reserved`。
+2. 占位后再比较完整的 `request_hash`，它包含 caller scope。scope 或任何指纹字段不一致都返回与其他指纹冲突**完全相同**的 `idempotency_conflict`（`retryable:false`、`delivery_state:not_delivered`、`fallback_allowed:false`），**不回显** scope digest、身份、持有者、结果摘要或任何存在性细节。
+3. 因此 `client_request_id` 在**一个 kind 内是全局一次性键**：同一个键不能被两个 scope 各自使用。调用方若确需在不同身份下发起新写入，必须换新键；这是用“键可能不可复用到其他身份”换取“身份变化后不会重复执行”。
+4. 释放（预送达失败）后同键重试沿用既有原子释放语义；释放前的“确实未送达”仍须由实现侧证明。
 
 `caller_scope_digest` 必须来自重启后仍可解析的持久身份，不能直接使用只存在于当前请求的 opaque session 字符串。浏览器调用者先用持久的 `browser_caller_sessions` 或 `browser_cross_device_caller_sessions` 绑定，将 `provider`、`session_ref` 和 `owning_device_id` 作为 scope 来源；本机浏览器没有设备归属时也要编码一个明确的 `device_local` 标记，不能把 `None` 和跨设备的 `Some(device_id)` 混成同一 scope。这两张表通过 caller session 的哈希查找，见 `state_store.rs:4804-4868`、`:5112-5144`。本地或 trusted caller 必须使用当前实例 `config.json` 中持久的 `edge_device_id` 和已认证的 caller 类型；没有持久设备身份时，在预留前返回 `durable_caller_scope_unavailable`，不执行写命令，也不提供重启 replay，不能继续沿用现有内存账本的空 scope。已验证的 lease holder 可以作为额外绑定字段，但不能单独作为身份权威。租约 token、cookie、bearer 等秘密不得进入明文或摘要之外的结果。请求摘要绑定以下内容：
 
@@ -74,7 +78,7 @@ request_hash = SHA-256(canonical JSON {
 })
 ```
 
-执行路径已经有一部分相同约束：`utility_exec.rs:224-250` 将 workspace、root、invocation、intent、busy 选项和 timeout 纳入 fingerprint。D-1 要求持久化 client key 的 request hash 至少覆盖这些字段，并将 caller scope 一并纳入。同一 caller scope 内改变 intent、命令、root 或 workspace 后复用同一原始 `client_request_id`，命中同一 `(kind, idempotency_key)` 行并返回 `idempotency_conflict`，不能把它当成新的请求执行。不同 caller scope 会得到不同 `key_digest`，查询互不可见且各自独立预留；不得把这种隔离写成跨 scope 的 `idempotency_conflict`。
+执行路径已经有一部分相同约束：`utility_exec.rs:224-250` 将 workspace、root、invocation、intent、busy 选项和 timeout 纳入 fingerprint。D-1 要求持久化 client key 的 request hash 至少覆盖这些字段，并将 caller scope 一并纳入。改变 intent、命令、root、workspace 或 scope 都是冲突，不能把同一个键当成新的请求执行。
 
 已结算记录的 replay 必须使用数据库中的原始摘要、`op_id`、`session_id`、状态和 `safe_retry_mode`。不能用重试请求中的 intent 或当前运行态覆盖旧记录。当前 `utility_exec.rs:346-360` 已经遵循“保留原始身份，只增加 replay 标记”的方向，D-1 沿用这个规则。
 
@@ -84,7 +88,7 @@ request_hash = SHA-256(canonical JSON {
 
 | 列 | D-1 用法 |
 | --- | --- |
-| `op_id` | 按 kind 使用 `op:herdr_exec_client_request:<前 32 个小写 hex 字符>` 或 `op:herdr_call_client_request:<前 32 个小写 hex 字符>`，稳定且不含原始 key |
+| `op_id` | `op:<kind>:<key_digest 前 32 个 hex 字符>`（如 `op:herdr_exec.client_request.v1:3f9c...`），稳定且不含原始 key。`operations.op_id` 是全局主键（`schema.rs:47-49`），因此 **kind 必须进入 op_id**：两个 kind 复用同一 key 时各有独立 op_id 与独立行，不会因主键冲突让 `reserve_operation` 落到“按 kind/key 查不到权威记录”的内部错误（`state_store.rs:1200-1211,1245-1267`）。32 指 **32 个 hex 字符 = 16 字节**的 SHA-256 前缀（122 位熵），不是字节数 |
 | `kind` | `herdr_exec.client_request.v1` 或 `herdr_call.client_request.v1` |
 | `idempotency_key` | 上述 `key_digest` |
 | `request_hash` | canonical 请求摘要 |
@@ -157,10 +161,10 @@ reserved/pending
 - 对 `idempotent_write` 和 `non_idempotent_write`，从第一次写入 `complete` 终态起，`operations.expires_at` 恒为 NULL。完整摘要内部写入 `summary_expires_at_ms = settled_at + 24h`，这个逻辑截止时间不参与通用 SQL prune。24 小时后，新 operation kind 的清理事务把结果正文原地压缩成只含 key digest、request hash、intent、终态和 `expired=true` 的 hash-only tombstone，并继续保持 `operations.expires_at=NULL`。旧键在 tombstone 存在时返回 `idempotency_key_expired` 或等价的不可重试冲突，不得再次执行。这样可以缩短敏感摘要保留期，同时保持写入键不会因为新旧二进制的通用 prune 而重新获得执行资格。
 - `pending` 和 `unknown` 的 `expires_at` 永远为 NULL，不参与自动清理。清除它们会重新打开重复副作用的窗口。
 - 清理只能删除 `read_only` 的终态行，或把写入终态压缩为 hash-only tombstone；写入 kind 的 tombstone 由该 kind 的清理函数保留，不能依赖 `task_decision_gates`。D-1 不为新 kind 创建 task gate，现有 gate 保护只适用于已经与 `herdr_prompt_task` 行关联的任务。新 kind 的清理事务必须检查 operation kind 和 state，并保证写入 tombstone、pending、unknown 永不进入可删除集合。不能通过删除旧行来释放一个尚未结算的键，也不能把写入终态直接删除后当作新请求。
-- 容量淘汰的可选集合是一个显式列表：仅包括 `result_json.intent == "read_only"`、`state == "complete"`、`expires_at IS NOT NULL` 且已到期的 D-1 终态行。写入类 pending、unknown、complete 和 hash-only tombstone 永远不在可淘汰集合中；“完整摘要已压缩且允许删除”不再作为另一种模糊类别。如果没有可淘汰的只读终态，返回 `client_request_ledger_full`，不丢记录、不执行新写命令。
+- 每个新 kind 设置有限容量，建议先沿用现有 1024 条的上限作为最小值，评估后再提高。达到上限时只能淘汰只读终态或完整摘要已压缩且允许删除的记录；写入 tombstone、pending 和 unknown 都不可淘汰。如果剩下的全是这些不可淘汰记录，返回 `client_request_ledger_full`，不丢记录、不执行新写命令。
 - 清理、容量拒绝和 replay 都必须保留同一个 key digest 的冲突语义，不能因清理路径把相同键当成新请求。
 
-实现时优先复用 `StateStore::reserve_operation` 的事务、唯一索引和现有清理框架，但 D-1 写入 kind 每次调用必须传入 `expires_at=NULL`，包括首次预留和 complete 结算。完整摘要的 24 小时逻辑截止时间只存在 `result_json.summary_expires_at_ms`，kind-specific cleanup 只更新 `result_json`，不设置 SQL `expires_at`，也不依赖通用 prune 的排除列表。现有 `operations` 的唯一索引按 `(kind, idempotency_key)` 约束；kind 进入 key digest 域分离，且 `op_id` 前缀按 kind 分开，保证 `herdr_exec.client_request.v1` 和 `herdr_call.client_request.v1` 使用同一个原始 key 时既不互相 replay，也不碰撞全局主键。
+实现时优先复用 `StateStore::reserve_operation` 的事务、唯一索引和现有清理框架，但 D-1 写入 kind 每次调用必须传入 `expires_at=NULL`，包括首次预留和 complete 结算。完整摘要的 24 小时逻辑截止时间只存在 `result_json.summary_expires_at_ms`，kind-specific cleanup 只更新 `result_json`，不设置 SQL `expires_at`，也不依赖通用 prune 的排除列表。现有 `operations` 的唯一索引按 `(kind, idempotency_key)` 约束，正好可以让 `herdr_exec` 和 `herdr_exec.client_request.v1` 使用不同命名空间而互不碰撞。
 
 ## schema 16、v1.1.x 回滚和兼容
 
@@ -214,10 +218,9 @@ D-1 设计阶段不改 Rust，不改 `contracts/`，不改变当前 epoch 6 和 
 - 关闭第一进程，重新打开同一个 state.db，使用相同 caller scope、相同 request fingerprint 和相同 key 重试。
 - 断言返回第一次记录的 `op_id`、摘要 digest、状态和 `safe_retry_mode=none`，外部计数器仍为 1，第二次没有启动子进程、没有发送到 utility pane、没有创建新 session。
 - 断言写入 `complete` 终态时 `operations.expires_at IS NULL`，`result_json.summary_expires_at_ms` 是 24 小时逻辑摘要截止时间；推进时钟到该时间后，在新 kind 的压缩任务运行前先触发旧版通用 `reserve_operation` prune，记录仍存在且同键仍只返回第一次摘要。
-- 在同一 caller scope 内变更命令、root、workspace 或 intent 后复用同一 key，断言 `idempotency_conflict`，且外部计数器不变；跨 caller scope 复用同一个原始 `client_request_id`，断言 `request.status` 对另一 scope 返回 `found:false`，两边互不 replay、互不泄露，并由 `mutation_leases` 测试跨设备写入互斥。
+- 变更命令、root、workspace、intent 或 caller scope 后复用同一 key，断言 `idempotency_conflict`，且外部计数器不变。
 - 重启后查询 `request.status`，断言同一 scope 能读到记录，其他 scope 得到 `found:false`，不泄露 key 是否存在。
 - 没有 `edge_device_id` 或持久浏览器 caller session 时，D-1 在预留前返回 `durable_caller_scope_unavailable`，不创建 pending 行，也不执行写命令。
-- 在同一 caller scope 内用同一个原始 `client_request_id` 分别提交 `herdr_exec.client_request.v1` 与 `herdr_call.client_request.v1`，断言两行的 `(kind, idempotency_key)` 和 `op_id` 都不同，均可独立预留，不发生 `operations.op_id` 主键冲突。
 
 ### 不确定结果和安全重试
 
@@ -238,7 +241,10 @@ D-1 设计阶段不改 Rust，不改 `contracts/`，不改变当前 epoch 6 和 
 - 终态记录在保留期内可重启 replay；写入终态的 SQL `expires_at` 从不设置，逻辑摘要截止后只变成 tombstone，旧 key 返回过期冲突而不是重新执行。只有新 key 才能开始新请求。只读终态被清理后，`request.status` 返回未知并允许重新读取。
 - pending/unknown 行经过多次清理和重启仍存在，容量达到上限时拒绝新写入而不淘汰它们。
 - 结果摘要不包含 stdout、stderr、prompt、文件内容、token、lease token 或其他秘密，只包含状态、digest、字节数和必要的 session/op 标识。
-- 同一 caller scope 内两个并发进程使用同一 kind 和原始 key 时只有一个获得 `Reserved`，另一个得到 replay 或 in-flight，不能各自执行一次；不同 scope 的同名 key 各自隔离，跨设备副作用互斥由 `mutation_leases` 验证。
+- 两个并发进程使用同一 key 时只有一个获得 `Reserved`，另一个得到 replay 或 in-flight，不能各自执行一次。
+- **跨 scope 并发**：两个进程使用相同 kind、相同 `client_request_id`、不同 caller scope 并发提交写请求；断言只有一个获得 reservation 并执行，另一个得到统一的 `idempotency_conflict`（不回显 scope/身份/摘要），外部计数器为 1。
+- **跨 scope 重启**：第一进程用 scope A 结算后重启；scope B 用同一 key 重试，断言 `idempotency_conflict`、外部计数器仍为 1、没有第二次执行；scope A 的重试仍按原摘要 replay。
+- **跨 kind 同键**：`herdr_exec.client_request.v1` 与 `herdr_call.client_request.v1` 使用同一 `client_request_id`，断言两行 `op_id` 不同（kind 已进入 op_id）、各自独立 replay、互不覆盖，且都不触发 operations 主键冲突。
 
 ### 回滚和兼容
 
