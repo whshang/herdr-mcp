@@ -78,6 +78,65 @@ test("Agent install resolves fleet existence before any Cloudflare mutation", ()
   assert.doesNotMatch(zh, /改用机器相关\/随机后缀名/);
 });
 
+test("user recovers a failed first-device bootstrap by rerunning it | Given activation failed after credentials were saved | When reading any language's agent-install guide | Then it instructs a same-machine rerun that fails closed and never restores deleted credentials", () => {
+  for (const [rel, rerun, failClosed, noRestore, keepJournal] of [
+    [
+      "docs/i18n/en/agent-install.md",
+      /rerun `worker bootstrap` on the same computer and OS account/,
+      /Missing, revoked or mismatched credentials fail closed/,
+      /revoked or deleted credentials cannot be restored/,
+      /Keep the journal and credential/,
+    ],
+    [
+      "docs/i18n/zh-CN/agent-install.md",
+      /同一台电脑、同一 OS 账号下重跑 `worker bootstrap`/,
+      /缺失、吊销或不匹配的凭据 fail closed/,
+      /已吊销或删除的凭据无法通过此路径恢复/,
+      /保留 journal 与凭据/,
+    ],
+    [
+      "docs/i18n/ja/agent-install.md",
+      /同じコンピュータと同じ OS アカウントで `worker bootstrap` を再実行/,
+      /資格情報は fail closed で失敗/,
+      /失効または削除された資格情報はこの経路では復元できない/,
+      /journal と資格情報は保持/,
+    ],
+  ]) {
+    const doc = read(rel);
+    assert.match(doc, rerun, `${rel} must keep the same-machine rerun contract`);
+    assert.match(doc, failClosed, `${rel} must keep credentials fail closed`);
+    assert.match(doc, noRestore, `${rel} must not promise restoring deleted credentials`);
+    assert.match(doc, keepJournal, `${rel} must keep the journal and credential on recovery`);
+  }
+});
+
+test("user diagnoses a stalled first-device bootstrap from doctor | Given a deployed Worker with 200 health but failed bootstrap | When reading any language's troubleshooting guide | Then it points to the read-only bootstrap journal layer and forbids Worker/secret deletion or manual pairing", () => {
+  for (const rel of [
+    "docs/i18n/en/troubleshooting.md",
+    "docs/i18n/zh-CN/troubleshooting.md",
+    "docs/i18n/ja/troubleshooting.md",
+  ]) {
+    const doc = read(rel);
+    assert.match(doc, /LAYER bootstrap-journal/, `${rel} must name the doctor layer`);
+    assert.match(
+      doc,
+      /~\/\.config\/herdr-mcp\/bootstrap\/first-worker-v1\.json/,
+      `${rel} must name the read-only journal path`,
+    );
+    assert.match(doc, /herdr-mcp worker bootstrap/, `${rel} must keep the rerun path`);
+    assert.match(
+      doc,
+      /Never delete the Worker|绝不删除 Worker|Worker を削除したり/,
+      `${rel} must forbid Worker deletion`,
+    );
+    assert.match(
+      doc,
+      /create a pairing manually|手动创建 pairing|pairing を手動で作成/,
+      `${rel} must forbid manual pairing`,
+    );
+  }
+});
+
 test("Agent install keeps the bootstrap Token ephemeral without requiring generic DNS write", () => {
   for (const rel of ["docs/i18n/en/agent-install.md", "docs/i18n/zh-CN/agent-install.md", "docs/i18n/ja/agent-install.md"]) {
     const doc = read(rel);

@@ -1739,39 +1739,54 @@ impl StateStore {
     }
 
     pub fn put_operation_ledger(&mut self, input: OperationLedgerInput<'_>) -> Result<(), String> {
-        if input.op_id.is_empty() || input.kind.is_empty() {
-            return Err("operation ledger op_id and kind are required".to_owned());
-        }
+        validate_operation_ledger_input(&input)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("cannot begin operation ledger update: {error}"))?;
-        tx.execute(
-            "INSERT INTO operations (
-                op_id, kind, idempotency_key, request_hash, phase, state,
-                created_at, updated_at, expires_at, result_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
-             ON CONFLICT(op_id) DO UPDATE SET
-                phase = excluded.phase,
-                state = excluded.state,
-                updated_at = excluded.updated_at,
-                expires_at = excluded.expires_at,
-                result_json = excluded.result_json",
-            params![
-                input.op_id,
-                input.kind,
-                input.idempotency_key,
-                input.request_hash,
-                input.phase,
-                input.state,
-                input.now_ms,
-                input.expires_at,
-                input.result_json,
-            ],
-        )
-        .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        upsert_operation_ledger(&tx, &input)
+            .map_err(|error| format!("cannot write operation ledger: {error}"))?;
         tx.commit()
             .map_err(|error| format!("cannot commit operation ledger update: {error}"))
+    }
+
+    /// Write several ledger rows in **one** `IMMEDIATE` transaction.
+    ///
+    /// #332 B-1: a new steering record and the supersede updates of the records
+    /// it replaces must land together. Writing them one row per transaction
+    /// leaves a crash window in which the new row exists while the older
+    /// `submitted|queued|delivered` row is still adoptable after a restart.
+    pub fn put_operation_ledgers_atomic(
+        &mut self,
+        inputs: &[OperationLedgerInput<'_>],
+    ) -> Result<(), String> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        for input in inputs {
+            validate_operation_ledger_input(input)?;
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("cannot begin operation ledger batch: {error}"))?;
+        #[cfg(test)]
+        for (index, input) in inputs.iter().enumerate() {
+            if test_hooks::ledger_batch_failure_after() == Some(index) {
+                // Return before commit so the caller observes an all-or-nothing
+                // batch, exactly like a crash between the two rows.
+                return Err("injected operation ledger batch failure".to_owned());
+            }
+            upsert_operation_ledger(&tx, input)
+                .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        }
+        #[cfg(not(test))]
+        for input in inputs {
+            upsert_operation_ledger(&tx, input)
+                .map_err(|error| format!("cannot write operation ledger: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("cannot commit operation ledger batch: {error}"))
     }
 
     pub fn operation_ledger(&self, op_id: &str) -> Result<Option<OperationLedgerRecord>, String> {
@@ -9547,6 +9562,61 @@ fn list_names(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+fn validate_operation_ledger_input(input: &OperationLedgerInput<'_>) -> Result<(), String> {
+    if input.op_id.is_empty() || input.kind.is_empty() {
+        return Err("operation ledger op_id and kind are required".to_owned());
+    }
+    Ok(())
+}
+
+fn upsert_operation_ledger(
+    tx: &rusqlite::Transaction<'_>,
+    input: &OperationLedgerInput<'_>,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO operations (
+            op_id, kind, idempotency_key, request_hash, phase, state,
+            created_at, updated_at, expires_at, result_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)
+         ON CONFLICT(op_id) DO UPDATE SET
+            phase = excluded.phase,
+            state = excluded.state,
+            updated_at = excluded.updated_at,
+            expires_at = excluded.expires_at,
+            result_json = excluded.result_json",
+        params![
+            input.op_id,
+            input.kind,
+            input.idempotency_key,
+            input.request_hash,
+            input.phase,
+            input.state,
+            input.now_ms,
+            input.expires_at,
+            input.result_json,
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LEDGER_BATCH_FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Fail the next `put_operation_ledgers_atomic` at row `after` (pre-commit).
+    pub(crate) fn inject_ledger_batch_failure_after(after: Option<usize>) {
+        LEDGER_BATCH_FAIL_AFTER.with(|slot| slot.set(after));
+    }
+
+    pub(crate) fn ledger_batch_failure_after() -> Option<usize> {
+        LEDGER_BATCH_FAIL_AFTER.with(Cell::get)
+    }
+}
 
 #[cfg(test)]
 mod tests {
