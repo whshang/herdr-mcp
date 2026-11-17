@@ -5206,9 +5206,14 @@ pub fn run_with_parent_session(
             .pane_worktree(pane_id)
             .map(|worktree| (pane_id.to_owned(), worktree))
     });
-    let audit_root = handoff_target
+    let audit_root = spawn_outcome
         .as_ref()
-        .map(|(_, worktree)| PathBuf::from(worktree));
+        .and_then(|outcome| outcome.cwd.clone())
+        .or_else(|| {
+            handoff_target
+                .as_ref()
+                .map(|(_, worktree)| PathBuf::from(worktree))
+        });
     let mut dispatch_audit = if readonly || !owned_paths.is_empty() {
         let Some(root) = audit_root.as_deref() else {
             let audit = audit_unavailable(
@@ -5217,23 +5222,21 @@ pub fn run_with_parent_session(
                 Path::new(""),
                 "dispatch target has no auditable worktree",
             );
-            return json!({
-                "ok": false,
-                "code": "dispatch_audit_unavailable",
-                "delivery_state": "not_delivered",
-                "audit": audit,
-            });
+            let failure = spawn_audit_failure(spawn_outcome.as_ref(), audit);
+            return finish_spawn_failure(registry, idempotency_key, &fingerprint, task_id, failure);
         };
         let before = match git_audit_snapshot(root) {
             Ok(before) => before,
             Err(message) => {
                 let audit = audit_unavailable(readonly, &owned_paths, root, &message);
-                return json!({
-                    "ok": false,
-                    "code": "dispatch_audit_unavailable",
-                    "delivery_state": "not_delivered",
-                    "audit": audit,
-                });
+                let failure = spawn_audit_failure(spawn_outcome.as_ref(), audit);
+                return finish_spawn_failure(
+                    registry,
+                    idempotency_key,
+                    &fingerprint,
+                    task_id,
+                    failure,
+                );
             }
         };
         Some(json!({
@@ -6378,6 +6381,18 @@ fn resolve_spawn_dispatch(
 ) -> Result<SpawnDispatch, Value> {
     let snapshot = spawn_snapshot(registry);
     let workspace_id = resolve_spawn_workspace(&snapshot, spawn)?;
+    if let Some(path) = spawn
+        .worktree
+        .as_ref()
+        .and_then(|worktree| worktree.path.as_deref())
+        && !crate::fs_security::managed_roots(&snapshot)
+            .iter()
+            .any(|root| Path::new(path).starts_with(root))
+    {
+        return Err(spawn_invalid(
+            "spawn.worktree.path must be inside a managed project root from the live topology",
+        ));
+    }
     let cwd = if spawn.worktree.is_some() {
         None
     } else {
@@ -7177,6 +7192,32 @@ fn spawn_chain(
         resumed,
         attempts: progress.attempts,
     })
+}
+
+fn spawn_audit_failure(outcome: Option<&SpawnOutcome>, audit: Value) -> Value {
+    let mut failure = json!({
+        "ok": false,
+        "failed_step": "audit",
+        "code": "dispatch_audit_unavailable",
+        "message": "dispatch worktree audit evidence was unavailable after spawn creation",
+        "delivery_state": "not_delivered",
+        "submitted": false,
+        "requires_human": false,
+        "audit": audit,
+    });
+    if let Some(outcome) = outcome {
+        failure["spawn"] = outcome.dispatch_facts(&json!({
+            "ok": false,
+            "submitted": false,
+            "delivery_state": "not_delivered",
+        }));
+        failure["reclaim"] = json!({
+            "owner": "this_spawn",
+            "pane_id": outcome.pane_id,
+            "rule": "reclaim only this spawn worktree/pane after inspecting the persisted receipt",
+        });
+    }
+    failure
 }
 
 /// Persist the spawn outcome for this key and annotate the identities, so the
@@ -9629,6 +9670,71 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// user planner | Given a spawn worktree whose audit snapshot is
+    /// unavailable after creation | When dispatch settles | Then the durable
+    /// failure still carries reclaimable spawn facts and same-key replay does
+    /// not create another worktree, pane or agent.
+    #[test]
+    fn spawn_audit_failure_settles_created_resources_for_replay() {
+        let root = audit_repo("spawn-audit-failure");
+        let checkout = root.join("created");
+        let socket = temp_socket();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_spawn_server(
+            UnixListener::bind(&socket).unwrap(),
+            vec![
+                json!({"result": {"worktree": {
+                    "path": checkout.to_string_lossy(),
+                    "branch": "feature/audit",
+                }}}),
+                spawn_tab_created(),
+                spawn_agent_started(true),
+            ],
+            requests.clone(),
+        );
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let (registry, watch_off) = spawn_registry_with(store.clone(), &root, 80);
+        let args = json!({
+            "spawn": {
+                "kind": "pi",
+                "workspace_id": "w1",
+                "worktree": {
+                    "branch": "feature/audit",
+                    "path": checkout.to_string_lossy(),
+                },
+            },
+            "text": "audit this worktree",
+            "idempotency_key": "spawn-audit-failure",
+            "readonly": true,
+        });
+        let client = HerdrClient::new(&socket);
+        let first = run(&client, &registry, &args);
+        server.join().unwrap();
+        assert_eq!(first["ok"], false, "{first}");
+        assert_eq!(first["code"], "dispatch_audit_unavailable", "{first}");
+        assert_eq!(first["failed_step"], "audit", "{first}");
+        assert_eq!(
+            first["spawn"]["worktree"]["path"],
+            json!(checkout.to_string_lossy().to_string())
+        );
+        assert_eq!(first["spawn"]["pane_id"], "w1:p9");
+        assert_eq!(
+            spawn_requested_methods(&requests),
+            vec!["worktree.create", "tab.create", "agent.start"]
+        );
+        drop(watch_off);
+        let (reloaded, _watch_off2) = spawn_registry_with(store, &root, 80);
+        let replay = run(&client, &reloaded, &args);
+        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert_eq!(replay["code"], "dispatch_audit_unavailable", "{replay}");
+        assert_eq!(
+            replay["spawn"]["worktree"]["path"],
+            json!(checkout.to_string_lossy().to_string())
+        );
+        assert_eq!(spawn_requested_methods(&requests).len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// user planner | Given a spawn dispatch already completed | When the same
     /// idempotency key is replayed | Then the stored spawn facts return and no
     /// second tab, pane, agent or prompt is created.
@@ -10266,6 +10372,18 @@ mod tests {
                     "spawn": {"kind": "pi", "workspace_id": "w1", "cwd": "/etc"},
                     "text": "work",
                     "idempotency_key": "spawn-outside",
+                }),
+                "managed project root",
+            ),
+            (
+                json!({
+                    "spawn": {
+                        "kind": "pi",
+                        "workspace_id": "w1",
+                        "worktree": {"branch": "feature/outside", "path": "/etc"},
+                    },
+                    "text": "work",
+                    "idempotency_key": "spawn-worktree-outside",
                 }),
                 "managed project root",
             ),
