@@ -2,7 +2,7 @@
   "schema_version": 1,
   "_notes": {
     "purpose": "Shared deterministic vectors for herdr-mcp Relay/link Batch 5: pure lifecycle/policy parity for the workstation-side herdr-link client. Covers (1) ConnectionPhase set/order/representative high-level transitions, (2) hello_ack refusal classification, (3) socket-close policy, (4) reconnect-cap vectors, and (5) heartbeat/silence pure vectors.",
-    "oracle_convention": "`oracle: node_parity` means the case is directly executable against the existing TypeScript/Node implementation (src/link/client.ts) and must match it exactly. All cases here are node_parity.",
+    "oracle_convention": "`oracle: node_parity` records cases originally checked against the retired TypeScript/Node implementation. The Rust Link implementation remains wire- and behavior-compatible with those cases.",
     "fatal_convention": "`fatal` is the boolean the client uses to decide reconnect vs stop. For hello_ack refusals it is `classifyFatalCode(code) !== \"fatal_error\"`; handshake_timeout is emitted directly with fatal:false. `reconnect` is the inverse of fatal for these vectors.",
     "no_secrets": "All tokens/endpoints are synthetic test values; no real credentials."
   },

@@ -208,13 +208,6 @@ test("quick Agent protocols plan once, batch safe work, and keep optional detail
   }
 });
 
-test("legacy Node herdr-link wrapper resolves Node from PATH when explicitly invoked", () => {
-  const src = read("bin/herdr-link");
-  assert.match(src, /HERDR_NODE_BIN/);
-  assert.match(src, /command -v node/);
-  assert.doesNotMatch(src, /^NODE_BIN="\/usr\/local\/bin\/node"$/m);
-});
-
 test("end-user install docs exclude the retired second-Mac GA UAT prompt", () => {
   for (const rel of ["docs/i18n/en/install.md", "docs/i18n/zh-CN/install.md", "docs/i18n/ja/install.md"]) {
     assert.doesNotMatch(read(rel), /second-mac-ga-uat-agent-prompt/);

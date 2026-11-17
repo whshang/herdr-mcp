@@ -312,9 +312,9 @@ bin/herdr-self-update
 
 The supervised updater reuses generation activation and must not be used to silently cross a public contract epoch.
 
-## Workstation link
+## Workstation Link
 
-`bin/herdr-link` maintains the workstation's outbound authenticated WSS connection to Edge. It carries workstation identity and routes requests to the current active runtime generation. It is normally service-managed rather than run manually.
+Production Link is owned by the Rust runtime and is service-managed through the active installed runtime generation. The retired Node `bin/herdr-link` entrypoint is no longer shipped.
 
 ## Common environment variables
 
@@ -327,7 +327,6 @@ The supervised updater reuses generation activation and must not be used to sile
 | `HERDR_MCP_READONLY` | off | disable mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | restrict writable projects |
 | `HERDR_MCP_AGENT_ALLOW` | all discovered agents | optionally restrict agent visibility in inspect/since |
-| `HERDR_MCP_ALL_TOOLS` | off | legacy Node runtime only; ignored by the Rust runtime |
 | `HERDR_SKILL_NETWORK` | on | `0` uses bundled skill only |
 
 ## Quick command map

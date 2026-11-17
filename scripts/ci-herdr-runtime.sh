@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ci-herdr-runtime.sh — bootstrap a real, pinned Herdr runtime for the
-# non-hermetic transport/regression tests on CI Linux or an isolated local macOS run.
+# non-hermetic regression tests on CI Linux or an isolated local macOS run.
 #
-# The transport tests (tests/transport.test.mjs) connect to a live Herdr over
-# HERDR_SOCKET_PATH (default ~/.config/herdr/herdr.sock) and assert herdr_inspect
-# returns a focused_workspace. The bootstrap workspace is deliberately non-Git:
+# The remaining Node regression tests connect to a live Herdr over
+# HERDR_SOCKET_PATH (default ~/.config/herdr/herdr.sock). The bootstrap workspace
+# is deliberately non-Git:
 # Keep the bootstrap workspace deliberately non-Git so the transport test fixture
 # does not depend on repository metadata (historical Herdr releases could block
 # workspace creation on Git discovery).

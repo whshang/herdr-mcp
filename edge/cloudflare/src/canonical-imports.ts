@@ -1,12 +1,12 @@
 /**
  * canonical-imports.ts — canonical Relay Protocol v1 types, constants and
- * validation ported from src/relay/ for the isolated Worker build.
+ * validation ported from crates/herdr-mcp/src/relay/ for the isolated Worker build.
  *
- * src/relay/** is the canonical definition and is NOT imported here. This file
- * is a wire-identical port scoped to edge/cloudflare. When the two modules
- * share a build, this file can be replaced by `export * from "../../src/relay/protocol.js"`.
+ * crates/herdr-mcp/src/relay/** is the Rust canonical definition and is NOT
+ * imported here. This file is a wire-identical port scoped to edge/cloudflare
+ * because the Worker and Rust trees have different build targets.
  *
- * Wire contract (src/relay/protocol.ts):
+ * Wire contract (crates/herdr-mcp/src/relay/protocol.rs):
  *   protocol_version = number 1
  *   kinds: hello, hello_ack, heartbeat, status, tool_request, tool_result,
  *          tool_error, cancel, cancel_ack

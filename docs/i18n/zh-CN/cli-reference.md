@@ -341,20 +341,7 @@ bin/herdr-self-update
 
 ## Workstation Link
 
-```text
-bin/herdr-link
-```
-
-`herdr-link` 是工作站到 Cloudflare Edge 的出站 WSS sidecar。正常情况下由系统服务管理，不需要日常手工运行。
-
-它负责：
-
-- workstation identity；
-- 持久出站 WSS；
-- 当前 active runtime 路由；
-- runtime generation/version heartbeat。
-
-它不是 MCP runtime 本身。
+生产 Link 由 Rust runtime 负责，并通过 active installed runtime generation 的系统服务管理。已退役的 Node `bin/herdr-link` 入口不再发布。
 
 ## 常用环境变量
 
@@ -367,7 +354,6 @@ bin/herdr-link
 | `HERDR_MCP_READONLY` | 关 | 禁止 mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | 缩小允许写的项目范围 |
 | `HERDR_MCP_AGENT_ALLOW` | 全部已发现 Agent | 可选地限制 inspect/since 展示哪些 Agent |
-| `HERDR_MCP_ALL_TOOLS` | 关 | 仅旧 Node runtime 使用；Rust runtime 忽略 |
 | `HERDR_SKILL_NETWORK` | 开 | `0` 时只使用 bundled skill |
 
 ## 命令怎么选

@@ -6,8 +6,6 @@ on:
     paths:
       - "edge/cloudflare/**"
       - "!edge/cloudflare/**/*.md"
-      - "src/relay/**"
-      - "tests/relay-*.mjs"
       - "package.json"
       - "package-lock.json"
       - ".github/workflows/cloudflare-edge.yml"

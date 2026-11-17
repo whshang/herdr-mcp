@@ -1,7 +1,7 @@
 # herdr-mcp — Cloudflare stable edge
 
 This subtree implements the Cloudflare Worker + Durable Object edge used between
-ChatGPT and the workstation `herdr-link`. Relay v1, the first-party DEV/PROD
+ChatGPT and the workstation Rust Link. Relay v1, the first-party DEV/PROD
 public contract **epoch 7 / 19 actions** (workstation Runtime Execution Contract
 **epoch 5 / 18 tools**), MCP transport and OAuth compatibility are implemented
 and exercised by the Edge Gate. The public Edge epoch-3 identity remains the
@@ -19,7 +19,7 @@ origin. See [`../../docs/i18n/en/cloudflare-edge-deployment.md`](../../docs/i18n
 | Plan phase | Edge state |
 | --- | --- |
 | Phase 1 relay protocol / contract | Complete: canonical Relay v1 plus the then-current frozen epoch-2 18-tool public contract; epoch 1 remains a legacy compatibility baseline. |
-| Phase 2 `herdr-link` | Implemented in `src/link/**`; workstation sidecar connects outbound over authenticated WSS. |
+| Phase 2 Rust Link | Implemented in `crates/herdr-mcp/src/link/**`; the workstation runtime connects outbound over authenticated WSS. |
 | Phase 3 Cloudflare Edge | Implemented: Worker/DO/Hibernation WSS, MCP transport, correlation, offline semantics, payload bounds and redacted logging. |
 | Phase 4 OAuth Edge | Implemented and migrated for the production issuer, including DCR, PKCE, refresh rotation and signing-key continuity. |
 | Phase 5 production cutover | Complete for the reference deployment: `herdr-mcp.agentforme.cc.cd` is a Worker Custom Domain; the legacy Tunnel is retired. Open-source installs may remain on `workers.dev`. |
@@ -103,12 +103,13 @@ edge/cloudflare/
 
 All wire envelopes, encode/decode, protocol-version checks and internal↔wire mapping
 live in **`src/relay-adapter.ts`** (canonical type/validation port in
-`src/canonical-imports.ts`). A separate worker owns `src/relay/**` (and
-`src/link/**`); nothing in this edge imports them and you must not edit them from
-here. When the link side lands, the two sides agree on the envelopes/versions in
-`relay-adapter.ts` — single point of reconciliation.
+`src/canonical-imports.ts`). The Rust runtime owns the workstation implementation
+in `crates/herdr-mcp/src/relay/**` and `crates/herdr-mcp/src/link/**`; this isolated
+Worker build keeps a wire-identical TypeScript port. The two sides agree on the
+envelopes and versions in `relay-adapter.ts`, the single edge reconciliation point.
 
-The wire is **canonical Relay Protocol v1** (mirrors `src/relay/protocol.ts`):
+The wire is **canonical Relay Protocol v1** (mirrors
+`crates/herdr-mcp/src/relay/protocol.rs`):
 - `protocol_version` is the **number `1`** on every frame.
 - Kinds: `hello`, `hello_ack`, `heartbeat`, `status`, `tool_request`, `tool_result`,
   `tool_error`, `cancel`, `cancel_ack`.
@@ -122,8 +123,8 @@ The wire is **canonical Relay Protocol v1** (mirrors `src/relay/protocol.ts`):
 - Draining/upgrade state lives as local DO state only (no wire kind for them).
 
 `canonical-imports.ts` is a wire-identical port of the canonical validation for
-this isolated Worker build; it can be swapped for
-`export * from "../../src/relay/protocol.js"` once the trees share a build.
+this isolated Worker build; it remains local because the Worker and Rust trees
+have different build targets.
 
 ## Pre-hello handshake
 
@@ -234,16 +235,17 @@ disappear. The harness is reusable for other grant-routed methods through
   immediately previous frozen epoch-4 contract and the frozen epoch-2 catalog
   remain only as bounded rollback compatibility identities.
 - **No public inbound path to the workstation.** The Edge terminates public MCP;
-  the workstation still connects outward through `herdr-link` only.
+  the workstation still connects outward through the Rust Link only.
 - **No mandatory custom domain.** `workers.dev` remains a supported installation
   target. Custom Domain is a routing preference, not a product prerequisite.
 - **No automatic DNS deletion in the domain controller.** Existing CNAME/Tunnel
   migrations require explicit rollback evidence before the conflicting DNS record
   is removed.
 - **No second relay implementation.** Protocol ownership remains canonical and the
-  Edge adapter must stay wire-compatible with `src/relay/**`.
+  Edge adapter must stay wire-compatible with
+  `crates/herdr-mcp/src/relay/**`.
 - **Runtime A/B does not launch arbitrary candidate processes.** Candidate process
-  creation remains a deployment/upgrade step; `herdr-link` owns validation,
+  creation remains a deployment/upgrade step; the Rust Link owns validation,
   activation, drain and rollback. See [`../../docs/i18n/en/runtime-self-upgrade.md`](../../docs/i18n/en/runtime-self-upgrade.md).
 
 ## Security posture
