@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { EPOCH1_CONTRACT } from "../dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../dist/contracts/epoch4.js";
@@ -274,6 +275,14 @@ test("initialize negotiates unknown protocol versions down to SDK wire", async (
     d.value,
   );
   assert.equal(r.body.result.protocolVersion, "2025-11-25");
+});
+
+test("user keeps the retired Node epoch1 contract | Given the legacy profile is fixed | When the profile is inspected | Then its 17-tool identity and missing herdr_skill remain unchanged", () => {
+  assert.equal(EPOCH1_CONTRACT.contract_epoch, 1);
+  assert.equal(EPOCH1_CONTRACT.contract_hash, "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d");
+  assert.equal(EPOCH1_CONTRACT.tool_count, 17);
+  assert.equal(EPOCH1_CONTRACT.tools.length, 17);
+  assert.equal(EPOCH1_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), false);
 });
 
 test("tools/list exposes runtime tools plus edge-local herdr_devices", async () => {

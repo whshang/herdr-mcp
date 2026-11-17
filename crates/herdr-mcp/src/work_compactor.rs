@@ -5019,6 +5019,8 @@ mod tests {
         assert!(moved.rule_derived);
         let moved_id = moved.id.clone();
 
+        // The rendered disk view carries no marker; an agent appends an
+        // unrelated task line (a plain hand edit).
         let disk = render_handoff_markdown(&memory);
         let edited = disk.replace(
             "\n## 历史会话路径\n",

@@ -121,6 +121,7 @@ impl<'a> RoleTarget<'a> {
                 pane_id: Some(pane.to_owned()),
                 agent_status: status.map(str::to_owned),
                 state_change_seq: agent.get("state_change_seq").and_then(Value::as_u64),
+                kind: agent.get("kind").and_then(Value::as_str).map(str::to_owned),
             };
             let mut reason = (status != Some("idle")).then_some("not_idle".to_owned());
             // Snapshot aliases also fence the caller's own pane if a native

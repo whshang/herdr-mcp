@@ -9,12 +9,15 @@ Own: `herdr_methods`, `herdr_inspect`, `herdr_call`, `herdr_since`.
 
 ## State and targets
 
-Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Prefer `herdr_since(cursor)` for incremental changes. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
+Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Save its `since_cursor` and pass that exact integer to `herdr_since(cursor)` for incremental changes; the cursor is captured before the inspect snapshot, so events arriving during snapshot assembly are included by the following since call. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
+
+The compatibility fields `semantic_judgment` and `workstation_info.native_migration` are deprecated duplicates. Read the top-level `semantic` and top-level `native_migration` fields instead; the duplicate fields remain in the full inspect view for existing clients.
 
 Connected-tool shape:
 
 - Put `device` inside the public tool arguments object. When multiple enrolled workstations are plausible, pass a device name or `device_id` explicitly. `herdr_devices` is the listing exception.
 - Bare workspace/pane ids are scoped to one selected device/Herdr server session; never reuse them as global ids across devices. Preserve device-aware opaque refs unchanged when Herdr returns them.
+- Device-bound `herdr_ref_*` values may appear in `workspace`, `workspace_id`, `pane_id`, `pane`, `target`, `split_from`, `parent_target`, nested `spawn.*` fields, and the scan-only `repair_of`. A ref for the called device resolves to its bare id; a ref for another device (or a malformed/unverifiable one) is rejected with `device_ref_conflict` — pass it back to the caller as-is instead of retrying with a stripped or guessed id.
 - `herdr_call` takes `method`, `params` as a JSON object (preferred) or a **JSON object string**, and optional top-level `device`. Encode the native/private method arguments inside `params`; do not spread those fields into the public tool call.
 
 UI/terminal focus is observational; mutations still require the intended explicit workspace/pane/project identity. Reconnect with read-only observations before deciding whether any uncertain mutation may be retried.
@@ -48,6 +51,7 @@ The project `HANDOFF.md` in a worktree is a **markdown view**, not the whole rel
 - The live git context (`## 工作区`: branch, changed files, next step) is page-level state, rendered once at the top and never evicted to satisfy the budget.
 - Entry guard: a summarizer rule/mistake longer than 280 characters, or one that names bound work (a PR/issue number, a run, a temporary path), is moved into the task list verbatim. Durable rules are short, repeatable statements — put one-off work in tasks. A moved rule is never auto-closed merely because it mentions a merged PR.
 - Closed work is archived, not deleted: a done, stale (30 days) or merge-proven task leaves the file and the default pickup projection but keeps its text in the authoritative state (rollback/history). `work.pickup` reports it in `archived_counts` and returns it only with `include_archived=true`; the newest 200 archived tasks are retained. An explicit task update re-opens an archived task.
+
 
 ## Bounded project pickup
 
