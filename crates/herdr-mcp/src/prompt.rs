@@ -69,6 +69,13 @@ const ESCALATION_STALL_IDLE_MS: u64 = 20 * 60_000;
 const ESCALATION_MAX_SIGNALS: usize = 16;
 /// Bound the per-signal task-id evidence (most recent first).
 const ESCALATION_MAX_TASK_IDS: usize = 8;
+/// #332 B-2: bound the foreground blocker observation so a hung probe never
+/// delays task registration. Names are process names, never raw argv.
+const FOREGROUND_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const FOREGROUND_BLOCKER_MAX_PROCESSES: usize = 8;
+const FOREGROUND_NAME_MAX_CHARS: usize = 64;
+const FOREGROUND_COMMAND_MAX_TOKENS: usize = 6;
+const FOREGROUND_COMMAND_MAX_CHARS: usize = 120;
 static NEXT_DISPATCH_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// One `spawn` call must fit the whole chain (pane create, `agent.start`,
@@ -144,6 +151,12 @@ fn update_steering(task: &mut PromptTaskRecord) {
         return;
     }
     task.steering_state = Some(mapped.to_owned());
+    // #332 B-2: a foreground blocker is only observable while the steering is
+    // still unacknowledged; an own outcome (acknowledged/applied/rejected)
+    // clears it so status never claims a finished prompt is still blocked.
+    if matches!(mapped, "acknowledged" | "applied" | "rejected") {
+        task.foreground_blocker = None;
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -151,6 +164,10 @@ struct AgentState {
     pane_id: Option<String>,
     agent_status: Option<String>,
     state_change_seq: Option<u64>,
+    /// Agent kind (e.g. `pi`, `codex`) when the reporting surface provides
+    /// one. #332 B-2 uses it to keep the agent's own foreground process out
+    /// of the blocker summary. None on older/partial observations.
+    kind: Option<String>,
 }
 
 struct RegisterTaskInput<'a> {
@@ -172,6 +189,9 @@ struct RegisterTaskInput<'a> {
     /// that created this task. Persisted so the terminal inbox row can be
     /// matched back to the envelope `request_id` the dispatcher saw.
     request_id: Option<&'a str>,
+    /// #332 B-2 sanitized `pane.process_info` summary probed at dispatch time
+    /// while the prompt was still unacknowledged. `None` skips the field.
+    foreground_blocker: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -321,6 +341,13 @@ struct PromptTaskRecord {
     /// superseded by that dispatch" apart from "it applied".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     superseded_by: Option<String>,
+    /// #332 B-2 foreground blocker: a sanitized `pane.process_info` summary
+    /// captured at dispatch while the prompt was still unacknowledged
+    /// (`steering_state` queued/delivered/submitted). Always `None` once the
+    /// task reports its own outcome. `Value` keeps the contract schema-free;
+    /// older runtimes ignore the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foreground_blocker: Option<Value>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -441,6 +468,12 @@ impl PromptTaskRecord {
                         "exhausted_at_ms": self.repair_exhausted_at_ms,
                     }),
                 );
+            }
+            // #332 B-2: non-secret `pane.process_info` summary while the
+            // steering stays unacknowledged; cleared by `update_steering` once
+            // the task reports its own outcome.
+            if let Some(blocker) = &self.foreground_blocker {
+                object.insert("foreground_blocker".to_owned(), json!(blocker));
             }
             // S4: `delivery_uncertain` means "may already have been delivered".
             // The row therefore carries the read-only check a caller can run to
@@ -796,6 +829,7 @@ impl PromptRegistry {
             max_runtime_ms,
             on_budget,
             request_id,
+            foreground_blocker,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
             return Ok(None);
@@ -905,6 +939,7 @@ impl PromptRegistry {
             repair_exhausted_at_ms: None,
             steering_state: None,
             superseded_by: None,
+            foreground_blocker,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
@@ -4522,6 +4557,47 @@ pub fn run_with_parent_session(
 
     let submitted = result.get("submitted").and_then(Value::as_bool);
     let after = agent_state_from_result(&result);
+
+    // #332 B-2: when the submit cannot already prove the agent picked the
+    // prompt up (`after` not `working`, no advanced seq), capture one bounded,
+    // sanitized `pane.process_info` snapshot so the durable task can name the
+    // foreground blocker instead of folding it into a vague boolean. Skipped
+    // for spawn chains (a fresh pane cannot already be occupied) and whenever
+    // the pane id is not resolvable. A failed probe yields `None`; it never
+    // blocks task registration.
+    let foreground_blocker = {
+        let pane_id = after
+            .as_ref()
+            .and_then(|state| state.pane_id.as_deref())
+            .or_else(|| before.as_ref().and_then(|state| state.pane_id.as_deref()));
+        let agent_busy_before = before
+            .as_ref()
+            .is_some_and(|state| state.agent_status.as_deref() == Some("working"));
+        let picked_up = after
+            .as_ref()
+            .is_some_and(|state| state.agent_status.as_deref() == Some("working"));
+        let seq_advanced = before
+            .as_ref()
+            .and_then(|state| state.state_change_seq)
+            .zip(after.as_ref().and_then(|state| state.state_change_seq))
+            .is_some_and(|(before, after)| before != after);
+        if submitted.is_some()
+            && !picked_up
+            && !seq_advanced
+            && !agent_busy_before
+            && spawn_outcome.is_none()
+        {
+            let agent_kind = after
+                .as_ref()
+                .and_then(|state| state.kind.as_deref())
+                .or_else(|| before.as_ref().and_then(|state| state.kind.as_deref()));
+            pane_id.and_then(|pane_id| {
+                foreground_blocker_of(client, pane_id, registry.now_ms(), agent_kind)
+            })
+        } else {
+            None
+        }
+    };
     match registry.register_task(RegisterTaskInput {
         task_id,
         target,
@@ -4538,6 +4614,7 @@ pub fn run_with_parent_session(
         max_runtime_ms,
         on_budget,
         request_id,
+        foreground_blocker,
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -6327,6 +6404,218 @@ fn agent_state_of(client: &HerdrClient, target: &str) -> Option<AgentState> {
         .ok()?;
     agent_state_from_value(&result)
 }
+/// #332 B-2: one bounded `pane.process_info` observation that lets
+/// `agent.task.status` answer "what is holding the pane" instead of folding a
+/// blocked prompt into a vague boolean. Returns `None` when the probe cannot
+/// run or the foreground is shell-only (the pane is not blocked).
+///
+/// The summary is deliberately non-secret: process `name` values and, when the
+/// runtime reports one, a strict-allowlist `command_prefix`. argv values are
+/// never copied through; any token containing `=`, quoting, punctuation that
+/// could carry a value, or a flag whose name mentions a credential drops the
+/// rest of the prefix. No environment variables are ever consulted.
+fn foreground_blocker_of(
+    client: &HerdrClient,
+    pane_id: &str,
+    observed_at_ms: u64,
+    agent_kind: Option<&str>,
+) -> Option<Value> {
+    let info = client
+        .call_with_timeout(
+            "pane.process_info",
+            json!({"pane_id": pane_id}),
+            FOREGROUND_PROBE_TIMEOUT,
+        )
+        .ok()?;
+    let info = info.get("process_info").unwrap_or(&info);
+    let shell_pid = finite_process_id(info.get("shell_pid"));
+    let foreground = info
+        .get("foreground_processes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let processes: Vec<Value> = foreground
+        .iter()
+        .filter_map(|process| sanitize_foreground_process(process, shell_pid, agent_kind))
+        .take(FOREGROUND_BLOCKER_MAX_PROCESSES)
+        .collect();
+    let shell_owns_foreground = shell_pid.is_some()
+        && finite_process_id(info.get("foreground_process_group_id")) == shell_pid;
+    let is_own = |process: &Value| {
+        finite_process_id(process.get("pid")) == shell_pid
+            || process.get("agent").and_then(Value::as_bool) == Some(true)
+    };
+    let shell_only = shell_owns_foreground
+        && foreground
+            .iter()
+            .all(|process| finite_process_id(process.get("pid")) == shell_pid);
+    if processes.is_empty() || shell_only || processes.iter().all(is_own) {
+        return None;
+    }
+    let non_shell_count = processes
+        .iter()
+        .filter(|process| {
+            process.get("shell").and_then(Value::as_bool) != Some(true)
+                && process.get("agent").and_then(Value::as_bool) != Some(true)
+        })
+        .count();
+    Some(json!({
+        "pane_id": pane_id,
+        "observed_at_ms": observed_at_ms,
+        "source": "pane.process_info",
+        "shell_owns_foreground": shell_owns_foreground,
+        "non_shell_processes": non_shell_count,
+        "processes": processes,
+        // Deliberately no `command`/`argv`/`env` echo: names only, plus the
+        // allowlisted `command_prefix` per process when the runtime reports it.
+    }))
+}
+
+fn finite_process_id(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .and_then(Value::as_i64)
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .filter(|value| *value > 0)
+}
+
+/// Keeps a process name usable as a classifier: basename characters, no
+/// whitespace, no control bytes, hard-truncated.
+fn sanitize_process_name(raw: &str) -> String {
+    let tail = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    tail.chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .take(FOREGROUND_NAME_MAX_CHARS)
+        .collect()
+}
+
+/// One allowlisted token for a command prefix: bare alnum plus `-_.`; no
+/// `=`, no quoting, no path separators, so no argument value can ride along.
+fn sanitize_command_token(raw: &str) -> Option<String> {
+    let token: String = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .collect();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Builds a non-secret command prefix: basename of argv[0] plus at most
+/// `FOREGROUND_COMMAND_MAX_TOKENS` allowlisted words. A `-`-prefixed flag
+/// containing a credential word, a bare credential marker (`bearer`,
+/// `apikey`...), or any token containing `=` terminates the prefix rather
+/// than leaking a value.
+fn sanitize_command_prefix(raw: &str) -> Option<String> {
+    const CREDENTIAL_WORDS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "key",
+        "auth",
+        "credential",
+        "bearer",
+        "apikey",
+        "api_key",
+        "cookie",
+    ];
+    let mut out = sanitize_process_name(raw.split_whitespace().next()?);
+    if out.is_empty() {
+        return None;
+    }
+    for token in raw
+        .split_whitespace()
+        .skip(1)
+        .take(FOREGROUND_COMMAND_MAX_TOKENS - 1)
+    {
+        let lower = token.to_ascii_lowercase();
+        // A `-`-prefixed flag containing a credential word, or a bare token
+        // that is exactly a credential marker (`bearer`, `apikey`...): either
+        // ends the prefix before the following value can leak.
+        let credential_flag = if lower.starts_with('-') {
+            CREDENTIAL_WORDS.iter().any(|word| lower.contains(word))
+        } else {
+            CREDENTIAL_WORDS.iter().any(|word| lower == *word)
+        };
+        if credential_flag || token.contains('=') {
+            break;
+        }
+        let Some(word) = sanitize_command_token(token) else {
+            break;
+        };
+        out.push(' ');
+        out.push_str(&word);
+    }
+    if out.chars().count() > FOREGROUND_COMMAND_MAX_CHARS {
+        let truncated: String = out.chars().take(FOREGROUND_COMMAND_MAX_CHARS).collect();
+        return Some(format!("{truncated}…"));
+    }
+    Some(out)
+}
+
+/// A foreground process counts as the agent itself only when the reported
+/// kind matches its process-name basename, so `less`/`vim` on an `omp` pane
+/// still surface as blockers while the agent's own foreground process does
+/// not. Case-insensitive; never treats an unmatched kind as agent-owned.
+fn agent_process_names_match(kind: &str, process_name: &str) -> bool {
+    !kind.is_empty() && process_name.eq_ignore_ascii_case(kind)
+}
+
+/// Shapes one `foreground_processes` entry for the durable record: pid, a
+/// sanitized name, a `shell` flag when it owns the pane's shell pid, and the
+/// allowlisted command prefix when the runtime reports `command`/`argv`.
+fn sanitize_foreground_process(
+    process: &Value,
+    shell_pid: Option<u64>,
+    agent_kind: Option<&str>,
+) -> Option<Value> {
+    let pid = finite_process_id(process.get("pid"));
+    let name = process
+        .get("name")
+        .and_then(Value::as_str)
+        .map(sanitize_process_name)
+        .filter(|name| !name.is_empty());
+    let is_agent = agent_kind.is_some_and(|kind| {
+        name.as_deref()
+            .is_some_and(|name| agent_process_names_match(kind, name))
+    });
+    if pid.is_none() && name.is_none() {
+        return None;
+    }
+    let mut entry = Map::new();
+    if let Some(pid) = pid {
+        entry.insert("pid".to_owned(), json!(pid));
+    }
+    if let Some(name) = name {
+        entry.insert("name".to_owned(), json!(name));
+    }
+    if shell_pid.is_some() && pid == shell_pid {
+        entry.insert("shell".to_owned(), json!(true));
+    }
+    // #332 B-2: the agent's own process is occupancy, not a blocker; the flag
+    // keeps it readable in the summary while excluding it from the count.
+    if is_agent {
+        entry.insert("agent".to_owned(), json!(true));
+    }
+    let command = process
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            process.get("argv").and_then(Value::as_array).map(|argv| {
+                argv.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        });
+    if let Some(prefix) = command.as_deref().and_then(sanitize_command_prefix) {
+        entry.insert("command_prefix".to_owned(), json!(prefix));
+    }
+    Some(Value::Object(entry))
+}
 
 fn agent_state_from_value(value: &Value) -> Option<AgentState> {
     let agent = value.get("agent").unwrap_or(value);
@@ -6341,6 +6630,7 @@ fn agent_state_from_value(value: &Value) -> Option<AgentState> {
             .or_else(|| agent.get("status").and_then(Value::as_str))
             .map(str::to_owned),
         state_change_seq: agent.get("state_change_seq").and_then(Value::as_u64),
+        kind: agent.get("kind").and_then(Value::as_str).map(str::to_owned),
     };
     (state.pane_id.is_some() || state.agent_status.is_some() || state.state_change_seq.is_some())
         .then_some(state)
@@ -6496,6 +6786,7 @@ fn agent_state_from_result(result: &Value) -> Option<AgentState> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         state_change_seq: after.get("state_change_seq").and_then(Value::as_u64),
+        kind: after.get("kind").and_then(Value::as_str).map(str::to_owned),
     })
 }
 
@@ -6846,6 +7137,7 @@ mod tests {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("idle".to_owned()),
             state_change_seq: Some(1),
+            kind: None,
         };
         let same = before.clone();
         assert_eq!(
@@ -6873,6 +7165,7 @@ mod tests {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("idle".to_owned()),
             state_change_seq: Some(10),
+            kind: None,
         };
         let unchanged = dispatch_correlation(Some(&idle), Some(&idle), false, false, Some(true));
         assert_eq!(unchanged["mode"], "awaiting_activity");
@@ -7359,6 +7652,7 @@ mod tests {
                 max_runtime_ms: None,
                 on_budget: None,
                 request_id: None,
+                foreground_blocker: None,
             })
             .unwrap()
             .expect("store present, so the task is registered");
@@ -9308,6 +9602,7 @@ mod tests {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("working".to_owned()),
             state_change_seq: Some(10),
+            kind: None,
         };
         let after = before.clone();
         let task_id = "dispatch:prompt:task-lifecycle-test";
@@ -9328,6 +9623,7 @@ mod tests {
                 request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
+                foreground_blocker: None,
             })
             .unwrap()
             .unwrap();
@@ -9507,6 +9803,7 @@ mod tests {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("idle".to_owned()),
             state_change_seq: Some(20),
+            kind: None,
         };
         let task_id = "dispatch:prompt:activity-timeout-test";
         let mut task = registry
@@ -9526,6 +9823,7 @@ mod tests {
                 request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
+                foreground_blocker: None,
             })
             .unwrap()
             .unwrap();
@@ -9566,6 +9864,7 @@ mod tests {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("idle".to_owned()),
             state_change_seq: Some(40),
+            kind: None,
         };
         let result = prompt_failure(
             &client,
@@ -9656,11 +9955,13 @@ mod tests {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("idle".to_owned()),
             state_change_seq: Some(1),
+            kind: None,
         };
         let after = AgentState {
             pane_id: Some("w1:p1".to_owned()),
             agent_status: Some("working".to_owned()),
             state_change_seq: Some(2),
+            kind: None,
         };
         let initial = registry
             .register_task(RegisterTaskInput {
@@ -9679,6 +9980,7 @@ mod tests {
                 request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
+                foreground_blocker: None,
             })
             .unwrap()
             .unwrap();
@@ -9811,6 +10113,7 @@ mod tests {
             repair_exhausted_at_ms: None,
             steering_state: None,
             superseded_by: None,
+            foreground_blocker: None,
         }
     }
 
@@ -11162,6 +11465,7 @@ mod tests {
             repair_exhausted_at_ms: None,
             steering_state: None,
             superseded_by: None,
+            foreground_blocker: None,
         }
     }
 
@@ -12367,6 +12671,7 @@ mod tests {
             pane_id: Some(pane_id.to_owned()),
             agent_status: Some(status.to_owned()),
             state_change_seq: Some(seq),
+            kind: None,
         }
     }
 
@@ -12399,6 +12704,7 @@ mod tests {
                 request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
+                foreground_blocker: None,
             })
             .unwrap()
             .unwrap();
@@ -12433,6 +12739,7 @@ mod tests {
                 request_id: None,
                 max_runtime_ms: None,
                 on_budget: None,
+                foreground_blocker: None,
             })
             .unwrap()
             .unwrap();
@@ -12572,6 +12879,171 @@ mod tests {
             decoded.superseded_by.as_deref(),
             Some("dispatch:prompt:newer")
         );
+    }
+
+    /// user coordinator | Given a dispatch whose agent stays idle because a
+    /// foreground program owns the pane | When the task is registered | Then
+    /// the durable record carries a sanitized `foreground_blocker` summary,
+    /// `steering_state` stays `delivered`, and `agent.task.status` reads the
+    /// blocker back with no raw argv.
+    #[test]
+    fn foreground_blocker_is_recorded_while_steering_stays_delivered() {
+        let socket = temp_socket();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let server = scripted_dispatch_server(
+            listener,
+            vec![
+                json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1, "kind": "pi"}}}),
+                json!({"result": {"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1, "kind": "pi"}}}}),
+                json!({"result": {"process_info": {
+                    "shell_pid": 42,
+                    "foreground_process_group_id": 77,
+                    "foreground_processes": [
+                        {"pid": 77, "name": "less", "command": "less -S /var/log/syslog --token abc123 KEY=secret"},
+                        {"pid": 90, "name": "pi"}
+                    ],
+                }}}),
+            ],
+            texts.clone(),
+        );
+        let client = HerdrClient::new(&socket);
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = PromptRegistry::with_store(store);
+        let result = run(
+            &client,
+            &registry,
+            &json!({"target": "w1:p1", "text": "hello\n", "idempotency_key": "blocker-e2e"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        server.join().unwrap();
+
+        let task_id = result["task_id"].as_str().unwrap();
+        let status = registry.task_status(task_id);
+        assert_eq!(status["task"]["steering_state"], "delivered", "{status}");
+        assert_eq!(status["task"]["terminal"], false);
+        let blocker = &status["task"]["foreground_blocker"];
+        assert_eq!(blocker["pane_id"], "w1:p1", "{blocker}");
+        assert_eq!(blocker["source"], "pane.process_info");
+        assert!(blocker["observed_at_ms"].as_u64().unwrap() > 0);
+        let processes = blocker["processes"].as_array().unwrap();
+        let less = processes.iter().find(|p| p["name"] == "less").unwrap();
+        assert_eq!(less["pid"], 77);
+        assert_eq!(less["agent"], Value::Null);
+        // The argv tail is cut at the first credential flag; the earlier
+        // allowlisted words survive, nothing secret does.
+        assert_eq!(less["command_prefix"], "less -S varlogsyslog");
+        let pi = processes.iter().find(|p| p["name"] == "pi").unwrap();
+        assert_eq!(pi["agent"], true);
+        assert_eq!(blocker["non_shell_processes"], 1);
+        // The serialized record must not contain the raw argv anywhere.
+        let persisted =
+            serde_json::to_string(&registry.load_task(task_id).unwrap().unwrap()).unwrap();
+        for leak in ["abc123", "KEY=secret", "--token"] {
+            assert!(!persisted.contains(leak), "leaked {leak}");
+        }
+        fs::remove_file(socket).unwrap();
+    }
+
+    /// user coordinator | Given a blocked prompt whose agent later picks it
+    /// up | When its own working event lands | Then `steering_state` advances
+    /// to acknowledged and the blocker fact clears: status never claims a
+    /// running prompt is still blocked.
+    #[test]
+    fn foreground_blocker_clears_on_agent_pickup() {
+        let (db_path, registry) = task_registry("blocker-clears");
+        let task =
+            register_pending_task(&registry, "dispatch:prompt:blocked", "child", "w1:p1", 10);
+        let mut persisted = registry.load_task(&task.task_id).unwrap().unwrap();
+        persisted.foreground_blocker = Some(json!({
+            "pane_id": "w1:p1", "observed_at_ms": 5,
+            "processes": [{"pid": 77, "name": "less"}],
+        }));
+        registry.save_task(&persisted, None).unwrap();
+
+        let mut task = persisted;
+        assert!(apply_task_event(
+            &mut task,
+            &json!({
+                "type": "pane.agent_status_changed", "pane_id": "w1:p1",
+                "agent_status": "working", "cursor": 30,
+            })
+        ));
+        registry.save_task(&task, None).unwrap();
+
+        let status = registry.task_status(&task.task_id);
+        assert_eq!(status["task"]["steering_state"], "acknowledged");
+        assert_eq!(status["task"]["foreground_blocker"], Value::Null);
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given argv that mixes safe words with credentials |
+    /// When the blocker summary is shaped | Then only the allowlisted prefix
+    /// survives and no secret, flag value, or env assignment can leak.
+    #[test]
+    fn foreground_blocker_redacts_credentials_and_env() {
+        let prefix = sanitize_command_prefix("git push --force origin main").unwrap();
+        assert_eq!(prefix, "git push --force origin main");
+
+        for secret_case in [
+            "deploy --token abc123",
+            "deploy --api-key=abc123",
+            "deploy PASS=supersecret",
+            "curl -H Bearer abc123",
+            "tool --password pw",
+            "tool API_KEY=abc def",
+        ] {
+            let shaped = sanitize_command_prefix(secret_case).unwrap_or_default();
+            assert!(!shaped.contains("abc123"), "{secret_case} -> {shaped}");
+            assert!(!shaped.contains("supersecret"), "{secret_case} -> {shaped}");
+            assert!(!shaped.contains("pw"), "{secret_case} -> {shaped}");
+            assert!(!shaped.contains("def"), "{secret_case} -> {shaped}");
+            assert!(
+                shaped.starts_with("deploy")
+                    || shaped.starts_with("curl")
+                    || shaped.starts_with("tool")
+            );
+        }
+
+        // A token that looks like a path or an env assignment ends the prefix.
+        assert_eq!(
+            sanitize_command_prefix("less /etc/passwd").unwrap(),
+            "less etcpasswd"
+        );
+        assert_eq!(sanitize_command_prefix("env FOO=bar baz").unwrap(), "env");
+
+        // Process entries keep pid + sanitized name only when argv is absent.
+        let entry =
+            sanitize_foreground_process(&json!({"pid": 77, "name": "  less\n"}), Some(42), None)
+                .unwrap();
+        assert_eq!(entry["pid"], 77);
+        assert_eq!(entry["name"], "less");
+        assert_eq!(entry["command_prefix"], Value::Null);
+    }
+
+    /// user coordinator | Given foreground reports for shell-only, agent-own
+    /// and genuinely blocked panes | When the blocker summary is shaped |
+    /// Then shell-only and agent-only foregrounds yield no blocker while a
+    /// foreign program does.
+    #[test]
+    fn foreground_blocker_skips_shell_and_agent_foreground() {
+        // Agent-owned foreground only: the idle agent pane itself, no blocker.
+        let entry =
+            sanitize_foreground_process(&json!({"pid": 77, "name": "omp"}), Some(42), Some("omp"))
+                .unwrap();
+        assert_eq!(entry["agent"], true);
+        let entry =
+            sanitize_foreground_process(&json!({"pid": 78, "name": "less"}), Some(42), Some("omp"))
+                .unwrap();
+        assert_eq!(entry["agent"], Value::Null);
+
+        // Kind matching is basename- and case-exact to the reported kind.
+        assert!(agent_process_names_match("pi", "PI"));
+        assert!(!agent_process_names_match("pi", "pip"));
+        assert!(!agent_process_names_match("", "pi"));
+        assert!(!agent_process_names_match("pi", ""));
     }
 
     /// user planner | Given a session-scoped supervisor task that settles while
