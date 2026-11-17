@@ -9,7 +9,9 @@ Own: `herdr_methods`, `herdr_inspect`, `herdr_call`, `herdr_since`.
 
 ## State and targets
 
-Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Prefer `herdr_since(cursor)` for incremental changes. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
+Use `herdr_inspect` for a fresh workspace/pane/agent baseline, then reuse explicit IDs. Save its `since_cursor` and pass that exact integer to `herdr_since(cursor)` for incremental changes; the cursor is captured before the inspect snapshot, so events arriving during snapshot assembly are included by the following since call. If boot identity changes or the cursor resets, discard stale incremental assumptions and resynchronize.
+
+The compatibility fields `semantic_judgment` and `workstation_info.native_migration` are deprecated duplicates. Read the top-level `semantic` and top-level `native_migration` fields instead; the duplicate fields remain in the full inspect view for existing clients.
 
 Connected-tool shape:
 
@@ -38,6 +40,15 @@ device -> project/workspace -> continuity/history -> live Git/runtime -> require
 For Edge connectivity failures, consume structured recovery metadata when present. `workstation_offline` / `workstation_reconnecting` should expose `retryable=true`, `delivery_state=not_delivered`, `retry_after_ms`, and `recovery={action:"retry_read_only_probe",probe_tool:"herdr_inspect",max_attempts:3,backoff_ms:[5000,10000,20000],...}`. Follow that bounded read-only probe schedule rather than inferring a retry policy from prose. A mutation may be reissued after recovery only when the failed result explicitly proves `not_delivered`; `delivery_unknown`, `delivered`, or a missing delivery state requires live evidence before replay.
 
 Saved Herdr SSH-machine profiles and Edge devices are separate routing identities even when they reach the same physical workstation. Normal Web-planner work stays on the enrolled Edge route. Cross-transport recovery is allowed only after proven Edge non-delivery or live proof that the mutation was not applied; raw SSH is a final bootstrap/recovery path, never an implicit mutation fallback.
+
+## Bounded project pickup
+
+`herdr_mcp.work.pickup` returns a bounded projection (`projection.v = 1`) of the recorded project handoff, not the raw stored document. Its default response stays under 32 KB even when the stored handoff is megabytes, so it fits the Link's 256 KiB frame on the first call.
+
+- Selectors: `worktree`, `project_root`, `project_ref`, `cwd`, `pane`; with none it lists projects that have handoffs.
+- `limit_per_section` (default 20, max 50), `sections` (`goals`, `preferences`, `mistakes`, `tasks`), `query` (case-insensitive match on item id/text), `include_archived` (default false), `include_markdown` (default false), `max_bytes` (budget, max 245760).
+- Always read `truncated`, `total_counts`, and `archived_counts` before treating the projection as the whole handoff. `workspace` carries the full live `GitContext`; `handoff_md` is empty unless `include_markdown=true`, and never contains the trailing `<!-- relay-memory: ... -->` JSON comment.
+- An out-of-range or wrongly-typed option is an explicit `work_pickup_params_invalid` refusal; never assume it was clamped.
 
 ## Native methods
 
