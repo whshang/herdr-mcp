@@ -2832,6 +2832,7 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "repair_exhausted_at_ms",
     "steering_state",
     "superseded_by",
+    "foreground_blocker",
 ];
 
 /// Overlay `new_json` onto the row's stored `result_json`, keeping only keys
@@ -4890,7 +4891,7 @@ pub fn run_with_parent_session(
             .and_then(|state| state.state_change_seq)
             .zip(after.as_ref().and_then(|state| state.state_change_seq))
             .is_some_and(|(before, after)| before != after);
-        if submitted.is_some()
+        if submitted == Some(true)
             && !picked_up
             && !seq_advanced
             && !agent_busy_before
@@ -13430,6 +13431,7 @@ mod tests {
         task.repair_exhausted_at_ms = Some(1);
         task.steering_state = Some("x".to_owned());
         task.superseded_by = Some("x".to_owned());
+        task.foreground_blocker = Some(json!({"pane_id": "w1:p1"}));
         let value: Value = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
         let keys = value.as_object().unwrap();
         for key in keys.keys() {
