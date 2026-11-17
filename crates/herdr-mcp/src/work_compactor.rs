@@ -548,18 +548,23 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
                     .collect();
                 next_id(&ids, "t")
             });
+        let prior = previous.iter().find(|task| task.id == id);
         // An unchanged line keeps its age; an edited one counts as touched.
-        let updated_ms = previous
-            .iter()
-            .find(|task| task.id == id && task.text == text && task.status == status)
+        let updated_ms = prior
+            .filter(|task| task.text == text && task.status == status)
             .and_then(|task| task.updated_ms)
             .or(Some(now_ms));
+        // #H3a review P1: the disk markdown carries no `rule_derived` marker, so
+        // recovering it by id must not reset it — otherwise an unrelated file
+        // edit turns a moved rule back into an ordinary task and the same tick's
+        // merged-ref refresh deletes the text.
+        let rule_derived = prior.is_some_and(|task| task.rule_derived);
         folded.push(RelayTask {
             id,
             text,
             status,
             updated_ms,
-            rule_derived: false,
+            rule_derived,
         });
     }
     dedupe_tasks(&mut folded);
@@ -749,6 +754,8 @@ fn dedupe_tasks(tasks: &mut Vec<RelayTask>) {
                     kept.status = task.status;
                 }
                 kept.updated_ms = kept.updated_ms.max(task.updated_ms);
+                // #H3a review P1: a deduped pair keeps the guard marker.
+                kept.rule_derived |= task.rule_derived;
             }
             None => deduped.push(task),
         }
@@ -4869,6 +4876,92 @@ mod tests {
             "merged-ref closure still applies to real tasks"
         );
         assert_eq!(memory.tasks.len(), 2);
+    }
+
+    /// relay memory entry guard | Given a moved rule rendered to disk | When an
+    /// unrelated hand edit is folded back | Then the recovered task keeps
+    /// `rule_derived`, so the same tick's merged-ref refresh still keeps the
+    /// text instead of deleting it.
+    #[test]
+    fn hand_edit_fold_preserves_rule_derived_through_the_same_tick_refresh() {
+        let mut memory = RelayMemory::default();
+        let ops: HandoffOps = serde_json::from_value(serde_json::json!({
+            "preferences": [
+                {"op": "add", "id": "p1", "text": "do not repeat the PR #986 rollout style"}
+            ]
+        }))
+        .unwrap();
+        apply_memory_ops(&mut memory, ops, 1_000);
+        reclassify_bound_items(&mut memory, 1_000);
+        let moved = memory
+            .tasks
+            .iter()
+            .find(|task| task.text.contains("PR #986"))
+            .expect("moved task");
+        assert!(moved.rule_derived);
+        let moved_id = moved.id.clone();
+
+        // The rendered disk view carries no marker; an agent appends an
+        // unrelated task line (a plain hand edit).
+        let disk = render_handoff_markdown(&memory);
+        let edited = disk.replace(
+            "\n## 历史会话路径\n",
+            "\n- [t777] (todo) hand added follow-up\n\n## 历史会话路径\n",
+        );
+        assert_ne!(edited, disk);
+        let mut folded = memory.clone();
+        assert!(fold_file_edits(&mut folded, &edited, 2_000));
+        let recovered = folded
+            .tasks
+            .iter()
+            .find(|task| task.id == moved_id)
+            .expect("moved rule survives the fold");
+        assert!(
+            recovered.rule_derived,
+            "the fold must recover rule_derived by id: {recovered:?}"
+        );
+
+        // Same tick: merged evidence for PR #986 must not delete the text.
+        let merged = MergedRefs {
+            prs: vec![986],
+            branches: Vec::new(),
+        };
+        refresh_tasks(&mut folded, Some(&merged), 2_000);
+        assert!(
+            folded
+                .tasks
+                .iter()
+                .any(|task| task.text.contains("PR #986 rollout style")),
+            "moved rule text survived the refresh: {:?}",
+            folded.tasks
+        );
+        assert!(folded.tasks.iter().any(|task| task.id == "t777"));
+    }
+
+    /// relay memory dedupe | Given two copies of one text where only one is a
+    /// moved rule | When duplicates collapse | Then the survivor keeps the
+    /// guard marker.
+    #[test]
+    fn dedupe_of_task_copies_keeps_the_rule_derived_marker() {
+        let mut tasks = vec![
+            RelayTask {
+                id: "t1".to_owned(),
+                text: "do not repeat the PR #986 rollout style".to_owned(),
+                status: "todo".to_owned(),
+                updated_ms: Some(1),
+                rule_derived: true,
+            },
+            RelayTask {
+                id: "t2".to_owned(),
+                text: "Do not repeat the PR #986 rollout style".to_owned(),
+                status: "todo".to_owned(),
+                updated_ms: Some(2),
+                rule_derived: false,
+            },
+        ];
+        dedupe_tasks(&mut tasks);
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert!(tasks[0].rule_derived, "{tasks:?}");
     }
 
     /// relay memory entry guard | Given ops whose rule text is exactly at the
