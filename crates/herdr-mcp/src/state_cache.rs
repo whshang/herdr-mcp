@@ -763,6 +763,28 @@ impl EventCache {
         }
     }
 
+    /// #768 Phase 2 slice 2b: an inert cache for a runtime that has no TUI
+    /// event stream. It spawns no worker, never connects to a Herdr socket, and
+    /// stays not-ready, so no route can mistake it for a live TUI snapshot.
+    pub fn detached() -> Self {
+        let state = CacheState::default();
+        let (cursor_watch, _) = tokio::sync::watch::channel(state.digest_cursor);
+        Self {
+            shared: Arc::new(SharedCache {
+                state: RwLock::new(state),
+                cursor_watch,
+                ready: Mutex::new(false),
+                ready_condvar: Condvar::new(),
+                stop: AtomicBool::new(false),
+                stream_connected: AtomicBool::new(false),
+                stream_live: AtomicBool::new(false),
+                last_error: Mutex::new(None),
+            }),
+            worker: None,
+            boot_id: new_boot_id(),
+        }
+    }
+
     #[cfg(test)]
     pub fn from_snapshot_for_test(snapshot: Value) -> Self {
         let mut state = CacheState::default();
