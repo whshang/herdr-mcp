@@ -10441,8 +10441,19 @@ mod tests {
     /// user owner | Given an open decision gate | When any MCP caller class
     /// claims human approval | Then resolution is rejected with no mutation;
     /// unmapped WebChat callers also cannot create or cancel gates.
-    #[tokio::test]
-    async fn decision_gate_resolution_rejects_all_mcp_callers_without_mutation() {
+    #[test]
+    fn decision_gate_resolution_rejects_all_mcp_callers_without_mutation() {
+        // Admission is read from the process env at capture time; parallel
+        // backend-selection tests hold this lock while they switch it, so this
+        // test must hold it too instead of observing their temporary value.
+        // The guard cannot live across `await`, so the body runs on an
+        // explicit runtime inside the lock.
+        let _guard = crate::test_env::lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
         let root = test_root("gate-boundary");
         let (socket, _) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
@@ -10508,6 +10519,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_file(socket);
+        });
     }
 
     /// user cannot claim another conversation | Given an unmapped WebChat caller with a covering grant | When an explicit second-session ref accompanies its own source turn | Then dispatch stays unstamped and the mapping remains absent
