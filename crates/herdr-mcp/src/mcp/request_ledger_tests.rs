@@ -34,6 +34,7 @@ fn ledger_context<'a>(
         browser_mutation_gate: None,
         browser_mutation_admission: None,
         runtime_backend: backend,
+        admitted_config: None,
         trusted_local_ipc: true,
         wire_request_id: None,
     }
