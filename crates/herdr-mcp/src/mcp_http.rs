@@ -5151,6 +5151,198 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// #768 Phase 2 slice 3: `workstation.preflight` must never wrap a
+    /// `herdr-core` failure into `ok: true`. The Core envelope propagates
+    /// unchanged (`not_delivered`, `fallback_allowed:false`), while a TUI router
+    /// keeps its normal preflight.
+    #[cfg(unix)]
+    #[test]
+    fn herdr_core_preflight_propagates_fail_closed_core_envelopes() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-preflight-failclosed");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let missing_socket = root.join("no-such-core.sock");
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": missing_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let preflight = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "workstation.preflight", "params": {"endpoint_limit": 0}}),
+            )
+            .await;
+            assert_eq!(preflight["ok"], false, "{preflight}");
+            assert!(
+                matches!(
+                    preflight["code"].as_str(),
+                    Some("herdr_core_unreachable" | "herdr_core_socket_error")
+                ),
+                "{preflight}"
+            );
+            assert_eq!(preflight["delivery_state"], "not_delivered", "{preflight}");
+            assert_eq!(preflight["fallback_allowed"], false, "{preflight}");
+            assert_eq!(preflight["retryable"], false, "{preflight}");
+        });
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768 Phase 2 slice 3: `herdr_methods`, `herdr_inspect` and the forwarded
+    /// `server.status` all address the same admitted client, and their surfaces
+    /// are explicit observation projections (never authorization/ownership).
+    /// A same-node, wrong-PID conditional target is rejected after connect but
+    /// before the admission hello, with zero bytes written.
+    #[cfg(unix)]
+    #[test]
+    fn herdr_core_read_only_routes_share_one_client_and_project_observations() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-slice3-observations");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let core_socket = PathBuf::from(format!(
+            "/tmp/hc-slice3-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = root.join("calls.log");
+        let core = start_core_child(&core_socket, &log);
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            assert!(
+                methods["capability_projection"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("not authorization")),
+                "{methods}"
+            );
+            let inspected = methods["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["method"] == "server.status")
+                .expect("server.status is declared");
+            assert_eq!(inspected["declared_only"], true, "{inspected}");
+            let core_id = methods["herdr_core"]["core_id"].clone();
+            let target = methods["herdr_core"]["target_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+
+            let inspect = call_public_tool(&app, "herdr_inspect", json!({})).await;
+            assert_eq!(inspect["ok"], true, "{inspect}");
+            assert!(
+                inspect["terminal_ownership"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("not_asserted")),
+                "{inspect}"
+            );
+
+            let status = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "server.status", "params": {"expected_core_target": target}}),
+            )
+            .await;
+            assert_eq!(status["ok"], true, "{status}");
+            assert_eq!(status["result"]["live"], 7, "{status}");
+
+            // Same node, wrong peer PID: refused after connect, before hello.
+            let baseline = std::fs::read_to_string(&log).unwrap();
+            let wrong_pid = hc_target_segment_bumped(&target, 1);
+            let rejected = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "server.status", "params": {"expected_core_target": wrong_pid}}),
+            )
+            .await;
+            assert_eq!(rejected["code"], "herdr_core_target_changed", "{rejected}");
+            assert_eq!(rejected["delivery_state"], "not_delivered", "{rejected}");
+            assert_eq!(rejected["fallback_allowed"], false, "{rejected}");
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                baseline,
+                "a pre-hello peer-PID mismatch must write no request byte"
+            );
+            // The same admitted client/identity answered every read-only route.
+            assert_eq!(core_id, json!("fixture-core-a"), "{methods}");
+            assert_eq!(
+                inspect["herdr_core"]["core_id"], core_id,
+                "herdr_methods and herdr_inspect must report the same Core identity: {inspect}"
+            );
+        });
+        drop(core);
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// The public route refuses operations whose policy or identity contracts
     /// cannot be preserved and never delivers them to herdr-core.
     #[cfg(unix)]
