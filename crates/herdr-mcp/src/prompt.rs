@@ -117,6 +117,35 @@ const SPAWN_PANE_TIMEOUT_MS: u64 = 10_000;
 const SPAWN_PANE_SOCKET_FLOOR_MS: u64 = 4_000;
 const SPAWN_AGENT_NAME_MAX: usize = 32;
 
+/// #332 B-1: maps the agent-turn `lifecycle` onto the prompt steering
+/// vocabulary used by `steering_state`. `DeliveryUncertain` degrades to
+/// `submitted`: the runtime accepted the submission but cannot prove the
+/// agent saw it.
+fn steering_for_lifecycle(lifecycle: &PromptTaskLifecycle) -> &'static str {
+    match lifecycle {
+        PromptTaskLifecycle::AwaitingPriorSettle => "queued",
+        PromptTaskLifecycle::AwaitingActivity => "delivered",
+        PromptTaskLifecycle::Running => "acknowledged",
+        PromptTaskLifecycle::Completed => "applied",
+        PromptTaskLifecycle::Blocked | PromptTaskLifecycle::Failed => "rejected",
+        PromptTaskLifecycle::DeliveryUncertain => "submitted",
+    }
+}
+
+/// Advances the persisted steering stage to match a lifecycle the record just
+/// entered. A record marked `superseded` stays superseded until its own
+/// outcome lands (the agent picked it up anyway, or it went terminal);
+/// in-between transitions like prior-settle must never erase the fact.
+fn update_steering(task: &mut PromptTaskRecord) {
+    let mapped = steering_for_lifecycle(&task.lifecycle);
+    if task.steering_state.as_deref() == Some("superseded")
+        && matches!(mapped, "queued" | "delivered" | "submitted")
+    {
+        return;
+    }
+    task.steering_state = Some(mapped.to_owned());
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct AgentState {
     pane_id: Option<String>,
@@ -277,6 +306,21 @@ struct PromptTaskRecord {
     repair_attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repair_exhausted_at_ms: Option<u64>,
+    /// #332 B-1 steering lifecycle: how far this prompt has advanced through
+    /// `submitted|queued|delivered|acknowledged|applied|superseded|rejected`,
+    /// persisted independently from `lifecycle` (which tracks the agent's
+    /// turn, not the prompt's adoption). Absent on records written before
+    /// B-1; readers derive the same vocabulary from `lifecycle` then.
+    /// Once `superseded`, only an own-outcome transition (running/terminal)
+    /// may advance it — see `update_steering`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    steering_state: Option<String>,
+    /// Task/dispatch id of the newer steering that replaced this record while
+    /// it was still unacknowledged. Keeps recording even after the record
+    /// reaches its own terminal outcome, so status can tell "this prompt was
+    /// superseded by that dispatch" apart from "it applied".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -296,6 +340,16 @@ impl PromptTaskRecord {
             "active"
         }
     }
+    /// #332 B-1 steering facts shared by the full projection and the running
+    /// inbox row: the persisted stage when one was written, else the stage
+    /// derived from `lifecycle`, plus the superseding task id when recorded.
+    fn steering_json(&self) -> (String, Value) {
+        let stage = self
+            .steering_state
+            .clone()
+            .unwrap_or_else(|| steering_for_lifecycle(&self.lifecycle).to_owned());
+        (stage, json!(self.superseded_by))
+    }
 
     fn public_json_at(&self, now: u64) -> Value {
         let mut public = json!({
@@ -305,6 +359,8 @@ impl PromptTaskRecord {
             "pane_id": self.pane_id,
             "workspace_id": self.workspace_id,
             "lifecycle": self.lifecycle.as_str(),
+            "steering_state": self.steering_json().0,
+            "superseded_by": self.superseded_by,
             "liveness": self.liveness(now),
             "activity_observed": self.activity_observed,
             "prior_settle_observed": self.prior_settle_observed,
@@ -847,18 +903,51 @@ impl PromptRegistry {
             updated_at_ms: now,
             repair_attempts: 0,
             repair_exhausted_at_ms: None,
+            steering_state: None,
+            superseded_by: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
         }
+        update_steering(&mut record);
         record.stall_after_ms = stall_after_ms;
         record.max_runtime_ms = max_runtime_ms;
         record.on_budget = on_budget.map(str::to_owned);
         record.request_id = request_id.map(str::to_owned);
         self.save_task(&record, Some(fingerprint))?;
+        self.supersede_unacknowledged_tasks(&record)?;
         drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
         Ok(reconciled.or(Some(record)))
+    }
+    /// #332 B-1: every still-unacknowledged steering on this task's lane
+    /// (same resolved pane or same unresolved target) is superseded by the
+    /// record just persisted. Records already acknowledged (`running`) or
+    /// terminal keep their own stage: a new prompt cannot retroactively
+    /// unsend work the agent already picked up. Runs under the same
+    /// `task_mutations` guard as the task write, before the new record's
+    /// reconcile, so a stale snapshot cannot unmark a supersession.
+    fn supersede_unacknowledged_tasks(&self, task: &PromptTaskRecord) -> Result<(), String> {
+        let now = self.now_ms();
+        for mut prior in self.list_active_tasks()? {
+            if prior.task_id == task.task_id
+                || !task_matches_target(&prior, &task.target, task.pane_id.as_deref())
+            {
+                continue;
+            }
+            let prior_stage = prior
+                .steering_state
+                .clone()
+                .unwrap_or_else(|| steering_for_lifecycle(&prior.lifecycle).to_owned());
+            if !matches!(prior_stage.as_str(), "submitted" | "queued" | "delivered") {
+                continue;
+            }
+            prior.steering_state = Some("superseded".to_owned());
+            prior.superseded_by = Some(task.task_id.clone());
+            prior.updated_at_ms = now;
+            self.save_task(&prior, None)?;
+        }
+        Ok(())
     }
 
     fn task_report(&self, params: &Value) -> Value {
@@ -918,6 +1007,7 @@ impl PromptRegistry {
                 task.terminal_cursor = None;
                 task.awaiting_children = None;
                 task.notification_state = "pending".to_owned();
+                update_steering(&mut task);
             }
         }
         task.updated_at_ms = now;
@@ -2200,6 +2290,7 @@ impl PromptRegistry {
             task.terminal_cursor = None;
             task.awaiting_children = None;
             task.notification_state = "pending".to_owned();
+            update_steering(&mut task);
             self.save_task(&task, None)?;
             self.maybe_notify_parent_locked(&task);
             return self.load_task(task_id);
@@ -2438,6 +2529,7 @@ fn mark_delivery_uncertain(task: &mut PromptTaskRecord, now_ms: u64, reason: &st
     task.notification_state = "pending".to_owned();
     task.notification_error = Some(reason.to_owned());
     task.updated_at_ms = now_ms;
+    update_steering(task);
     true
 }
 
@@ -2493,7 +2585,7 @@ enum InboxView {
 /// `final_excerpt` is present only when captured and spares the planner an
 /// `agent.read` round trip; `awaiting_children` is present only while a
 /// supervisor is held for its own children.
-const COMPACT_TASK_FIELDS: [&str; 17] = [
+const COMPACT_TASK_FIELDS: [&str; 19] = [
     "task_id",
     "receipt_id",
     "request_id",
@@ -2502,6 +2594,8 @@ const COMPACT_TASK_FIELDS: [&str; 17] = [
     "target",
     "pane_id",
     "lifecycle",
+    "steering_state",
+    "superseded_by",
     "liveness",
     "terminal",
     "acknowledged",
@@ -2534,6 +2628,8 @@ fn running_task_row(task: PromptTaskRecord, now: u64) -> Value {
         "lifecycle": task.lifecycle.as_str(),
         "liveness": task.liveness(now),
         "terminal": false,
+        "steering_state": task.steering_json().0,
+        "superseded_by": task.superseded_by,
     });
     if let Some(requested) = &task.requested_target {
         row["target"] = json!(task.target);
@@ -2950,6 +3046,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
         task.terminal_at_ms = Some(now);
         task.notification_state = "pending".to_owned();
         task.updated_at_ms = now;
+        update_steering(task);
         return true;
     }
 
@@ -2961,6 +3058,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
             task.prior_settle_observed = true;
             task.lifecycle = PromptTaskLifecycle::AwaitingActivity;
             task.updated_at_ms = now;
+            update_steering(task);
             return true;
         }
         return false;
@@ -2984,6 +3082,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
                 task.turn_seq = Some(seq);
             }
             task.updated_at_ms = now;
+            update_steering(task);
             true
         }
         "blocked" => {
@@ -3002,6 +3101,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
             task.terminal_at_ms = Some(now);
             task.notification_state = "pending".to_owned();
             task.updated_at_ms = now;
+            update_steering(task);
             true
         }
         "idle" | "done" if task.activity_observed => {
@@ -3011,6 +3111,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
             task.terminal_at_ms = Some(now);
             task.notification_state = "pending".to_owned();
             task.updated_at_ms = now;
+            update_steering(task);
             true
         }
         _ => false,
@@ -3105,6 +3206,7 @@ fn hold_settled_task_for_children(task: &mut PromptTaskRecord, awaiting_children
     task.terminal_cursor = None;
     task.terminal_at_ms = None;
     task.final_excerpt = None;
+    update_steering(task);
 }
 
 /// Returns true when this same event batch already proves the pane moved past
@@ -9707,6 +9809,8 @@ mod tests {
             updated_at_ms: now.saturating_sub(age_ms),
             repair_attempts: 0,
             repair_exhausted_at_ms: None,
+            steering_state: None,
+            superseded_by: None,
         }
     }
 
@@ -10664,6 +10768,8 @@ mod tests {
                 "liveness",
                 "pane_id",
                 "receipt_id",
+                "steering_state",
+                "superseded_by",
                 "target",
                 "task_id",
                 "terminal",
@@ -11054,6 +11160,8 @@ mod tests {
             updated_at_ms: 1,
             repair_attempts: 0,
             repair_exhausted_at_ms: None,
+            steering_state: None,
+            superseded_by: None,
         }
     }
 
@@ -12296,6 +12404,174 @@ mod tests {
             .unwrap();
         assert_eq!(task.lifecycle, PromptTaskLifecycle::Running);
         task
+    }
+    /// Registers one still-pending task (submitted but the agent has not
+    /// entered `working` yet) through the real task path.
+    fn register_pending_task(
+        registry: &PromptRegistry,
+        task_id: &str,
+        target: &str,
+        pane_id: &str,
+        start_cursor: u64,
+    ) -> PromptTaskRecord {
+        let before = task_agent_state(pane_id, "idle", 1);
+        let after = task_agent_state(pane_id, "idle", 1);
+        let task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target,
+                requested_target: None,
+                fingerprint: task_id,
+                idempotency_key: None,
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor,
+                parent_target: None,
+                parent_session_ref: None,
+                stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::AwaitingActivity);
+        task
+    }
+
+    /// user coordinator | Given a still-pending steering on one agent | When
+    /// a second prompt targets the same pane | Then the earlier record is
+    /// `superseded` with `superseded_by` naming the newer task, the newer task
+    /// keeps its own stage, and `agent.task.status` reads both facts back.
+    #[test]
+    fn consecutive_prompts_supersede_unacknowledged_task() {
+        let (db_path, registry) = task_registry("supersede-pending");
+        let first_id = "dispatch:prompt:first";
+        let second_id = "dispatch:prompt:second";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+
+        let second = register_pending_task(&registry, second_id, "child", "w1:p1", 20);
+
+        let status = registry.task_status(first_id);
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["steering_state"], "superseded");
+        assert_eq!(status["task"]["superseded_by"], second_id);
+        assert_eq!(status["task"]["lifecycle"], "awaiting_activity");
+        assert_eq!(status["task"]["terminal"], false);
+
+        let second_status = registry.task_status(second_id);
+        assert_eq!(second_status["task"]["steering_state"], "delivered");
+        assert_eq!(second_status["task"]["superseded_by"], Value::Null);
+        assert_eq!(second.task_id, second_id);
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given an already-running steering on one agent |
+    /// When a second prompt targets the same pane | Then the acknowledged
+    /// record is left untouched: a new prompt cannot retroactively unsend
+    /// work the agent already picked up.
+    #[test]
+    fn acknowledged_task_is_not_superseded() {
+        let (db_path, registry) = task_registry("supersede-acknowledged");
+        let running_id = "dispatch:prompt:acknowledged";
+        register_running_task(&registry, running_id, "child", "w1:p1", None, None, 10);
+
+        register_pending_task(&registry, "dispatch:prompt:later", "child", "w1:p1", 20);
+
+        let status = registry.task_status(running_id);
+        assert_eq!(status["task"]["steering_state"], "acknowledged");
+        assert_eq!(status["task"]["superseded_by"], Value::Null);
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a steering superseded on one registry | When
+    /// the store is reopened (runtime restart) | Then `agent.task.status`
+    /// still reports `superseded` and the original `superseded_by` id.
+    #[test]
+    fn superseded_state_survives_restart() {
+        let (db_path, registry) = task_registry("supersede-restart");
+        let first_id = "dispatch:prompt:restart-first";
+        let second_id = "dispatch:prompt:restart-second";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+        register_pending_task(&registry, second_id, "child", "w1:p1", 20);
+        drop(registry);
+
+        let reopened =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(&db_path).unwrap())));
+        let status = reopened.task_status(first_id);
+        assert_eq!(status["task"]["steering_state"], "superseded");
+        assert_eq!(status["task"]["superseded_by"], second_id);
+
+        drop(reopened);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a superseded task that the agent picks up
+    /// anyway | When its own turn event arrives | Then its stage advances to
+    /// the real outcome while `superseded_by` keeps the audit fact.
+    #[test]
+    fn superseded_task_reports_its_own_outcome() {
+        let (db_path, registry) = task_registry("supersede-outcome");
+        let first_id = "dispatch:prompt:outcome-first";
+        let second_id = "dispatch:prompt:outcome-second";
+        register_pending_task(&registry, first_id, "child", "w1:p1", 10);
+        register_pending_task(&registry, second_id, "child", "w1:p1", 20);
+
+        let mut task = registry.load_task(first_id).unwrap().unwrap();
+        assert!(apply_task_event(
+            &mut task,
+            &json!({
+                "type": "pane.agent_status_changed", "pane_id": "w1:p1",
+                "agent_status": "working", "cursor": 30,
+            })
+        ));
+        update_steering(&mut task);
+        registry.save_task(&task, None).unwrap();
+
+        let status = registry.task_status(first_id);
+        assert_eq!(status["task"]["steering_state"], "acknowledged");
+        assert_eq!(status["task"]["superseded_by"], second_id);
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user coordinator | Given a durable record written before B-1 existed |
+    /// When it is decoded and projected | Then steering fields are absent on
+    /// disk but `agent.task.status` still reports the derived stage, and a
+    /// B-1 record survives an older reader that ignores the new fields.
+    #[test]
+    fn steering_fields_are_rollback_safe() {
+        let base = excerpt_test_task("dispatch:prompt:steering-serde");
+        assert_eq!(base.steering_state, None);
+        assert_eq!(base.superseded_by, None);
+        let old_shape = serde_json::to_string(&base).unwrap();
+        assert!(!old_shape.contains("steering_state"));
+        assert!(!old_shape.contains("superseded_by"));
+        let decoded: PromptTaskRecord = serde_json::from_str(&old_shape).unwrap();
+        assert_eq!(decoded.steering_state, None);
+        // Legacy row: public projection derives the stage from lifecycle.
+        let public = decoded.public_json_at(2);
+        assert_eq!(public["steering_state"], "acknowledged");
+        assert_eq!(public["superseded_by"], Value::Null);
+
+        // A B-1 row stays decodable for an older schema: unknown keys are
+        // ignored, matching the final_excerpt rollback rule.
+        let upgraded = serde_json::to_string(&base).unwrap().replace(
+            '}',
+            ",\"steering_state\":\"superseded\",\"superseded_by\":\"dispatch:prompt:newer\"}",
+        );
+        let decoded: PromptTaskRecord = serde_json::from_str(&upgraded).unwrap();
+        assert_eq!(decoded.steering_state.as_deref(), Some("superseded"));
+        assert_eq!(
+            decoded.superseded_by.as_deref(),
+            Some("dispatch:prompt:newer")
+        );
     }
 
     /// user planner | Given a session-scoped supervisor task that settles while
