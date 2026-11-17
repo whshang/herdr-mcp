@@ -599,6 +599,10 @@ pub fn print_doctor(
     // journal probe above: doctor never creates or migrates state.
     let mutation_leases =
         probe_mutation_leases(&continuity_state_dir.join("state.db"), unix_now_ms());
+    // #865: a first-Worker bootstrap that stalled mid-phase leaves only the
+    // durable journal under config_dir. Report it read-only so recovery can be
+    // diagnosed without re-running a mutating bootstrap.
+    let bootstrap_journal = crate::worker_bootstrap::probe_bootstrap_journal(paths);
     // Read-only herdr-core / Herdr app detection (#765) and WebChat grant
     // snapshot (#772). Neither affects Result.
     let herdr_core = crate::herdr_core::probe();
@@ -823,6 +827,7 @@ pub fn print_doctor(
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
     println!("{}", continuity_journal_layer(&continuity_journal));
+    println!("{}", bootstrap_journal_layer(&bootstrap_journal));
     println!("{}", mutation_leases_layer(&mutation_leases));
     println!("{}", webchat_grants.doctor_line(language));
     let orphan_candidates = std::env::var_os("HOME")
@@ -880,6 +885,7 @@ pub fn print_doctor(
         },
         "webchat_grants": webchat_grants.as_json(),
         "continuity_journal": continuity_journal_json(&continuity_journal),
+        "bootstrap_journal": bootstrap_journal_json(&bootstrap_journal),
         "mutation_leases": mutation_leases_json(&mutation_leases),
         "orphan_candidates": crate::residue::orphan_candidates_json(&orphan_candidates),
         "overall": readiness.as_str(),
@@ -1267,6 +1273,76 @@ fn continuity_journal_timestamp(at_ms: Option<i64>) -> String {
                 .ok()
         })
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// #865: one doctor line for the first-Worker bootstrap journal.
+///
+/// Same contract as the continuity journal layer: purely observational, so a
+/// missing or unreadable journal stays a non-fatal `absent`/`unreadable` and
+/// the line never echoes a path, error text, credential, account/Worker name,
+/// or device id. `release_match` uses the same release identity bootstrap
+/// validates on resume (runtime version + compiled source commit), so a stale
+/// journal is visible before any mutating rerun.
+fn bootstrap_journal_layer(
+    probe: &Result<Option<crate::worker_bootstrap::BootstrapJournalProbe>, String>,
+) -> String {
+    match probe {
+        Ok(Some(probe)) => format!(
+            "LAYER bootstrap-journal state=observed phase={} device={} recovery_upgrade={} updated={} release_match={}",
+            probe.phase,
+            if probe.device_enrolled {
+                "enrolled"
+            } else {
+                "none"
+            },
+            probe.recovery_upgrade,
+            bootstrap_journal_timestamp(probe.updated_at_ms),
+            bootstrap_release_match(probe),
+        ),
+        Ok(None) => {
+            "LAYER bootstrap-journal state=absent reason=bootstrap_journal_missing".to_owned()
+        }
+        Err(_) => "LAYER bootstrap-journal state=unreadable reason=bootstrap_journal_unreadable"
+            .to_owned(),
+    }
+}
+
+fn bootstrap_journal_json(
+    probe: &Result<Option<crate::worker_bootstrap::BootstrapJournalProbe>, String>,
+) -> Value {
+    match probe {
+        Ok(Some(probe)) => json!({
+            "state": "observed",
+            "phase": probe.phase,
+            "device_enrolled": probe.device_enrolled,
+            "recovery_upgrade": probe.recovery_upgrade,
+            "updated_at_ms": probe.updated_at_ms,
+            "runtime_version_mismatch": probe.journal_runtime_version
+                != crate::runtime_meta::runtime_version(),
+        }),
+        Ok(None) => json!({"state": "absent"}),
+        Err(_) => json!({"state": "unreadable"}),
+    }
+}
+
+/// Same release identity `validate_journal` requires for resume: the runtime
+/// version plus the compiled source commit (release builds report `release`
+/// when no commit is embedded, matching the runtime provenance line).
+fn bootstrap_release_match(probe: &crate::worker_bootstrap::BootstrapJournalProbe) -> bool {
+    probe.journal_runtime_version == crate::runtime_meta::runtime_version()
+        && probe.journal_source_commit
+            == crate::runtime_meta::compiled_source_commit().unwrap_or("release")
+}
+
+fn bootstrap_journal_timestamp(updated_at_ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(updated_at_ms) * 1_000_000)
+        .ok()
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "none".to_owned())
 }
 
 /// #926: one doctor line for active single-writer mutation leases.
@@ -2419,6 +2495,63 @@ mod tests {
         assert!(layer.contains("last_write=unknown"));
         assert!(!layer.contains("state.db"), "the layer never echoes a path");
         assert_eq!(continuity_journal_json(&unreadable)["state"], "unreadable");
+    }
+
+    /// user can see a stalled first-Worker bootstrap journal | Given the doctor
+    /// probe input | When the layer and JSON are rendered | Then the stalled
+    /// phase and enrollment state are visible, a version mismatch is reported,
+    /// and absent/unreadable journals never fail doctor nor leak a path,
+    /// credential, or error text.
+    #[test]
+    fn bootstrap_journal_doctor_layer_reports_phase_without_leaking_details() {
+        let observed = Ok(Some(crate::worker_bootstrap::BootstrapJournalProbe {
+            phase: "secrets_provisioned",
+            device_enrolled: false,
+            recovery_upgrade: true,
+            updated_at_ms: 1_700_000_123_456,
+            journal_runtime_version: "0.0.0-test".to_owned(),
+            journal_source_commit: "not-the-release-commit".to_owned(),
+        }));
+        let layer = bootstrap_journal_layer(&observed);
+        assert!(
+            layer.starts_with("LAYER bootstrap-journal state=observed"),
+            "{layer}"
+        );
+        assert!(layer.contains("phase=secrets_provisioned"), "{layer}");
+        assert!(layer.contains("device=none"), "{layer}");
+        assert!(layer.contains("recovery_upgrade=true"), "{layer}");
+        assert!(
+            layer.contains("updated=2023-11-14T22:15:23.456Z"),
+            "{layer}"
+        );
+        assert!(layer.contains("release_match=false"), "{layer}");
+        let json = bootstrap_journal_json(&observed);
+        assert_eq!(json["state"], "observed");
+        assert_eq!(json["phase"], "secrets_provisioned");
+        assert_eq!(json["device_enrolled"], false);
+        assert_eq!(json["recovery_upgrade"], true);
+        assert_eq!(json["updated_at_ms"], 1_700_000_123_456_u64);
+        assert_eq!(json["runtime_version_mismatch"], true);
+
+        assert_eq!(
+            bootstrap_journal_layer(&Ok(None)),
+            "LAYER bootstrap-journal state=absent reason=bootstrap_journal_missing"
+        );
+        assert_eq!(bootstrap_journal_json(&Ok(None))["state"], "absent");
+
+        let unreadable = Err(
+            "cannot read /Users/secret/.config/herdr-mcp/bootstrap/first-worker-v1.json".to_owned(),
+        );
+        let layer = bootstrap_journal_layer(&unreadable);
+        assert_eq!(
+            layer,
+            "LAYER bootstrap-journal state=unreadable reason=bootstrap_journal_unreadable"
+        );
+        assert!(
+            !layer.contains("first-worker-v1.json"),
+            "the layer never echoes a path"
+        );
+        assert_eq!(bootstrap_journal_json(&unreadable)["state"], "unreadable");
     }
 
     #[test]

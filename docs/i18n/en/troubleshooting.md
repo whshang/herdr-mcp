@@ -364,6 +364,12 @@ Use least-privilege credentials and fix the specific layer. Do not turn a route 
 
 See [Cloudflare Edge credentials](cloudflare-edge-token.md) and [Cloudflare Edge deployment](cloudflare-edge-deployment.md).
 
+## Symptom: first-device bootstrap failed but the Worker `/health` is 200
+
+The Worker is deployed; the local record of where bootstrap stopped is the durable journal. Run `herdr-mcp doctor` and read `LAYER bootstrap-journal`: it reports the stalled `phase`, `device=enrolled|none`, `recovery_upgrade`, the journal's `updated` time, and `release_match=false` when the journal belongs to a different release. The journal at `~/.config/herdr-mcp/bootstrap/first-worker-v1.json` is read-only evidence — never edit or delete it.
+
+When the journal shows first-device credentials were saved before the failed step, fix the local error and rerun `herdr-mcp worker bootstrap` on the same computer and OS account; retry authenticates the same device without re-pairing or reprovisioning fleet secrets. Missing, revoked, or mismatched credentials fail closed; previously revoked or deleted credentials cannot be restored this way. Never delete the Worker, hand-edit Worker secrets, or create a pairing manually.
+
 ## Symptom: runtime upgrade broke local behavior
 
 For an implementation change inside the same contract epoch:

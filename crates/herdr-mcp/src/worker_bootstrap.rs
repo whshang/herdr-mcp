@@ -60,6 +60,23 @@ enum Phase {
     OperationalReady,
 }
 
+impl Phase {
+    /// Snake-case serde name, for read-only diagnostics that must not expose
+    /// the internal enum.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Classified => "classified",
+            Self::SubdomainReady => "subdomain_ready",
+            Self::WorkerDeploying => "worker_deploying",
+            Self::WorkerDeployed => "worker_deployed",
+            Self::SecretsProvisioned => "secrets_provisioned",
+            Self::DeviceEnrolled => "device_enrolled",
+            Self::OperatorRemoved => "operator_removed",
+            Self::OperationalReady => "operational_ready",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BootstrapJournal {
     schema: u32,
@@ -4196,6 +4213,40 @@ fn read_journal(path: &Path) -> Result<Option<BootstrapJournal>, String> {
     Ok(Some(journal))
 }
 
+/// #865: read-only bootstrap journal projection for `herdr-mcp doctor`.
+///
+/// The probe exposes only non-secret, non-identifying fields: no account id,
+/// Worker name, origin, device id, or generation. Diagnostics never create,
+/// repair, or delete the journal; a missing file is `Ok(None)` and any
+/// read/parse/schema failure collapses to one fixed error so callers cannot
+/// echo a filesystem path or serde detail.
+pub(crate) struct BootstrapJournalProbe {
+    /// `Phase` serde name (snake_case).
+    pub phase: &'static str,
+    /// `canonical_device_id.is_some()` — enrollment proof without the id.
+    pub device_enrolled: bool,
+    pub recovery_upgrade: bool,
+    pub updated_at_ms: u64,
+    /// Release identity recorded in the journal, for drift reporting.
+    pub journal_runtime_version: String,
+    pub journal_source_commit: String,
+}
+
+pub(crate) fn probe_bootstrap_journal(
+    paths: &RuntimePaths,
+) -> Result<Option<BootstrapJournalProbe>, String> {
+    let journal = read_journal(&journal_path(paths))
+        .map_err(|_| "bootstrap journal is unreadable".to_owned())?;
+    Ok(journal.map(|journal| BootstrapJournalProbe {
+        phase: journal.phase.as_str(),
+        device_enrolled: journal.canonical_device_id.is_some(),
+        recovery_upgrade: journal.recovery_upgrade,
+        updated_at_ms: journal.updated_at_ms,
+        journal_runtime_version: journal.runtime_version,
+        journal_source_commit: journal.source_commit,
+    }))
+}
+
 fn write_journal(path: &Path, journal: &BootstrapJournal) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -4455,6 +4506,66 @@ fn read_hidden_line(prompt: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe_test_paths(tag: &str) -> (PathBuf, RuntimePaths) {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-bootstrap-probe-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let paths = RuntimePaths {
+            instance: crate::instance::InstanceId::default_instance(),
+            config_dir: dir.clone(),
+            config_file: dir.join("config.json"),
+            dev_state_dir: dir.join("dev-state"),
+            herdr_socket: None,
+        };
+        (dir, paths)
+    }
+
+    #[test]
+    fn bootstrap_journal_probe_reports_absent_and_observed_without_secrets() {
+        let (dir, paths) = probe_test_paths("states");
+        assert!(
+            probe_bootstrap_journal(&paths).unwrap().is_none(),
+            "a missing journal is absent, not an error"
+        );
+
+        // A pre-enrollment journal (phase never reached OperationalReady and no
+        // device id) is the recovery-relevant case: the probe reports the
+        // stalled phase without echoing Worker/account/device identifiers.
+        let mut journal = BootstrapJournal::new(
+            "a".repeat(40),
+            "1.0.0".into(),
+            "account-secret".into(),
+            "herdr-edge-secret".into(),
+        );
+        journal.phase = Phase::SecretsProvisioned;
+        journal.recovery_upgrade = true;
+        write_journal(&journal_path(&paths), &journal).unwrap();
+        let probe = probe_bootstrap_journal(&paths).unwrap().unwrap();
+        assert_eq!(probe.phase, "secrets_provisioned");
+        assert!(!probe.device_enrolled);
+        assert!(probe.recovery_upgrade);
+        assert_eq!(probe.updated_at_ms, journal.updated_at_ms);
+        assert_eq!(probe.journal_runtime_version, "1.0.0");
+        assert_eq!(probe.journal_source_commit, "a".repeat(40));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bootstrap_journal_probe_fails_closed_on_corrupt_or_foreign_schema() {
+        let (dir, paths) = probe_test_paths("errors");
+        let path = journal_path(&paths);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{ not json").unwrap();
+        assert!(probe_bootstrap_journal(&paths).is_err());
+        fs::write(&path, br#"{"schema": 99}"#).unwrap();
+        assert!(probe_bootstrap_journal(&paths).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn authenticated_registry_requires_unique_active_canonical_device() {

@@ -64,6 +64,8 @@ herdr-mcp worker bootstrap
 
 このコマンドは Cloudflare API 事前チェック、subdomain 解決、既存 Worker 検出、release manifest と `herdr-edge-<version>.mjs` artifact attestation、Worker/DO bootstrap、デバイス enrollment、資格情報、Link 整合を担う。Wrangler もソース checkout も不要。
 
+最初のデバイス資格情報と設定が保存された後に activation が失敗したら、ローカルのエラーを直し、同じコンピュータと同じ OS アカウントで `worker bootstrap` を再実行する。journal と資格情報は保持する：再試行は同じデバイスを再 pairing や fleet 秘密の再配布なしに認証する。欠落・失効・不一致の資格情報は fail closed で失敗し、以前に失効または削除された資格情報はこの経路では復元できない。
+
 公開 origin は Connector 作成前に一度選ぶ。
 - 適した active zone が一つなら `https://herdr-mcp.example.com/mcp` の Custom Domain。
 - 複数なら一度だけユーザーに選択を求める。
