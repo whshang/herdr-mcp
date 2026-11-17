@@ -438,3 +438,72 @@ test("mcp handler exposes device metadata in ChatGPT text", async () => {
   assert.equal(text.result.workspaces[0].id, "w1", "workspace id must remain bare in text-visible JSON");
   assert.equal(decodeDeviceRef(text.result.workspaces[0].workspace_ref).d, DEV_A, "workspace ref must retain device affinity");
 });
+
+test("nested spawn ref fields are scanned for routing and conflicts", async () => {
+  const refA = encodeDeviceRef(DEV_A, "w1");
+  const paneA = encodeDeviceRef(DEV_A, undefined, "w1:p1");
+  const refB = encodeDeviceRef(DEV_B, "w2");
+  // spawn.workspace_id contributes device evidence
+  const ext1 = extractDeviceIdFromArgs({ spawn: { kind: "pi", workspace_id: refA } });
+  assert.equal(ext1.deviceId, DEV_A);
+  assert.equal(ext1.field, "spawn.workspace_id");
+  // spawn.split_from is a pane field
+  const ext2 = extractDeviceIdFromArgs({ spawn: { kind: "pi", split_from: paneA } });
+  assert.equal(ext2.deviceId, DEV_A);
+  // kind mismatch inside spawn fails closed
+  const ext3 = extractDeviceIdFromArgs({ spawn: { workspace_id: paneA } });
+  assert.equal(ext3.deviceId, "__type_mismatch__");
+  assert.equal(ext3.field, "spawn.workspace_id");
+  // nested spawn vs top-level device conflict fails closed
+  const ext4 = extractDeviceIdFromArgs({ workspace: refA, spawn: { workspace_id: refB } });
+  assert.equal(ext4.deviceId, "__conflict__");
+  // herdr_call params.spawn is scanned too
+  const ext5 = extractDeviceIdFromArgs({ params: JSON.stringify({ spawn: { workspace_id: refA } }) });
+  assert.equal(ext5.deviceId, DEV_A);
+  assert.equal(ext5.field, "params.spawn.workspace_id");
+  // malformed ref inside spawn fails closed, not silently passed through
+  const ext6 = extractDeviceIdFromArgs({ spawn: { workspace_id: "herdr_ref_not-base64!!" } });
+  assert.equal(ext6.deviceId, "__malformed__");
+});
+
+test("split_from / parent_target / repair_of are ref-scanned fields", async () => {
+  const paneA = encodeDeviceRef(DEV_A, undefined, "w1:p1");
+  const refA = encodeDeviceRef(DEV_A, "w1");
+  const refB = encodeDeviceRef(DEV_B, "w2");
+  // pane fields at top level
+  assert.equal(extractDeviceIdFromArgs({ split_from: paneA }).deviceId, DEV_A);
+  assert.equal(extractDeviceIdFromArgs({ parent_target: paneA }).deviceId, DEV_A);
+  // kind mismatch on the new pane fields fails closed
+  assert.equal(extractDeviceIdFromArgs({ split_from: refA }).deviceId, "__type_mismatch__");
+  assert.equal(extractDeviceIdFromArgs({ parent_target: refA }).deviceId, "__type_mismatch__");
+  // repair_of is scan-only: device evidence counts, no type failure
+  assert.equal(extractDeviceIdFromArgs({ repair_of: paneA }).deviceId, DEV_A);
+  assert.equal(extractDeviceIdFromArgs({ repair_of: refA }).deviceId, DEV_A);
+  // a foreign-device repair ref still surfaces a conflict against a local field
+  const ext = extractDeviceIdFromArgs({ workspace: refA, repair_of: refB });
+  assert.equal(ext.deviceId, "__conflict__");
+});
+
+test("unwrapDeviceRefs unwraps nested spawn refs strictly by type", async () => {
+  const refA = encodeDeviceRef(DEV_A, "w1");
+  const paneA = encodeDeviceRef(DEV_A, undefined, "w1:p1");
+  const out = unwrapDeviceRefs({ spawn: { kind: "pi", workspace_id: refA, split_from: paneA } });
+  assert.equal(out.spawn.workspace_id, "w1");
+  assert.equal(out.spawn.split_from, "w1:p1");
+  // type mismatch inside spawn is never coerced
+  const mismatch = unwrapDeviceRefs({ spawn: { workspace_id: paneA } });
+  assert.equal(mismatch.spawn.workspace_id, paneA);
+  // params.spawn (object and string forms) unwraps too
+  const outParams = unwrapDeviceRefs({ params: { spawn: { workspace_id: refA }, split_from: paneA } });
+  assert.equal(outParams.params.spawn.workspace_id, "w1");
+  assert.equal(outParams.params.split_from, "w1:p1");
+  const outStr = unwrapDeviceRefs({ params: JSON.stringify({ spawn: { split_from: paneA } }) });
+  assert.equal(JSON.parse(outStr.params).spawn.split_from, "w1:p1");
+  // scan-only fields are never rewritten
+  const outRepair = unwrapDeviceRefs({ repair_of: paneA });
+  assert.equal(outRepair.repair_of, paneA);
+  // caller-owned nested objects are not mutated
+  const original = { spawn: { workspace_id: refA } };
+  unwrapDeviceRefs(original);
+  assert.equal(original.spawn.workspace_id, refA);
+});

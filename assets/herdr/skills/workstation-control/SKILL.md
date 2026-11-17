@@ -15,6 +15,7 @@ Connected-tool shape:
 
 - Put `device` inside the public tool arguments object. When multiple enrolled workstations are plausible, pass a device name or `device_id` explicitly. `herdr_devices` is the listing exception.
 - Bare workspace/pane ids are scoped to one selected device/Herdr server session; never reuse them as global ids across devices. Preserve device-aware opaque refs unchanged when Herdr returns them.
+- Device-bound `herdr_ref_*` values may appear in `workspace`, `workspace_id`, `pane_id`, `pane`, `target`, `split_from`, `parent_target`, nested `spawn.*` fields, and the scan-only `repair_of`. A ref for the called device resolves to its bare id; a ref for another device (or a malformed/unverifiable one) is rejected with `device_ref_conflict` — pass it back to the caller as-is instead of retrying with a stripped or guessed id.
 - `herdr_call` takes `method`, `params` as a JSON object (preferred) or a **JSON object string**, and optional top-level `device`. Encode the native/private method arguments inside `params`; do not spread those fields into the public tool call.
 
 UI/terminal focus is observational; mutations still require the intended explicit workspace/pane/project identity. Reconnect with read-only observations before deciding whether any uncertain mutation may be retried.
