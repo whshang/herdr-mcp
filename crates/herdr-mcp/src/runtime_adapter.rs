@@ -2460,7 +2460,11 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
                 "method": method,
                 "source": "herdr_core_hello",
                 "route": "herdr_core",
+                // `forwardable` is the static allowlist verdict, never an
+                // authorization: the peer's declaration plus this flag is an
+                // observation projection (slice 3).
                 "forwardable": hc_forwarding_refusal(method.trim()).is_none(),
+                "declared_only": true,
             })
         })
         .collect();
@@ -2492,6 +2496,10 @@ pub fn herdr_core_methods(client: &HerdrCoreClient, query: &str) -> Value {
         "count": methods.len(),
         "methods": methods,
         "source": "herdr-core hello.methods (dynamically negotiated)",
+        // Observation projection, never an authority: `hello.methods` proves the
+        // peer declares a method, not that the caller is authorized, the target
+        // is authenticated, or any terminal is owned by this runtime.
+        "capability_projection": "declared_by_peer; not authorization, authentication or ownership",
         "local_method_source": "herdr_mcp_local_registry",
         "runtime_backend": "herdr-core",
         "herdr_core": {
@@ -2803,6 +2811,13 @@ pub fn inspect_herdr_core_with_client(
         Ok(mut output) => {
             if let Some(obj) = output.as_object_mut() {
                 obj.insert("runtime_backend".to_owned(), selection.summary_json());
+                // Slice 3: global terminal counts are an observation projection.
+                // This runtime does not own `hc` terminals, so neither the
+                // counts nor `hello.methods` prove terminal ownership.
+                obj.insert(
+                    "terminal_ownership".to_owned(),
+                    json!("not_asserted: global hc terminal counts are observations only"),
+                );
             }
             output
         }
@@ -5417,5 +5432,39 @@ mod tests {
         assert_eq!(refusal["required_capability"], json!("public_tool_route"));
         assert_eq!(refusal["delivery_state"], json!("not_delivered"));
         assert_eq!(refusal["fallback_allowed"], json!(false));
+    }
+    /// #768 Phase 2 slice 3 (Windows): the Core IPC transport is explicitly
+    /// unsupported, never "assumed working". The refusal code is stable and the
+    /// platform classification of the route table does not depend on the OS.
+    #[cfg(windows)]
+    #[test]
+    fn windows_core_ipc_is_explicitly_unverified_and_classification_is_platform_independent() {
+        let error = connect_hc_socket(Path::new("/nonexistent/herdr.sock"), Duration::from_secs(1))
+            .expect_err("Windows Core IPC must fail closed");
+        assert_eq!(error.code, "herdr_core_windows_ipc_unverified");
+        let client = HerdrCoreClient::new("/nonexistent/herdr.sock");
+        let refusal = herdr_core_methods(&client, "");
+        assert_eq!(refusal["ok"], json!(false), "{refusal}");
+        assert_eq!(
+            refusal["code"],
+            json!("herdr_core_windows_ipc_unverified"),
+            "{refusal}"
+        );
+        assert_eq!(
+            refusal["delivery_state"],
+            json!("not_delivered"),
+            "{refusal}"
+        );
+        assert_eq!(refusal["fallback_allowed"], json!(false), "{refusal}");
+        // Classification itself is OS-independent: the same three read-only
+        // routes are servable and every mutating route stays refused.
+        assert_eq!(
+            core_public_route("herdr_methods").map(|route| route.kind),
+            Some(CorePublicRouteKind::ServableReadOnly)
+        );
+        assert_eq!(
+            core_public_route("herdr_fs_write").map(|route| route.kind),
+            Some(CorePublicRouteKind::PolicyBlockedParity)
+        );
     }
 }

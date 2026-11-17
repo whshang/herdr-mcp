@@ -2532,6 +2532,17 @@ fn browser_conversation_url_ref(
     Ok(None)
 }
 
+/// Core inspect codes that `workstation.preflight` must propagate unchanged
+/// (fail-closed) instead of wrapping into an `ok: true` summary.
+fn preflight_propagates_core_failure(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "herdr_core_target_changed" | "herdr_core_identity_changed" | "invalid_runtime_backend"
+        )
+    )
+}
+
 fn workstation_preflight_call(
     context: &RuntimeContext<'_>,
     params: &Value,
@@ -2574,8 +2585,17 @@ fn workstation_preflight_call(
         selection,
         core_client,
     );
+    // #768 Phase 2 slice 3: target/PID and backend-drift failures from the Core
+    // inspect must never be wrapped into a successful preflight. The Core
+    // envelope is propagated unchanged (it already carries `not_delivered`,
+    // `fallback_allowed:false`, `retryable:false` and the exact code) so a
+    // drifted target/identity can never be reported as success or fall back to
+    // TUI. Capability (e.g. a peer that does not advertise `server.status`) and
+    // plain transport failures keep the existing aggregate envelope: the local
+    // preflight summary is still valid then, and changing that is out of this
+    // slice.
     if selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
-        && inspect_view.get("code").and_then(Value::as_str) == Some("herdr_core_identity_changed")
+        && preflight_propagates_core_failure(inspect_view.get("code").and_then(Value::as_str))
     {
         return inspect_view;
     }
@@ -2762,6 +2782,8 @@ pub(crate) fn format_mutation_lease_conflict(
     if let Some(lease) = active_lease {
         payload.insert("project_root".to_owned(), json!(lease.project_root));
         payload.insert("lane_key".to_owned(), json!(lease.lane_key));
+        payload.insert("intent".to_owned(), json!(lease.intent));
+        payload.insert("readers".to_owned(), json!(lease.readers));
         payload.insert("holder_id".to_owned(), json!(lease.holder_id));
         payload.insert("lease_epoch".to_owned(), json!(lease.lease_epoch));
         payload.insert("device_id".to_owned(), json!(lease.device_id));
@@ -2822,6 +2844,7 @@ fn orchestration_lease_call(
                 "workspace_id",
                 "pane_id",
                 "branch",
+                "intent",
             ];
             for key in object.keys() {
                 if !ALLOWED.contains(&key.as_str()) {
@@ -2912,6 +2935,10 @@ fn orchestration_lease_call(
                 Ok(v) => v,
                 Err(err) => return err,
             };
+            let intent = match optional_str_field("intent") {
+                Ok(v) => v,
+                Err(err) => return err,
+            };
             let Ok(mut store) = context.state_store.lock() else {
                 return json!({"ok": false, "code": "state_store_unavailable", "retryable": true});
             };
@@ -2919,6 +2946,7 @@ fn orchestration_lease_call(
                 MutationLeaseAcquireInput {
                     project_root,
                     lane_key,
+                    intent,
                     holder_id: &holder_id,
                     lease_token: token_opt.as_deref(),
                     ttl_seconds,
@@ -2944,6 +2972,7 @@ fn orchestration_lease_call(
                         "reacquired": reacquired,
                         "project_root": lease.project_root,
                         "lane_key": lease.lane_key,
+                        "intent": lease.intent,
                         "holder_id": lease.holder_id,
                         "device_id": lease.device_id,
                         "lease_epoch": lease.lease_epoch,
@@ -32066,6 +32095,125 @@ mod client_request_shape_matrix_tests {
         .unwrap();
         assert_eq!(parse_tool_payload(&unleased_write)["ok"], true);
         assert_eq!(std::fs::read_to_string(&target_file).unwrap(), "v1\n");
+        // Shared read leases cannot authorize mutations, even through read_only exec.
+        let read_root = temp_root.join("read-repo");
+        std::fs::create_dir_all(&read_root).unwrap();
+        let read_target = read_root.join("target.txt");
+        std::fs::write(&read_target, "unchanged\n").unwrap();
+        let read_root_str = read_root.to_string_lossy().into_owned();
+        let acquire_reader = |holder: &str| {
+            let response = handle(
+                &json!({
+                    "jsonrpc": "2.0", "id": 201, "method": "tools/call",
+                    "params": {"name": "herdr_call", "arguments": {
+                        "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                        "params": {"project_root": read_root_str, "holder_id": holder,
+                                   "intent": "read", "ttl_seconds": 120}
+                    }}
+                }),
+                &ctx_anon,
+            )
+            .unwrap();
+            parse_tool_payload(&response)
+        };
+        let reader_a = acquire_reader("reader-a");
+        let reader_b = acquire_reader("reader-b");
+        assert_eq!(reader_a["ok"], true, "{reader_a}");
+        assert_eq!(reader_b["ok"], true, "{reader_b}");
+        assert_eq!(reader_a["intent"], "read");
+        assert_eq!(reader_b["intent"], "read");
+        let token_a = reader_a["lease_token"].as_str().unwrap();
+        let token_b = reader_b["lease_token"].as_str().unwrap();
+        assert_ne!(token_a, token_b);
+        let writer_response = handle(
+            &json!({
+                "jsonrpc": "2.0", "id": 202, "method": "tools/call",
+                "params": {"name": "herdr_call", "arguments": {
+                    "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                    "params": {"project_root": read_root_str, "holder_id": "writer",
+                               "intent": "write"}
+                }}
+            }),
+            &ctx_anon,
+        )
+        .unwrap();
+        let conflict = parse_tool_payload(&writer_response);
+        assert_eq!(
+            conflict["code"], "single_writer_lease_conflict",
+            "{conflict}"
+        );
+        assert_eq!(conflict["intent"], "read");
+        let readers = conflict["readers"].as_array().unwrap();
+        assert_eq!(readers.len(), 2);
+        assert!(
+            readers
+                .iter()
+                .any(|reader| reader["holder_id"] == "reader-a")
+        );
+        assert!(
+            readers
+                .iter()
+                .any(|reader| reader["holder_id"] == "reader-b")
+        );
+        let conflict_text = conflict.to_string();
+        assert!(!conflict_text.contains(token_a));
+        assert!(!conflict_text.contains(token_b));
+        assert!(!conflict_text.contains("lease_token"));
+
+        let reader_epoch = reader_a["lease_epoch"].as_i64().unwrap();
+        for (tool, arguments) in [
+            (
+                "herdr_fs_write",
+                json!({
+                    "path": read_target.to_string_lossy(), "content": "hacked\n",
+                    "overwrite": true, "confirm_dirty": true,
+                    "lease_holder_id": "reader-a", "lease_epoch": reader_epoch, "lease_token": token_a
+                }),
+            ),
+            (
+                "herdr_exec",
+                json!({
+                    "workspace": "w1", "project_root": read_root_str,
+                    "command": format!("echo hacked > {}", read_target.display()),
+                    "intent": "read_only", "lease_holder_id": "reader-a",
+                    "lease_epoch": reader_epoch, "lease_token": token_a
+                }),
+            ),
+        ] {
+            let response = handle(
+                &json!({"jsonrpc": "2.0", "id": 203, "method": "tools/call",
+                        "params": {"name": tool, "arguments": arguments}}),
+                &ctx_anon,
+            )
+            .unwrap();
+            let payload = parse_tool_payload(&response);
+            assert_eq!(
+                payload["code"], "single_writer_lease_conflict",
+                "{tool}: {payload}"
+            );
+            assert_eq!(
+                payload["delivery_state"], "not_delivered",
+                "{tool}: {payload}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&read_target).unwrap(),
+            "unchanged\n"
+        );
+
+        let invalid_intent = handle(
+            &json!({"jsonrpc": "2.0", "id": 204, "method": "tools/call",
+            "params": {"name": "herdr_call", "arguments": {
+                "method": ORCHESTRATION_LEASE_ACQUIRE_METHOD,
+                "params": {"project_root": read_root_str, "holder_id": "bad", "intent": 7}
+            }}}),
+            &ctx_anon,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_tool_payload(&invalid_intent)["code"],
+            "invalid_params"
+        );
 
         // 3. Acquire root lease for lane-a -> epoch 1 + unpredictable lease_token
         let acq_resp = handle(
@@ -33413,5 +33561,29 @@ mod text_transfer_safety_tests {
         if let Some(fake_core) = fake_core {
             fake_core.finish();
         }
+    }
+    /// #768 Phase 2 slice 3: the preflight projection escapes exactly the
+    /// target/identity/backend-drift codes and keeps the aggregate envelope for
+    /// capability/transport failures (documented slice boundary).
+    #[test]
+    fn preflight_propagates_only_target_identity_and_backend_drift() {
+        for code in [
+            "herdr_core_target_changed",
+            "herdr_core_identity_changed",
+            "invalid_runtime_backend",
+        ] {
+            assert!(preflight_propagates_core_failure(Some(code)), "{code}");
+        }
+        for code in [
+            "herdr_core_unreachable",
+            "herdr_core_socket_error",
+            "herdr_core_windows_ipc_unverified",
+            "runtime_capability_unsupported",
+            "herdr_core_peer_uid_mismatch",
+            "timeout",
+        ] {
+            assert!(!preflight_propagates_core_failure(Some(code)), "{code}");
+        }
+        assert!(!preflight_propagates_core_failure(None));
     }
 }

@@ -99,6 +99,41 @@ pub struct MutationLeaseView {
     pub branch: Option<String>,
     pub acquired_at: i64,
     pub expires_at: i64,
+    pub intent: String,
+    pub readers: Vec<crate::state_store::mutation_leases::MutationLeaseReader>,
+}
+
+#[derive(serde::Deserialize)]
+struct StatusStoredReader {
+    #[serde(flatten)]
+    reader: crate::state_store::mutation_leases::MutationLeaseReader,
+    token_sha256: String,
+    #[serde(rename = "updated_at")]
+    _updated_at: i64,
+    epoch: i64,
+}
+
+impl StatusStoredReader {
+    fn valid_for_epoch(&self, epoch: i64) -> bool {
+        let valid_id = |value: &str| {
+            !value.is_empty()
+                && value == value.trim()
+                && value.len() <= crate::state_store::mutation_leases::MAX_MUTATION_LEASE_ID_BYTES
+                && !value.chars().any(char::is_control)
+        };
+        self.epoch == epoch
+            && valid_id(&self.reader.holder_id)
+            && [
+                &self.reader.device_id,
+                &self.reader.workspace_id,
+                &self.reader.pane_id,
+                &self.reader.branch,
+            ]
+            .into_iter()
+            .all(|value| value.as_deref().is_none_or(valid_id))
+            && self.token_sha256.len() == 64
+            && self.token_sha256.chars().all(|c| c.is_ascii_hexdigit())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,31 +200,78 @@ pub fn probe_mutation_leases(state_db_path: &Path, now_ms: i64) -> MutationLease
     if !table_exists {
         return MutationLeasesProbe::Uninitialized;
     }
-    let mut stmt = match conn.prepare(
+    // Older binaries may have created the table without either auxiliary column.
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mutation_leases') WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    let (Ok(has_intent), Ok(has_readers)) = (has_column("intent"), has_column("readers_json"))
+    else {
+        return MutationLeasesProbe::Unreadable;
+    };
+    let sql = format!(
         "SELECT project_root, lane_key, holder_id, lease_epoch,
-                workspace_id, pane_id, branch, acquired_at, expires_at
+                workspace_id, pane_id, branch, acquired_at, expires_at, {}, {}
            FROM mutation_leases
           WHERE released_at IS NULL AND expires_at > ?1
           ORDER BY project_root, lane_key
           LIMIT 32",
-    ) {
+        if has_intent { "intent" } else { "NULL" },
+        if has_readers { "readers_json" } else { "NULL" },
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(stmt) => stmt,
         Err(_) => return MutationLeasesProbe::Unreadable,
     };
     let leases = match stmt.query_map([now_ms], |row| {
+        let lease_epoch: i64 = row.get(3)?;
+        let intent: Option<String> = row.get(9)?;
+        let intent = if intent.as_deref() == Some("read") {
+            "read"
+        } else {
+            "write"
+        };
+        let readers_json: Option<String> = row.get(10)?;
+        let readers = if intent == "read" {
+            let stored: Vec<StatusStoredReader> =
+                serde_json::from_str(readers_json.as_deref().unwrap_or("[]")).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            stored
+                .into_iter()
+                .filter(|entry| entry.valid_for_epoch(lease_epoch))
+                .take(64)
+                .filter(|entry| entry.reader.expires_at > now_ms)
+                .map(|entry| entry.reader)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(MutationLeaseView {
             project_root: row.get(0)?,
             lane_key: row.get(1)?,
             holder_id: row.get(2)?,
-            lease_epoch: row.get(3)?,
+            lease_epoch,
             workspace_id: row.get(4)?,
             pane_id: row.get(5)?,
             branch: row.get(6)?,
             acquired_at: row.get(7)?,
             expires_at: row.get(8)?,
+            intent: intent.to_owned(),
+            readers,
         })
     }) {
-        Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
+        Ok(rows) => match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(leases) => leases,
+            Err(_) => return MutationLeasesProbe::Unreadable,
+        },
         Err(_) => return MutationLeasesProbe::Unreadable,
     };
     if leases.is_empty() {
@@ -599,6 +681,10 @@ pub fn print_doctor(
     // journal probe above: doctor never creates or migrates state.
     let mutation_leases =
         probe_mutation_leases(&continuity_state_dir.join("state.db"), unix_now_ms());
+    // #865: a first-Worker bootstrap that stalled mid-phase leaves only the
+    // durable journal under config_dir. Report it read-only so recovery can be
+    // diagnosed without re-running a mutating bootstrap.
+    let bootstrap_journal = crate::worker_bootstrap::probe_bootstrap_journal(paths);
     // Read-only herdr-core / Herdr app detection (#765) and WebChat grant
     // snapshot (#772). Neither affects Result.
     let herdr_core = crate::herdr_core::probe();
@@ -823,6 +909,7 @@ pub fn print_doctor(
         crate::webchat_grants::summary_line(&webchat_grants, language)
     );
     println!("{}", continuity_journal_layer(&continuity_journal));
+    println!("{}", bootstrap_journal_layer(&bootstrap_journal));
     println!("{}", mutation_leases_layer(&mutation_leases));
     println!("{}", webchat_grants.doctor_line(language));
     let orphan_candidates = std::env::var_os("HOME")
@@ -880,6 +967,7 @@ pub fn print_doctor(
         },
         "webchat_grants": webchat_grants.as_json(),
         "continuity_journal": continuity_journal_json(&continuity_journal),
+        "bootstrap_journal": bootstrap_journal_json(&bootstrap_journal),
         "mutation_leases": mutation_leases_json(&mutation_leases),
         "orphan_candidates": crate::residue::orphan_candidates_json(&orphan_candidates),
         "overall": readiness.as_str(),
@@ -1269,6 +1357,76 @@ fn continuity_journal_timestamp(at_ms: Option<i64>) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// #865: one doctor line for the first-Worker bootstrap journal.
+///
+/// Same contract as the continuity journal layer: purely observational, so a
+/// missing or unreadable journal stays a non-fatal `absent`/`unreadable` and
+/// the line never echoes a path, error text, credential, account/Worker name,
+/// or device id. `release_match` uses the same release identity bootstrap
+/// validates on resume (runtime version + compiled source commit), so a stale
+/// journal is visible before any mutating rerun.
+fn bootstrap_journal_layer(
+    probe: &Result<Option<crate::worker_bootstrap::BootstrapJournalProbe>, String>,
+) -> String {
+    match probe {
+        Ok(Some(probe)) => format!(
+            "LAYER bootstrap-journal state=observed phase={} device={} recovery_upgrade={} updated={} release_match={}",
+            probe.phase,
+            if probe.device_enrolled {
+                "enrolled"
+            } else {
+                "none"
+            },
+            probe.recovery_upgrade,
+            bootstrap_journal_timestamp(probe.updated_at_ms),
+            bootstrap_release_match(probe),
+        ),
+        Ok(None) => {
+            "LAYER bootstrap-journal state=absent reason=bootstrap_journal_missing".to_owned()
+        }
+        Err(_) => "LAYER bootstrap-journal state=unreadable reason=bootstrap_journal_unreadable"
+            .to_owned(),
+    }
+}
+
+fn bootstrap_journal_json(
+    probe: &Result<Option<crate::worker_bootstrap::BootstrapJournalProbe>, String>,
+) -> Value {
+    match probe {
+        Ok(Some(probe)) => json!({
+            "state": "observed",
+            "phase": probe.phase,
+            "device_enrolled": probe.device_enrolled,
+            "recovery_upgrade": probe.recovery_upgrade,
+            "updated_at_ms": probe.updated_at_ms,
+            "runtime_version_mismatch": probe.journal_runtime_version
+                != crate::runtime_meta::runtime_version(),
+        }),
+        Ok(None) => json!({"state": "absent"}),
+        Err(_) => json!({"state": "unreadable"}),
+    }
+}
+
+/// Same release identity `validate_journal` requires for resume: the runtime
+/// version plus the compiled source commit (release builds report `release`
+/// when no commit is embedded, matching the runtime provenance line).
+fn bootstrap_release_match(probe: &crate::worker_bootstrap::BootstrapJournalProbe) -> bool {
+    probe.journal_runtime_version == crate::runtime_meta::runtime_version()
+        && probe.journal_source_commit
+            == crate::runtime_meta::compiled_source_commit().unwrap_or("release")
+}
+
+fn bootstrap_journal_timestamp(updated_at_ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(updated_at_ms) * 1_000_000)
+        .ok()
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "none".to_owned())
+}
+
 /// #926: one doctor line for active single-writer mutation leases.
 ///
 /// Purely observational: lease activity (or the inability to read it) must
@@ -1309,6 +1467,9 @@ fn mutation_leases_json(probe: &MutationLeasesProbe) -> Value {
                     "branch": lease.branch,
                     "acquired_at": lease.acquired_at,
                     "expires_at": lease.expires_at,
+                    "intent": lease.intent,
+                    "reader_count": lease.readers.len(),
+                    "readers": lease.readers,
                 })
             })
             .collect::<Vec<_>>(),
@@ -2421,6 +2582,63 @@ mod tests {
         assert_eq!(continuity_journal_json(&unreadable)["state"], "unreadable");
     }
 
+    /// user can see a stalled first-Worker bootstrap journal | Given the doctor
+    /// probe input | When the layer and JSON are rendered | Then the stalled
+    /// phase and enrollment state are visible, a version mismatch is reported,
+    /// and absent/unreadable journals never fail doctor nor leak a path,
+    /// credential, or error text.
+    #[test]
+    fn bootstrap_journal_doctor_layer_reports_phase_without_leaking_details() {
+        let observed = Ok(Some(crate::worker_bootstrap::BootstrapJournalProbe {
+            phase: "secrets_provisioned",
+            device_enrolled: false,
+            recovery_upgrade: true,
+            updated_at_ms: 1_700_000_123_456,
+            journal_runtime_version: "0.0.0-test".to_owned(),
+            journal_source_commit: "not-the-release-commit".to_owned(),
+        }));
+        let layer = bootstrap_journal_layer(&observed);
+        assert!(
+            layer.starts_with("LAYER bootstrap-journal state=observed"),
+            "{layer}"
+        );
+        assert!(layer.contains("phase=secrets_provisioned"), "{layer}");
+        assert!(layer.contains("device=none"), "{layer}");
+        assert!(layer.contains("recovery_upgrade=true"), "{layer}");
+        assert!(
+            layer.contains("updated=2023-11-14T22:15:23.456Z"),
+            "{layer}"
+        );
+        assert!(layer.contains("release_match=false"), "{layer}");
+        let json = bootstrap_journal_json(&observed);
+        assert_eq!(json["state"], "observed");
+        assert_eq!(json["phase"], "secrets_provisioned");
+        assert_eq!(json["device_enrolled"], false);
+        assert_eq!(json["recovery_upgrade"], true);
+        assert_eq!(json["updated_at_ms"], 1_700_000_123_456_u64);
+        assert_eq!(json["runtime_version_mismatch"], true);
+
+        assert_eq!(
+            bootstrap_journal_layer(&Ok(None)),
+            "LAYER bootstrap-journal state=absent reason=bootstrap_journal_missing"
+        );
+        assert_eq!(bootstrap_journal_json(&Ok(None))["state"], "absent");
+
+        let unreadable = Err(
+            "cannot read /Users/secret/.config/herdr-mcp/bootstrap/first-worker-v1.json".to_owned(),
+        );
+        let layer = bootstrap_journal_layer(&unreadable);
+        assert_eq!(
+            layer,
+            "LAYER bootstrap-journal state=unreadable reason=bootstrap_journal_unreadable"
+        );
+        assert!(
+            !layer.contains("first-worker-v1.json"),
+            "the layer never echoes a path"
+        );
+        assert_eq!(bootstrap_journal_json(&unreadable)["state"], "unreadable");
+    }
+
     #[test]
     fn parses_http_status_line() {
         assert_eq!(
@@ -2801,8 +3019,55 @@ mod tests {
                 "branch": "feat/a",
                 "acquired_at": now - 5_000,
                 "expires_at": now + 300_000,
+                "intent": "write",
+                "reader_count": 0,
+                "readers": [],
             })
         );
+        // New columns are observed without migrating legacy tables; stale epochs,
+        // expired readers, and stored capabilities must not reach doctor output.
+        {
+            let conn = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+            conn.execute_batch("ALTER TABLE mutation_leases ADD COLUMN intent TEXT; ALTER TABLE mutation_leases ADD COLUMN readers_json TEXT;").unwrap();
+            let reader = |holder: &str, epoch: i64, expires_at: i64| {
+                json!({
+                    "holder_id": holder, "device_id": "device-a", "workspace_id": "w1",
+                    "pane_id": "p1", "branch": "feat/a", "acquired_at": now - 500,
+                    "expires_at": expires_at, "epoch": epoch, "updated_at": now,
+                    "token_sha256": "a".repeat(64), "lease_token": "secret-token"
+                })
+            };
+            let mut readers = vec![
+                reader("active-reader", 1, now + 10_000),
+                reader("old-epoch", 2, now + 10_000),
+                reader("expired-reader", 1, now),
+            ];
+            let mut invalid = reader("invalid-digest", 1, now + 10_000);
+            invalid["token_sha256"] = json!("secret-digest");
+            readers.push(invalid);
+            readers.push(reader(" invalid-holder ", 1, now + 10_000));
+            let mut invalid = reader("invalid-metadata", 1, now + 10_000);
+            invalid["device_id"] = json!("");
+            readers.push(invalid);
+            let readers = serde_json::to_string(&readers).unwrap();
+            conn.execute(
+                "UPDATE mutation_leases SET intent = 'read', readers_json = ?1 WHERE project_root = '/Users/test/alpha'",
+                [readers.to_string()],
+            ).unwrap();
+        }
+        let projected = mutation_leases_json(&probe_mutation_leases(&dir.join("state.db"), now));
+        assert_eq!(projected["leases"][0]["intent"], "read");
+        assert_eq!(projected["leases"][0]["reader_count"], 1);
+        assert_eq!(
+            projected["leases"][0]["readers"][0],
+            json!({
+                "holder_id": "active-reader", "device_id": "device-a", "workspace_id": "w1",
+                "pane_id": "p1", "branch": "feat/a", "acquired_at": now - 500,
+                "expires_at": now + 10_000
+            })
+        );
+        assert!(!projected.to_string().contains("secret"));
+        assert!(!projected.to_string().contains(&"a".repeat(64)));
         // Zero unexpired rows reports idle, not absent.
         let idle = probe_mutation_leases(&dir.join("state.db"), now + 1_000_000);
         assert_eq!(idle, MutationLeasesProbe::Idle);

@@ -261,6 +261,80 @@ struct AppState {
     admitted_config: crate::runtime_adapter::AdmittedBackendConfig,
 }
 
+/// #768 Phase 2 slice 2b: the TUI-dependent background workers a candidate
+/// builds. A `herdr-core` candidate constructs and starts none of them; the
+/// admission fence in `candidate_startup` stays in place until this isolation is
+/// proven, so this plan is the single place that decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CandidateWorkerPlan {
+    /// Long-lived TUI snapshot/event-cursor worker (`EventCache::start`).
+    pub tui_event_cache: bool,
+    /// Exec sessions attach a TUI client for pane-backed sessions.
+    pub tui_exec_client: bool,
+    /// The agent-task tracker is woken by the TUI cache cursor.
+    pub tui_prompt_tracker: bool,
+    /// Work compaction reads the TUI cache.
+    pub work_compactor: bool,
+    /// Schema prewarm shells out to the Herdr TUI `api schema`.
+    pub tui_schema_prewarm: bool,
+}
+
+impl CandidateWorkerPlan {
+    pub(crate) fn for_backend(backend: crate::runtime_adapter::RuntimeBackend) -> Self {
+        let tui = backend != crate::runtime_adapter::RuntimeBackend::HerdrCore;
+        Self {
+            tui_event_cache: tui,
+            tui_exec_client: tui,
+            tui_prompt_tracker: tui,
+            work_compactor: tui,
+            tui_schema_prewarm: tui,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn starts_tui_workers(&self) -> bool {
+        self.tui_event_cache
+            || self.tui_exec_client
+            || self.tui_prompt_tracker
+            || self.work_compactor
+            || self.tui_schema_prewarm
+    }
+}
+
+/// Build exactly the workers the plan allows. This is the only construction path
+/// `serve_candidate` uses, so a test can prove the Core plan never touches a TUI
+/// socket or starts a TUI tracker.
+fn candidate_workers(
+    plan: CandidateWorkerPlan,
+    client: &HerdrClient,
+    state_store: &Arc<Mutex<StateStore>>,
+    exec_state_dir: &std::path::Path,
+) -> Result<(Arc<EventCache>, ExecRegistry, PromptRegistry), String> {
+    let cache = Arc::new(if plan.tui_event_cache {
+        EventCache::start(client.clone())
+    } else {
+        EventCache::detached()
+    });
+    let exec = ExecRegistry::new_with_client(
+        exec_state_dir.to_path_buf(),
+        plan.tui_exec_client.then(|| client.clone()),
+    )?;
+    let prompt = if plan.tui_prompt_tracker {
+        PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone())
+    } else {
+        PromptRegistry::with_store_only(state_store.clone())
+    };
+    if plan.work_compactor
+        && let Ok(store) = state_store.lock()
+    {
+        crate::work_compactor::start_background(&store, cache.clone());
+    }
+    if plan.tui_schema_prewarm {
+        crate::schema::prewarm_async();
+    }
+    Ok((cache, exec, prompt))
+}
+
 pub fn serve_candidate(
     port: u16,
     runtime_backend: crate::runtime_adapter::RuntimeBackendSelection,
@@ -283,7 +357,7 @@ pub fn serve_candidate(
         .herdr_socket
         .ok_or_else(|| "candidate runtime requires a Herdr local transport".to_owned())?;
     let client = HerdrClient::new(socket);
-    let cache = Arc::new(EventCache::start(client.clone()));
+    let worker_plan = CandidateWorkerPlan::for_backend(runtime_backend.backend);
     let exec_state_dir = env::var_os("HERDR_MCP_STATE_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.dev_state_dir.join("candidate"));
@@ -292,13 +366,9 @@ pub fn serve_candidate(
         "state",
     )?));
     runtime_started_at_ms();
-    let exec = ExecRegistry::new_with_client(exec_state_dir, Some(client.clone()))?;
-    let prompt = PromptRegistry::with_runtime(state_store.clone(), cache.clone(), client.clone());
-    if let Ok(store) = state_store.lock() {
-        crate::work_compactor::start_background(&store, cache.clone());
-    }
+    let (cache, exec, prompt) =
+        candidate_workers(worker_plan, &client, &state_store, &exec_state_dir)?;
     let skill = SkillService::new();
-    crate::schema::prewarm_async();
     // Herdr is a recoverable local dependency. EventCache owns reconnect/backoff,
     // so a temporarily absent Herdr server must not prevent the managed runtime
     // from starting or make installation transactional rollback permanent.
@@ -484,6 +554,54 @@ fn admitted_backend_refusal(path: &str, state: &AppState, message: &str) -> Resp
             "failure_phase": "backend_selection",
         }),
     )
+}
+
+/// #768 Phase 2 slice 2 (narrow): `GET /mcp` and `/push/events` stream the TUI
+/// snapshot/event-cursor model. `herdr-core` has no such stream, so the request
+/// is refused before the first frame instead of being kept as an unverified
+/// "connected" or empty stream. It never falls back to the TUI snapshot.
+fn core_tui_stream_refusal(path: &str, state: &AppState) -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        &json!({
+            "ok": false,
+            "code": "runtime_capability_unsupported",
+            "operation": "candidate_transport",
+            "path": path,
+            "required_capability": "tui_snapshot_stream",
+            "runtime_backend": state.runtime_backend.summary_json(),
+            "fallback_allowed": false,
+            "retryable": false,
+            "delivery_state": "not_delivered",
+            "failure_phase": "backend_capability",
+            "message": "the selected herdr-core backend has no TUI snapshot/event stream; the stream is not served and never falls back to the TUI snapshot",
+        }),
+    )
+}
+
+/// `herdr-core` has no TUI pane control surface; refuse before touching the
+/// TUI client/cache (#768 Phase 2 slice 2a).
+fn core_tui_pane_control_refusal(path: &str, state: &AppState) -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        &json!({
+            "ok": false,
+            "code": "runtime_capability_unsupported",
+            "operation": "candidate_transport",
+            "path": path,
+            "required_capability": "tui_pane_control",
+            "runtime_backend": state.runtime_backend.summary_json(),
+            "fallback_allowed": false,
+            "retryable": false,
+            "delivery_state": "not_delivered",
+            "failure_phase": "backend_capability",
+            "message": "the selected herdr-core backend has no TUI pane control surface; the action is not executed and never falls back to the TUI snapshot",
+        }),
+    )
+}
+
+fn admitted_backend_is_core(state: &AppState) -> bool {
+    state.runtime_backend.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
 }
 
 fn valid_extension_task_ref(value: &str) -> bool {
@@ -2007,6 +2125,11 @@ async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if !request_authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // #768 Phase 2 slice 2a: `/push/state` is a pure TUI snapshot. Under
+    // `herdr-core` it is refused before `state.cache` is read at all.
+    if admitted_backend_is_core(&state) {
+        return core_tui_stream_refusal("/push/state", &state);
+    }
     json_response(StatusCode::OK, &push_state_payload(&state.cache))
 }
 
@@ -2021,6 +2144,12 @@ async fn post_extension_control_action(State(state): State<AppState>, body: Byte
                 "code": "trusted_extension_ipc_required",
             }),
         );
+    }
+    // #768 Phase 2 slice 2a: this route executes through the TUI client/cache.
+    // Under `herdr-core` it is refused before the body is parsed or
+    // `browser_control::execute_action` is reached.
+    if admitted_backend_is_core(&state) {
+        return core_tui_pane_control_refusal("/extension/control/action", &state);
     }
     if body.len() > MAX_REQUEST_BYTES {
         return json_response(
@@ -2089,6 +2218,11 @@ async fn push_events(
 ) -> Response {
     if !request_authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    // #768 Phase 2 slice 2: the push stream carries TUI snapshot/event-cursor
+    // state, which `herdr-core` does not serve. Refuse before the hello frame.
+    if admitted_backend_is_core(&state) {
+        return core_tui_stream_refusal("/push/events", &state);
     }
     let filters = PushFilters {
         agent: query.get("agent").filter(|v| !v.is_empty()).cloned(),
@@ -2877,7 +3011,14 @@ fn iso_from_ms(value: u64) -> String {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
-    let mut payload = runtime_meta::health_fields(&state.cache, Some(&state.exec));
+    // #768 Phase 2 slice 2a: a Core-admitted candidate has no TUI event cache,
+    // so it reports an explicit `not_applicable` scope instead of the TUI
+    // diagnostics. TUI health output is unchanged.
+    let mut payload = if admitted_backend_is_core(&state) {
+        runtime_meta::health_fields_for_core(Some(&state.exec))
+    } else {
+        runtime_meta::health_fields(&state.cache, Some(&state.exec))
+    };
     payload.insert("ok".to_owned(), json!(true));
     let payload = Value::Object(payload);
     json_response(StatusCode::OK, &payload)
@@ -2893,6 +3034,12 @@ async fn get_mcp(State(state): State<AppState>, headers: HeaderMap) -> Response 
                 "id": null
             }),
         );
+    }
+    // #768 Phase 2 slice 2: a `GET /mcp` stream is the TUI transport. Under
+    // `herdr-core` it is refused before the first frame (no empty/success
+    // stream, no TUI snapshot fallback).
+    if admitted_backend_is_core(&state) {
+        return core_tui_stream_refusal("/mcp", &state);
     }
     if is_stateless_client(&headers, None) {
         return persistent_sse_response();
@@ -3945,6 +4092,100 @@ mod tests {
                 "diagnostic leaked {forbidden}"
             );
         }
+    }
+
+    /// user operator | Given a candidate backend | When the worker plan is
+    /// derived | Then only a TUI backend starts TUI workers, and `herdr-core`
+    /// starts none of them.
+    #[test]
+    fn candidate_worker_plan_starts_tui_workers_only_for_a_tui_backend() {
+        use crate::runtime_adapter::RuntimeBackend;
+        let core = CandidateWorkerPlan::for_backend(RuntimeBackend::HerdrCore);
+        assert_eq!(
+            core,
+            CandidateWorkerPlan {
+                tui_event_cache: false,
+                tui_exec_client: false,
+                tui_prompt_tracker: false,
+                work_compactor: false,
+                tui_schema_prewarm: false,
+            }
+        );
+        assert!(!core.starts_tui_workers());
+        assert!(CandidateWorkerPlan::for_backend(RuntimeBackend::Tui).starts_tui_workers());
+    }
+
+    /// user operator | Given a `herdr-core` candidate and a live TUI socket |
+    /// When the candidate workers are built | Then nothing connects to that
+    /// socket, no TUI tracker is started and the cache stays not-ready; the TUI
+    /// plan does connect, proving the sentinel observes real connections.
+    #[cfg(unix)]
+    #[test]
+    fn core_candidate_workers_open_no_tui_connection() {
+        use crate::runtime_adapter::RuntimeBackend;
+        use std::time::{Duration, Instant};
+
+        let root = test_root("s2b-candidate-workers");
+        std::fs::create_dir_all(&root).unwrap();
+        // A Unix socket path must stay under `SUN_LEN`; keep it in a short temp
+        // directory instead of the deep per-test root used for state files.
+        let socket_dir = std::env::temp_dir().join(format!(
+            "s2b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("h.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let store = Arc::new(Mutex::new(
+            StateStore::open_in_dir(&root, "state.db").unwrap(),
+        ));
+        let client = HerdrClient::new(socket_path.clone());
+
+        let (core_cache, _core_exec, core_prompt) = candidate_workers(
+            CandidateWorkerPlan::for_backend(RuntimeBackend::HerdrCore),
+            &client,
+            &store,
+            &root.join("exec-core"),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            listener.accept().is_err(),
+            "herdr-core must not connect to the TUI event socket"
+        );
+        assert!(!core_prompt.has_tui_runtime(), "no TUI tracker/client");
+        assert!(
+            !core_cache.wait_ready(Duration::from_millis(100)),
+            "the detached cache must stay not-ready"
+        );
+
+        // The same helper with the TUI plan really connects, so the sentinel is
+        // not vacuous.
+        let (_tui_cache, _tui_exec, tui_prompt) = candidate_workers(
+            CandidateWorkerPlan::for_backend(RuntimeBackend::Tui),
+            &client,
+            &store,
+            &root.join("exec-tui"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut connected = false;
+        while Instant::now() < deadline {
+            if listener.accept().is_ok() {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "the TUI plan must connect to the TUI socket");
+        assert!(tui_prompt.has_tui_runtime());
+        std::fs::remove_dir_all(socket_dir).ok();
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5060,6 +5301,7 @@ mod tests {
                     project_root: &project.to_string_lossy(),
                     lane_key: Some("*"),
                     holder_id: "other-writer",
+                    intent: None,
                     lease_token: None,
                     ttl_seconds: Some(600),
                     workspace_id: None,
@@ -5110,6 +5352,198 @@ mod tests {
             }
         }
         std::fs::remove_file(&core_socket).ok();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768 Phase 2 slice 3: `workstation.preflight` must never wrap a
+    /// `herdr-core` failure into `ok: true`. The Core envelope propagates
+    /// unchanged (`not_delivered`, `fallback_allowed:false`), while a TUI router
+    /// keeps its normal preflight.
+    #[cfg(unix)]
+    #[test]
+    fn herdr_core_preflight_propagates_fail_closed_core_envelopes() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-preflight-failclosed");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let missing_socket = root.join("no-such-core.sock");
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": missing_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let preflight = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "workstation.preflight", "params": {"endpoint_limit": 0}}),
+            )
+            .await;
+            assert_eq!(preflight["ok"], false, "{preflight}");
+            assert!(
+                matches!(
+                    preflight["code"].as_str(),
+                    Some("herdr_core_unreachable" | "herdr_core_socket_error")
+                ),
+                "{preflight}"
+            );
+            assert_eq!(preflight["delivery_state"], "not_delivered", "{preflight}");
+            assert_eq!(preflight["fallback_allowed"], false, "{preflight}");
+            assert_eq!(preflight["retryable"], false, "{preflight}");
+        });
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768 Phase 2 slice 3: `herdr_methods`, `herdr_inspect` and the forwarded
+    /// `server.status` all address the same admitted client, and their surfaces
+    /// are explicit observation projections (never authorization/ownership).
+    /// A same-node, wrong-PID conditional target is rejected after connect but
+    /// before the admission hello, with zero bytes written.
+    #[cfg(unix)]
+    #[test]
+    fn herdr_core_read_only_routes_share_one_client_and_project_observations() {
+        let _guard = crate::test_env::lock();
+        let root = test_root("core-slice3-observations");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let core_socket = PathBuf::from(format!(
+            "/tmp/hc-slice3-{}-{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = root.join("calls.log");
+        let core = start_core_child(&core_socket, &log);
+        std::fs::write(
+            config_dir.join("config.json"),
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let previous_config_dir = env::var_os("HERDR_MCP_CONFIG_DIR");
+        let previous_backend = env::var_os("HERDR_MCP_RUNTIME_BACKEND");
+        unsafe {
+            env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+            env::remove_var("HERDR_MCP_RUNTIME_BACKEND");
+        }
+        let mut state = test_state_with_snapshot(
+            &root.join("tcp"),
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        adopt_env_admitted_backend(&mut state);
+        let app = candidate_router(state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let methods = call_public_tool(&app, "herdr_methods", json!({})).await;
+            assert_eq!(methods["ok"], true, "{methods}");
+            assert!(
+                methods["capability_projection"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("not authorization")),
+                "{methods}"
+            );
+            let inspected = methods["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["method"] == "server.status")
+                .expect("server.status is declared");
+            assert_eq!(inspected["declared_only"], true, "{inspected}");
+            let core_id = methods["herdr_core"]["core_id"].clone();
+            let target = methods["herdr_core"]["target_ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+
+            let inspect = call_public_tool(&app, "herdr_inspect", json!({})).await;
+            assert_eq!(inspect["ok"], true, "{inspect}");
+            assert!(
+                inspect["terminal_ownership"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("not_asserted")),
+                "{inspect}"
+            );
+
+            let status = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "server.status", "params": {"expected_core_target": target}}),
+            )
+            .await;
+            assert_eq!(status["ok"], true, "{status}");
+            assert_eq!(status["result"]["live"], 7, "{status}");
+
+            // Same node, wrong peer PID: refused after connect, before hello.
+            let baseline = std::fs::read_to_string(&log).unwrap();
+            let wrong_pid = hc_target_segment_bumped(&target, 1);
+            let rejected = call_public_tool(
+                &app,
+                "herdr_call",
+                json!({"method": "server.status", "params": {"expected_core_target": wrong_pid}}),
+            )
+            .await;
+            assert_eq!(rejected["code"], "herdr_core_target_changed", "{rejected}");
+            assert_eq!(rejected["delivery_state"], "not_delivered", "{rejected}");
+            assert_eq!(rejected["fallback_allowed"], false, "{rejected}");
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                baseline,
+                "a pre-hello peer-PID mismatch must write no request byte"
+            );
+            // The same admitted client/identity answered every read-only route.
+            assert_eq!(core_id, json!("fixture-core-a"), "{methods}");
+            assert_eq!(
+                inspect["herdr_core"]["core_id"], core_id,
+                "herdr_methods and herdr_inspect must report the same Core identity: {inspect}"
+            );
+        });
+        drop(core);
+        unsafe {
+            match previous_config_dir {
+                Some(value) => env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+            match previous_backend {
+                Some(value) => env::set_var("HERDR_MCP_RUNTIME_BACKEND", value),
+                None => env::remove_var("HERDR_MCP_RUNTIME_BACKEND"),
+            }
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -5290,6 +5724,7 @@ mod tests {
                     project_root: &project.to_string_lossy(),
                     lane_key: Some("*"),
                     holder_id: "caller-holder",
+                    intent: None,
                     lease_token: None,
                     ttl_seconds: Some(600),
                     workspace_id: None,
@@ -13553,6 +13988,337 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768 Phase 2 slice 2a: the TUI snapshot JSON route and the TUI pane
+    /// control route are refused under `herdr-core` (both the loopback HTTP
+    /// router and the trusted-IPC clone), and `/health` reports an explicit
+    /// Core projection instead of TUI cache diagnostics. TUI behaviour is
+    /// unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn core_backend_refuses_tui_snapshot_json_and_pane_control_routes() {
+        use crate::runtime_adapter::{
+            AdmittedBackendConfig, EnvOverrides, RuntimeBackend, RuntimeBackendSelection,
+        };
+
+        let root = test_root("core-s2a-routes");
+        std::fs::create_dir_all(&root).unwrap();
+        let core_socket = root.join("core.sock");
+        let core_config_file = root.join("config.json");
+        std::fs::write(
+            &core_config_file,
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut core_state = test_state_with_snapshot(
+            &root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        core_state.runtime_backend = RuntimeBackendSelection {
+            backend: RuntimeBackend::HerdrCore,
+            source: "test",
+            herdr_core_socket: Some(core_socket.clone()),
+        };
+        core_state.admitted_config = AdmittedBackendConfig::from_parts(
+            core_config_file,
+            crate::instance::InstanceId::default_instance(),
+            EnvOverrides {
+                runtime_backend: Some("herdr-core".to_owned()),
+                hc_socket: Some(core_socket.clone()),
+                ..EnvOverrides::default()
+            },
+        );
+        core_state.trusted_extension_ipc = true;
+        let core_app = candidate_router(core_state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // GET /push/state (pure TUI snapshot JSON).
+            let response = core_app
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/push/state", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "/push/state");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"], "runtime_capability_unsupported",
+                "{payload}"
+            );
+            assert_eq!(
+                payload["required_capability"], "tui_snapshot_stream",
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+            assert_eq!(payload["retryable"], false, "{payload}");
+
+            // POST /extension/control/action on the trusted-IPC clone.
+            let response = core_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/extension/control/action")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{\"action\":\"unknown\"}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "/extension/control/action"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"], "runtime_capability_unsupported",
+                "{payload}"
+            );
+            assert_eq!(
+                payload["required_capability"], "tui_pane_control",
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+
+            // /health keeps its 200 envelope but never reports TUI cache state
+            // for a Core-admitted runtime.
+            let response = core_app
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/health", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/health");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["ok"], true, "{payload}");
+            assert_eq!(payload["event_cache"], Value::Null, "{payload}");
+            assert!(
+                payload["event_cache_scope"]
+                    .as_str()
+                    .is_some_and(|scope| scope.contains("not_applicable")),
+                "{payload}"
+            );
+        });
+
+        // TUI keeps the snapshot JSON, reaches the pane-control handler, and
+        // reports the normal event-cache diagnostics.
+        let tui_root = test_root("core-s2a-routes-tui");
+        std::fs::create_dir_all(&tui_root).unwrap();
+        let mut tui_state = test_state_with_snapshot(
+            &tui_root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        tui_state.trusted_extension_ipc = true;
+        let tui_app = candidate_router(tui_state);
+        runtime.block_on(async {
+            let response = tui_app
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/push/state", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/push/state tui");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(payload["boot_id"].is_string(), "{payload}");
+
+            let response = tui_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/extension/control/action")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{\"action\":\"unknown\"}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "TUI must reach the pane-control handler, not the Core refusal"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_ne!(
+                payload["code"], "runtime_capability_unsupported",
+                "{payload}"
+            );
+
+            let response = tui_app
+                .oneshot(rpc_request(Method::GET, "/health", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(payload["event_cache"].is_object(), "{payload}");
+            assert!(payload.get("event_cache_scope").is_none(), "{payload}");
+        });
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(tui_root).ok();
+    }
+
+    /// #768 Phase 2 slice 2 (narrow): the TUI snapshot/push streams are refused
+    /// under `herdr-core` before any frame (never an unverified "connected"
+    /// stream, never a TUI fallback), and the same routes still fail closed on
+    /// backend drift at connection time. Both admissions are pinned explicitly,
+    /// so this test never mutates process-global env.
+    #[cfg(unix)]
+    #[test]
+    fn core_backend_refuses_tui_snapshot_streams_and_drift_fences_get_mcp() {
+        use crate::runtime_adapter::{
+            AdmittedBackendConfig, EnvOverrides, RuntimeBackend, RuntimeBackendSelection,
+        };
+
+        let root = test_root("core-stream-admission");
+        std::fs::create_dir_all(&root).unwrap();
+        let core_socket = root.join("core.sock");
+        let core_config_file = root.join("config.json");
+        std::fs::write(
+            &core_config_file,
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut core_state = test_state_with_snapshot(
+            &root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        core_state.runtime_backend = RuntimeBackendSelection {
+            backend: RuntimeBackend::HerdrCore,
+            source: "test",
+            herdr_core_socket: Some(core_socket.clone()),
+        };
+        core_state.admitted_config = AdmittedBackendConfig::from_parts(
+            core_config_file,
+            crate::instance::InstanceId::default_instance(),
+            // Pin the resolved selection explicitly: this test must not depend
+            // on (or mutate) the process environment.
+            EnvOverrides {
+                runtime_backend: Some("herdr-core".to_owned()),
+                hc_socket: Some(core_socket.clone()),
+                ..EnvOverrides::default()
+            },
+        );
+        let core_app = candidate_router(core_state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for path in ["/mcp", "/push/events"] {
+                let response = core_app
+                    .clone()
+                    .oneshot(rpc_request(
+                        Method::GET,
+                        path,
+                        None,
+                        &[("user-agent", "openai-mcp/1.0")],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+                assert_ne!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("text/event-stream"),
+                    "{path} must not open an event stream under herdr-core"
+                );
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(payload["ok"], false, "{path}: {payload}");
+                assert_eq!(
+                    payload["code"], "runtime_capability_unsupported",
+                    "{path}: {payload}"
+                );
+                assert_eq!(
+                    payload["required_capability"], "tui_snapshot_stream",
+                    "{path}: {payload}"
+                );
+                assert_eq!(payload["fallback_allowed"], false, "{path}: {payload}");
+                assert_eq!(
+                    payload["delivery_state"], "not_delivered",
+                    "{path}: {payload}"
+                );
+                assert_eq!(payload["retryable"], false, "{path}: {payload}");
+            }
+        });
+
+        // TUI keeps both streams, and an admitted-TUI router fences `GET /mcp`
+        // once its pinned config drifts.
+        let tui_root = test_root("core-stream-admission-tui");
+        std::fs::create_dir_all(&tui_root).unwrap();
+        let tui_state = test_state_with_snapshot(
+            &tui_root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        let tui_app = candidate_router(tui_state);
+        runtime.block_on(async {
+            for path in ["/mcp", "/push/events"] {
+                let response = tui_app
+                    .clone()
+                    .oneshot(rpc_request(
+                        Method::GET,
+                        path,
+                        None,
+                        &[("user-agent", "openai-mcp/1.0")],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("text/event-stream"),
+                    "{path}"
+                );
+            }
+            // Drift the pinned TUI config after admission; the GET stream fences.
+            std::fs::write(
+                tui_root.join("config.json"),
+                br#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/tmp/herdr-core-stream-refusal.sock"}}"#,
+            )
+            .unwrap();
+            let drifted = tui_app
+                .oneshot(rpc_request(
+                    Method::GET,
+                    "/mcp",
+                    None,
+                    &[("user-agent", "openai-mcp/1.0")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(drifted.status(), StatusCode::CONFLICT);
+            let bytes = drifted.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"],
+                crate::runtime_adapter::INVALID_RUNTIME_BACKEND_CODE,
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+        });
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(tui_root).ok();
     }
 
     /// #768: a browser command queued while an SSE stream is already open must

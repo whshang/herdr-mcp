@@ -321,6 +321,27 @@ pub(crate) fn redact_command_summary(command: &str) -> String {
 }
 
 pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<String, Value> {
+    let mut output = health_fields_base(exec);
+    output.insert("event_cache".to_owned(), cache.health_diagnostics());
+    output
+}
+
+/// `herdr-core` health projection (#768 Phase 2 slice 2a).
+///
+/// A Core-admitted candidate has no TUI event cache, so it must not present the
+/// TUI cache diagnostics as its own health state. The field stays present (with
+/// an explicit scope marker) so existing readers keep a stable shape.
+pub fn health_fields_for_core(exec: Option<&ExecRegistry>) -> Map<String, Value> {
+    let mut output = health_fields_base(exec);
+    output.insert("event_cache".to_owned(), Value::Null);
+    output.insert(
+        "event_cache_scope".to_owned(),
+        json!("not_applicable: herdr-core has no TUI event cache"),
+    );
+    output
+}
+
+fn health_fields_base(exec: Option<&ExecRegistry>) -> Map<String, Value> {
     let sealed = env::var_os("HOME")
         .map(|home| {
             crate::link::seal::production_ready_from_seal(
@@ -350,7 +371,6 @@ pub fn health_fields(cache: &EventCache, exec: Option<&ExecRegistry>) -> Map<Str
         exec.map(ExecRegistry::health_diagnostics)
             .unwrap_or(Value::Null),
     );
-    output.insert("event_cache".to_owned(), cache.health_diagnostics());
     output
 }
 
