@@ -102,11 +102,11 @@ handoff  herdr-mcp webchat handoff --continuity-id hc:... --source-url URL
 リクエストが実際に通る順序で診断する。上の壊れたレイヤーを直すために健全なレイヤーを再起動しない：
 
 ```bash
-herdr-mcp status            # runtime、Herdr、TCC、1 行の健康状態
-herdr-mcp doctor            # レイヤー別証拠。デフォルト出力は簡潔
-herdr-mcp doctor --local    # 読み取り専用ローカルスナップショット:allow-list プロセス、
-                            # loopback ポート 8772、設定ファイルメタデータのみ
-herdr-mcp link status       # Link トランスポートと Edge ルーティング状態
+herdr-mcp status            # runtime, Herdr, TCC, one-line health
+herdr-mcp doctor            # per-layer evidence; default output is concise
+herdr-mcp doctor --local    # read-only local snapshot: allow-listed processes,
+                            # loopback port 8772, config-file metadata only
+herdr-mcp link status       # Link transport and Edge routing state
 ```
 
 `doctor --local` はファイル内容、環境変数、`state.db` を一切読まない。既定以外のポートで動く名前付きインスタンスが 8772 で `listening:false` を出すのは設計通り。完全な故障語彙と回復手順は [トラブルシューティング](troubleshooting.md) を参照。

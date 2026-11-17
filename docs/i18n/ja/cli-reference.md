@@ -201,8 +201,8 @@ runtime のログは `~/.config/herdr-mcp/` 配下のファイルであり、`he
 
 ```bash
 tail -f ~/.config/herdr-mcp/server.log                  # runtime server
-tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog プローブ
-tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link(macOS)
+tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog probes
+tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link (macOS)
 ```
 
 ローカルの HTTP `200` または `401` は runtime がリッスンしている証拠です。接続エラーはプロセス/ポートの問題を示します。
@@ -214,10 +214,10 @@ tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link(macOS)
 macOS では service install が周期的な `dev.herdr-mcp.health-watchdog` LaunchAgent を管理し、release checkout の `watchdog.sh` を実行します。手動制御:
 
 ```bash
-bin/watchdog.sh status      # ワンショットのヘルスプローブ + state ファイル
-bin/watchdog.sh once        # launchd なしで 1 回プローブ
-bin/watchdog.sh install     # LaunchAgent をインストール/再読み込み
-bin/watchdog.sh uninstall   # LaunchAgent をアンロードして削除
+bin/watchdog.sh status      # one-shot health probe + state file
+bin/watchdog.sh once        # probe once without launchd
+bin/watchdog.sh install     # install/reload the LaunchAgent
+bin/watchdog.sh uninstall   # unload and remove the LaunchAgent
 ```
 
 watchdog は herdr-mcp の可用性を保護します。一時的な Herdr TaskGroup/ExceptionGroup エラーのすべてを Herdr daemon を再起動すべき理由として扱うことはありません。

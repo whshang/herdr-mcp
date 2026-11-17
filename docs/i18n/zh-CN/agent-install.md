@@ -37,7 +37,7 @@ herdr-mcp doctor
 
 如果 `~/.local/bin/herdr-mcp` 已存在但交互 shell 找不到它，记为 `installed_but_not_on_shell_path`，修复用户 PATH 后用新 shell 验证。不要重复安装，也不要创建第二个 PATH owner。只有实际需要修 PATH 时再打开[故障排查](troubleshooting.md)。
 
-macOS 在 Cloudflare 工作前先执行 `herdr-mcp permissions status`；仅返回 `needs_setup` 时，集中引导用户为稳定 broker 授予完全磁盘访问权限一次，再执行 `permissions verify`；不先探测受保护路径，`sudo` 不能替代。broker 只承担 MCP 文件/Git 的 TCC；pane/Agent 的 TCC 取决于执行宿主。Linux 使用 release 自带 user-service / process backend；Windows 用当前用户 Startup 快捷方式 + Credential Manager。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
+macOS 在 Cloudflare 工作前先执行 `herdr-mcp permissions status`；仅返回 `needs_setup` 时，集中引导用户为稳定 broker 授予完全磁盘访问权限一次，再执行 `herdr-mcp permissions verify`；不先探测受保护路径，`sudo` 不能替代。broker 只承担 MCP 文件/Git 的 TCC；pane/Agent 的 TCC 取决于执行宿主。Linux 使用 release 自带 user-service / process backend；Windows 用当前用户 Startup 快捷方式 + Credential Manager。普通安装不需要 Node.js、Wrangler、npm 或 Cargo。
 
 ### 可选：快速语义判断
 
@@ -52,7 +52,7 @@ herdr-mcp semantic status
 
 ## 4. 第一台 Worker：Cloudflare + bootstrap
 
-Herdr 用 Cloudflare Workers Free 即可，不需绑卡；没有账号就先告知可免费注册，推荐 Google 登录。需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>，推荐 **Edit Cloudflare Workers** 模板并限定到本 Account；自定义 Token 需 **Account Settings → Read** 和 **Workers Scripts → Write/Edit**。`workers/subdomain` 返回 403 时指出缺失权限，不要无据扩大。**核心安装不需要 R2**；仅启用 artifact relay 时加 Workers R2 Storage。
+Herdr 用 Cloudflare Workers Free 即可，不需要绑卡；没有账号就先告知可免费注册，推荐 Google 登录。需要 Token 时打开 <https://dash.cloudflare.com/profile/api-tokens>，推荐 **Edit Cloudflare Workers** 模板并限定到本 Account；自定义 Token 需 **Account Settings → Read** 和 **Workers Scripts → Write/Edit**。`workers/subdomain` 返回 403 时指出缺失权限，不要无根据扩大权限。**核心安装不需要 R2**；仅启用 artifact relay 时加 Workers R2 Storage。
 
 Token 仅放入当前进程的 `CLOUDFLARE_API_TOKEN` 或交给 `worker bootstrap` 的隐藏输入。不要把 Token 写进命令行字面量、配置仓库或普通日志。
 

@@ -61,9 +61,11 @@ macOS の LaunchAgent インストールの場合：
 
 ```bash
 herdr-mcp status
-herdr-mcp logs
+herdr-mcp doctor --local
 herdr-mcp permissions status
 ```
+
+`herdr-mcp doctor --local` は allow-list のプロセス名/PID/開始時刻、loopback ポート `8772` の `listening:false` を含む listening 状態、設定ファイルの存在と mtime だけを返します。ファイル内容、環境変数、`state.db` は読みません。
 
 file/Git tool が `macos_tcc_access_blocked` を返す場合は、上記の macOS 権限の手順を参照してください。`not_found` 単体は TCC の遮断の証拠ではありませんが、保護されたパスではパスが無いと判断する前に `herdr-mcp permissions status` で確認してください。
 
