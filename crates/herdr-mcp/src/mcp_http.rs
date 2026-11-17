@@ -509,6 +509,27 @@ fn core_tui_stream_refusal(path: &str, state: &AppState) -> Response {
     )
 }
 
+/// `herdr-core` has no TUI pane control surface; refuse before touching the
+/// TUI client/cache (#768 Phase 2 slice 2a).
+fn core_tui_pane_control_refusal(path: &str, state: &AppState) -> Response {
+    json_response(
+        StatusCode::CONFLICT,
+        &json!({
+            "ok": false,
+            "code": "runtime_capability_unsupported",
+            "operation": "candidate_transport",
+            "path": path,
+            "required_capability": "tui_pane_control",
+            "runtime_backend": state.runtime_backend.summary_json(),
+            "fallback_allowed": false,
+            "retryable": false,
+            "delivery_state": "not_delivered",
+            "failure_phase": "backend_capability",
+            "message": "the selected herdr-core backend has no TUI pane control surface; the action is not executed and never falls back to the TUI snapshot",
+        }),
+    )
+}
+
 fn admitted_backend_is_core(state: &AppState) -> bool {
     state.runtime_backend.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
 }
@@ -2034,6 +2055,11 @@ async fn push_state(State(state): State<AppState>, headers: HeaderMap) -> Respon
     if !request_authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // #768 Phase 2 slice 2a: `/push/state` is a pure TUI snapshot. Under
+    // `herdr-core` it is refused before `state.cache` is read at all.
+    if admitted_backend_is_core(&state) {
+        return core_tui_stream_refusal("/push/state", &state);
+    }
     json_response(StatusCode::OK, &push_state_payload(&state.cache))
 }
 
@@ -2048,6 +2074,12 @@ async fn post_extension_control_action(State(state): State<AppState>, body: Byte
                 "code": "trusted_extension_ipc_required",
             }),
         );
+    }
+    // #768 Phase 2 slice 2a: this route executes through the TUI client/cache.
+    // Under `herdr-core` it is refused before the body is parsed or
+    // `browser_control::execute_action` is reached.
+    if admitted_backend_is_core(&state) {
+        return core_tui_pane_control_refusal("/extension/control/action", &state);
     }
     if body.len() > MAX_REQUEST_BYTES {
         return json_response(
@@ -2909,7 +2941,14 @@ fn iso_from_ms(value: u64) -> String {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
-    let mut payload = runtime_meta::health_fields(&state.cache, Some(&state.exec));
+    // #768 Phase 2 slice 2a: a Core-admitted candidate has no TUI event cache,
+    // so it reports an explicit `not_applicable` scope instead of the TUI
+    // diagnostics. TUI health output is unchanged.
+    let mut payload = if admitted_backend_is_core(&state) {
+        runtime_meta::health_fields_for_core(Some(&state.exec))
+    } else {
+        runtime_meta::health_fields(&state.cache, Some(&state.exec))
+    };
     payload.insert("ok".to_owned(), json!(true));
     let payload = Value::Object(payload);
     json_response(StatusCode::OK, &payload)
@@ -13783,6 +13822,186 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// #768 Phase 2 slice 2a: the TUI snapshot JSON route and the TUI pane
+    /// control route are refused under `herdr-core` (both the loopback HTTP
+    /// router and the trusted-IPC clone), and `/health` reports an explicit
+    /// Core projection instead of TUI cache diagnostics. TUI behaviour is
+    /// unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn core_backend_refuses_tui_snapshot_json_and_pane_control_routes() {
+        use crate::runtime_adapter::{
+            AdmittedBackendConfig, EnvOverrides, RuntimeBackend, RuntimeBackendSelection,
+        };
+
+        let root = test_root("core-s2a-routes");
+        std::fs::create_dir_all(&root).unwrap();
+        let core_socket = root.join("core.sock");
+        let core_config_file = root.join("config.json");
+        std::fs::write(
+            &core_config_file,
+            json!({
+                "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut core_state = test_state_with_snapshot(
+            &root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        core_state.runtime_backend = RuntimeBackendSelection {
+            backend: RuntimeBackend::HerdrCore,
+            source: "test",
+            herdr_core_socket: Some(core_socket.clone()),
+        };
+        core_state.admitted_config = AdmittedBackendConfig::from_parts(
+            core_config_file,
+            crate::instance::InstanceId::default_instance(),
+            EnvOverrides {
+                runtime_backend: Some("herdr-core".to_owned()),
+                hc_socket: Some(core_socket.clone()),
+                ..EnvOverrides::default()
+            },
+        );
+        core_state.trusted_extension_ipc = true;
+        let core_app = candidate_router(core_state);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // GET /push/state (pure TUI snapshot JSON).
+            let response = core_app
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/push/state", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "/push/state");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"], "runtime_capability_unsupported",
+                "{payload}"
+            );
+            assert_eq!(
+                payload["required_capability"], "tui_snapshot_stream",
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+            assert_eq!(payload["retryable"], false, "{payload}");
+
+            // POST /extension/control/action on the trusted-IPC clone.
+            let response = core_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/extension/control/action")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{\"action\":\"unknown\"}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "/extension/control/action"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                payload["code"], "runtime_capability_unsupported",
+                "{payload}"
+            );
+            assert_eq!(
+                payload["required_capability"], "tui_pane_control",
+                "{payload}"
+            );
+            assert_eq!(payload["delivery_state"], "not_delivered", "{payload}");
+            assert_eq!(payload["fallback_allowed"], false, "{payload}");
+
+            // /health keeps its 200 envelope but never reports TUI cache state
+            // for a Core-admitted runtime.
+            let response = core_app
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/health", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/health");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["ok"], true, "{payload}");
+            assert_eq!(payload["event_cache"], Value::Null, "{payload}");
+            assert!(
+                payload["event_cache_scope"]
+                    .as_str()
+                    .is_some_and(|scope| scope.contains("not_applicable")),
+                "{payload}"
+            );
+        });
+
+        // TUI keeps the snapshot JSON, reaches the pane-control handler, and
+        // reports the normal event-cache diagnostics.
+        let tui_root = test_root("core-s2a-routes-tui");
+        std::fs::create_dir_all(&tui_root).unwrap();
+        let mut tui_state = test_state_with_snapshot(
+            &tui_root,
+            json!({"workspaces": [], "panes": [], "agents": [], "tabs": []}),
+        );
+        tui_state.trusted_extension_ipc = true;
+        let tui_app = candidate_router(tui_state);
+        runtime.block_on(async {
+            let response = tui_app
+                .clone()
+                .oneshot(rpc_request(Method::GET, "/push/state", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "/push/state tui");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(payload["boot_id"].is_string(), "{payload}");
+
+            let response = tui_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/extension/control/action")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from("{\"action\":\"unknown\"}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "TUI must reach the pane-control handler, not the Core refusal"
+            );
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_ne!(
+                payload["code"], "runtime_capability_unsupported",
+                "{payload}"
+            );
+
+            let response = tui_app
+                .oneshot(rpc_request(Method::GET, "/health", None, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(payload["event_cache"].is_object(), "{payload}");
+            assert!(payload.get("event_cache_scope").is_none(), "{payload}");
+        });
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(tui_root).ok();
     }
 
     /// #768 Phase 2 slice 2 (narrow): the TUI snapshot/push streams are refused
