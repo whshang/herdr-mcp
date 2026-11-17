@@ -4613,7 +4613,13 @@ fn git_commit_diff_paths(
     }
     let diff = Command::new("git")
         .current_dir(root)
-        .args(["diff", "--name-only", before_head, after_head])
+        .args([
+            "diff",
+            "--name-only",
+            "--no-renames",
+            before_head,
+            after_head,
+        ])
         .output()
         .map_err(|error| format!("cannot read dispatch git commit diff: {error}"))?;
     if !diff.status.success() {
@@ -8053,6 +8059,71 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|path| path == "__HEAD__")
+        );
+    }
+
+    #[test]
+    fn dispatch_audit_checks_both_sides_of_a_committed_rename() {
+        let root = audit_repo("commit-rename");
+        fs::write(root.join("secret.txt"), "secret\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "secret.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=herdr-test@example.invalid",
+                    "-c",
+                    "user.name=herdr-test",
+                    "commit",
+                    "-qm",
+                    "add secret",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let before = git_audit_snapshot(&root).unwrap();
+        fs::create_dir(root.join("owned")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["mv", "secret.txt", "owned/secret.txt"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=herdr-test@example.invalid",
+                    "-c",
+                    "user.name=herdr-test",
+                    "commit",
+                    "-qm",
+                    "move secret",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let after = git_audit_snapshot(&root).unwrap();
+        let (audit, code) =
+            dispatch_audit_result(false, &["owned".to_owned()], &root, before, after);
+        assert_eq!(code, Some("scope_violation"), "{audit}");
+        assert_eq!(audit["result"], "scope_violation");
+        assert_eq!(
+            audit["changed_files"],
+            json!(["owned/secret.txt", "secret.txt"])
         );
     }
 
