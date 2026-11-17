@@ -119,7 +119,7 @@ probe のサブプロセスは stdin を受け取らず、3 秒の timeout と�
 
 ### Web planner 向けの動的プランニング助言
 
-現在のワークステーション Runtime Execution Contract は epoch 5 / 18 tools で、専用の planning tool は追加しません。first-party の公開 Edge contract は epoch 8 / 19 actions で、`herdr_devices` は Edge ローカルです。progressive な `herdr_skill` bootstrap は、既存の `herdr_call` tool を経由する読み取り専用のローカルメソッドを告知します:
+現在のワークステーション Runtime Execution Contract は epoch 6 / 18 tools で、専用の planning tool は追加しません。first-party の公開 Edge contract は epoch 8 / 19 actions で、`herdr_devices` は Edge ローカルです。progressive な `herdr_skill` bootstrap は、既存の `herdr_call` tool を経由する読み取り専用のローカルメソッドを告知します:
 
 ```text
 herdr_call(
@@ -195,7 +195,14 @@ herdr-mcp automation revoke <svc_client_id> --confirm
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 herdr-mcp status
-herdr-mcp logs
+```
+
+runtime のログは `~/.config/herdr-mcp/` 配下のファイルであり、`herdr-mcp logs` サブコマンドではありません:
+
+```bash
+tail -f ~/.config/herdr-mcp/server.log                  # runtime server
+tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog プローブ
+tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link(macOS)
 ```
 
 ローカルの HTTP `200` または `401` は runtime がリッスンしている証拠です。接続エラーはプロセス/ポートの問題を示します。
@@ -204,11 +211,13 @@ herdr-mcp logs
 
 ## Watchdog
 
-macOS では runtime watchdog をインストールできます:
+macOS では service install が周期的な `dev.herdr-mcp.health-watchdog` LaunchAgent を管理し、release checkout の `watchdog.sh` を実行します。手動制御:
 
 ```bash
-herdr-mcp watchdog install
-herdr-mcp watchdog status
+bin/watchdog.sh status      # ワンショットのヘルスプローブ + state ファイル
+bin/watchdog.sh once        # launchd なしで 1 回プローブ
+bin/watchdog.sh install     # LaunchAgent をインストール/再読み込み
+bin/watchdog.sh uninstall   # LaunchAgent をアンロードして削除
 ```
 
 watchdog は herdr-mcp の可用性を保護します。一時的な Herdr TaskGroup/ExceptionGroup エラーのすべてを Herdr daemon を再起動すべき理由として扱うことはありません。
@@ -216,6 +225,7 @@ watchdog は herdr-mcp の可用性を保護します。一時的な Herdr TaskG
 ## UI 言語
 
 ```bash
+herdr-mcp lang auto
 herdr-mcp lang en
 herdr-mcp lang zh
 herdr-mcp lang ja
@@ -317,7 +327,7 @@ bin/herdr-self-update
 | `HERDR_MCP_READONLY` | off | mutation を無効化 |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | 書き込み可能なプロジェクトを制限 |
 | `HERDR_MCP_AGENT_ALLOW` | all discovered agents | inspect/since での agent 可視性を任意で制限 |
-| `HERDR_MCP_ALL_TOOLS` | off | 高度/互換ツールを公開 |
+| `HERDR_MCP_ALL_TOOLS` | off | 旧 Node runtime のみ。Rust runtime は無視 |
 | `HERDR_SKILL_NETWORK` | on | `0` の場合はバンドルされた skill のみを使用 |
 
 ## クイックコマンドマップ
@@ -325,7 +335,7 @@ bin/herdr-self-update
 | 目的 | コマンド |
 |---|---|
 | runtime の status | `herdr-mcp status` |
-| ログを追う | `herdr-mcp logs -f` |
+| ログを追う | `tail -f ~/.config/herdr-mcp/server.log` |
 | 現在のソースを DEV runtime として dogfood する | `herdr-mcp dev sync` |
 | DEV/PROD provenance を確認する | `herdr-mcp dev status` |
 | DEV から固定 PROD に戻す | `herdr-mcp dev rollback` |

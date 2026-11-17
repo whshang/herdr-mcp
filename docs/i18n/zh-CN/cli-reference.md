@@ -120,7 +120,7 @@ probe 子进程没有 stdin，超时上限为三秒，输出有大小上限，�
 
 ### Web planner 的动态规划建议
 
-当前 workstation Runtime Execution Contract 为 epoch 5 / 18 tools，不新增专用 planning tool；first-party 公共 Edge contract 为 epoch 8 / 19 actions，其中 `herdr_devices` 只在 Edge 执行。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
+当前 workstation Runtime Execution Contract 为 epoch 6 / 18 tools，不新增专用 planning tool；first-party 公共 Edge contract 为 epoch 8 / 19 actions，其中 `herdr_devices` 只在 Edge 执行。`herdr_skill` 的 progressive bootstrap 会声明一个现有 `herdr_call` 可调用的本地只读方法：
 
 ```text
 herdr_call(
@@ -195,8 +195,14 @@ herdr-mcp automation revoke <svc_client_id> --confirm
 
 ```bash
 herdr-mcp status
-herdr-mcp logs
-herdr-mcp logs -f
+```
+
+runtime 日志是 `~/.config/herdr-mcp/` 下的文件，不是 `herdr-mcp logs` 子命令：
+
+```bash
+tail -f ~/.config/herdr-mcp/server.log                  # runtime server
+tail -f ~/.config/herdr-mcp/health-watchdog.log         # watchdog 探测
+tail -f ~/.config/herdr-mcp/link-prod.launchd.out.log   # production Link(macOS)
 ```
 
 排障时最好先记录状态再重启。
@@ -206,7 +212,6 @@ herdr-mcp logs -f
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8772/
 herdr-mcp status
-herdr-mcp logs
 ```
 
 即使是 loopback，`http://127.0.0.1:8772/mcp` 也故意保持鉴权。第一方本机客户端可以从受保护的本地状态自动取得 runtime credential，让用户无需手工粘贴；裸 `curl` 或第三方 TCP client 必须显式带 bearer。官方浏览器插件不使用这个 TCP token，而是通过 Chromium Native Messaging 进入 mode-`0600` 的 `extension.sock` trusted IPC；这条通道本身 tokenless，并会剥离网页传入的 `Authorization`。
@@ -215,11 +220,13 @@ herdr-mcp logs
 
 ## Watchdog
 
-macOS 可以安装本机 watchdog：
+macOS 上 service install 会管理周期性的 `dev.herdr-mcp.health-watchdog` LaunchAgent,执行 release checkout 里的 `watchdog.sh`。手动控制:
 
 ```bash
-herdr-mcp watchdog install
-herdr-mcp watchdog status
+bin/watchdog.sh status      # 一次性健康探测 + 状态文件
+bin/watchdog.sh once        # 不走 launchd 探测一次
+bin/watchdog.sh install     # 安装/重载 LaunchAgent
+bin/watchdog.sh uninstall   # 卸载并移除 LaunchAgent
 ```
 
 它用于发现 herdr-mcp runtime 自身失联并按受控策略恢复，不把每一次 Herdr TaskGroup/ExceptionGroup 控制面毛刺都当成 daemon 必须重启。
@@ -229,6 +236,7 @@ herdr-mcp watchdog status
 ## UI 语言
 
 ```bash
+herdr-mcp lang auto
 herdr-mcp lang en
 herdr-mcp lang zh
 herdr-mcp lang ja
@@ -361,7 +369,7 @@ bin/herdr-link
 | `HERDR_MCP_READONLY` | 关 | 禁止 mutation |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | 缩小允许写的项目范围 |
 | `HERDR_MCP_AGENT_ALLOW` | 全部已发现 Agent | 可选地限制 inspect/since 展示哪些 Agent |
-| `HERDR_MCP_ALL_TOOLS` | 关 | 打开高级/兼容工具；正常 ChatGPT 不需要 |
+| `HERDR_MCP_ALL_TOOLS` | 关 | 仅旧 Node runtime 使用；Rust runtime 忽略 |
 | `HERDR_SKILL_NETWORK` | 开 | `0` 时只使用 bundled skill |
 
 ## 命令怎么选
@@ -369,7 +377,7 @@ bin/herdr-link
 | 目标 | 命令 |
 |---|---|
 | 看本机 runtime 是否活着 | `herdr-mcp status` |
-| 看错误 | `herdr-mcp logs -f` |
+| 看错误 | `tail -f ~/.config/herdr-mcp/server.log` |
 | 把当前源码 dogfood 为 DEV runtime | `herdr-mcp dev sync` |
 | 查看 DEV/PROD provenance | `herdr-mcp dev status` |
 | 从 DEV 回到固定 PROD | `herdr-mcp dev rollback` |
