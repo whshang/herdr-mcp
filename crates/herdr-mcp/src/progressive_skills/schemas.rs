@@ -430,9 +430,27 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                     "project_ref": {"type": "string", "maxLength": 512},
                     "cwd": {"type": "string", "maxLength": 4096},
                     "pane": {"type": "string", "maxLength": 256},
+                    "limit_per_section": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 20,
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["goals", "preferences", "mistakes", "tasks"],
+                        },
+                        "minItems": 1,
+                    },
+                    "query": {"type": "string", "maxLength": 512},
+                    "include_archived": {"type": "boolean", "default": false},
+                    "include_markdown": {"type": "boolean", "default": false},
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 245760},
                 },
                 "required": [],
-                "description": "Pass worktree or project_root (or cwd/pane to resolve the caller's project); with no selector, lists projects that have handoffs.",
+                "description": "Pass worktree or project_root (or cwd/pane to resolve the caller's project); with no selector, lists projects that have handoffs. The response is a bounded projection (projection.v=1): sections are capped by limit_per_section (default 20, max 50), optional sections/query filters, total_counts/archived_counts/truncated metadata, and the full workspace git context. handoff_md is empty unless include_markdown=true, and the trailing relay-memory JSON comment is never returned.",
             },
         }),
         json!({
