@@ -2532,6 +2532,17 @@ fn browser_conversation_url_ref(
     Ok(None)
 }
 
+/// Core inspect codes that `workstation.preflight` must propagate unchanged
+/// (fail-closed) instead of wrapping into an `ok: true` summary.
+fn preflight_propagates_core_failure(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some(
+            "herdr_core_target_changed" | "herdr_core_identity_changed" | "invalid_runtime_backend"
+        )
+    )
+}
+
 fn workstation_preflight_call(
     context: &RuntimeContext<'_>,
     params: &Value,
@@ -2574,8 +2585,17 @@ fn workstation_preflight_call(
         selection,
         core_client,
     );
+    // #768 Phase 2 slice 3: target/PID and backend-drift failures from the Core
+    // inspect must never be wrapped into a successful preflight. The Core
+    // envelope is propagated unchanged (it already carries `not_delivered`,
+    // `fallback_allowed:false`, `retryable:false` and the exact code) so a
+    // drifted target/identity can never be reported as success or fall back to
+    // TUI. Capability (e.g. a peer that does not advertise `server.status`) and
+    // plain transport failures keep the existing aggregate envelope: the local
+    // preflight summary is still valid then, and changing that is out of this
+    // slice.
     if selection.backend == crate::runtime_adapter::RuntimeBackend::HerdrCore
-        && inspect_view.get("code").and_then(Value::as_str) == Some("herdr_core_identity_changed")
+        && preflight_propagates_core_failure(inspect_view.get("code").and_then(Value::as_str))
     {
         return inspect_view;
     }
@@ -33413,5 +33433,29 @@ mod text_transfer_safety_tests {
         if let Some(fake_core) = fake_core {
             fake_core.finish();
         }
+    }
+    /// #768 Phase 2 slice 3: the preflight projection escapes exactly the
+    /// target/identity/backend-drift codes and keeps the aggregate envelope for
+    /// capability/transport failures (documented slice boundary).
+    #[test]
+    fn preflight_propagates_only_target_identity_and_backend_drift() {
+        for code in [
+            "herdr_core_target_changed",
+            "herdr_core_identity_changed",
+            "invalid_runtime_backend",
+        ] {
+            assert!(preflight_propagates_core_failure(Some(code)), "{code}");
+        }
+        for code in [
+            "herdr_core_unreachable",
+            "herdr_core_socket_error",
+            "herdr_core_windows_ipc_unverified",
+            "runtime_capability_unsupported",
+            "herdr_core_peer_uid_mismatch",
+            "timeout",
+        ] {
+            assert!(!preflight_propagates_core_failure(Some(code)), "{code}");
+        }
+        assert!(!preflight_propagates_core_failure(None));
     }
 }
