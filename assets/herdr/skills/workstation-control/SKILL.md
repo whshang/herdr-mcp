@@ -42,6 +42,13 @@ For Edge connectivity failures, consume structured recovery metadata when presen
 
 Saved Herdr SSH-machine profiles and Edge devices are separate routing identities even when they reach the same physical workstation. Normal Web-planner work stays on the enrolled Edge route. Cross-transport recovery is allowed only after proven Edge non-delivery or live proof that the mutation was not applied; raw SSH is a final bootstrap/recovery path, never an implicit mutation fallback.
 
+## HANDOFF.md on disk
+
+The project `HANDOFF.md` in a worktree is a **markdown view**, not the whole relay state. SQLite keeps the authoritative handoff (including the trailing `<!-- relay-memory: ... -->` JSON that lets an older runtime still see every item); the file never contains that block.
+
+- A tick compares the file against the markdown it last rendered, so an untouched file is not rewritten. Editing the file in place (`- [id] text`, `- [id] (status) text`) is folded back into the authoritative state on the next tick.
+- When the state is larger than the character budget, the file shows what fits and states how many items it omitted (`已省略 N 条`). Omitted items stay in the authoritative state; they are not deleted by a later file edit. Read them with `herdr_mcp.work.pickup`, which projects the full state.
+
 ## Bounded project pickup
 
 `herdr_mcp.work.pickup` returns a bounded projection (`projection.v = 1`) of the recorded project handoff, not the raw stored document. Its default response stays under 32 KB even when the stored handoff is megabytes, so it fits the Link's 256 KiB frame on the first call.

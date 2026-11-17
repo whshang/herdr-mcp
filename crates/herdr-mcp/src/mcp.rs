@@ -4090,14 +4090,10 @@ fn trim_largest_section(sections: &mut serde_json::Map<String, Value>) -> bool {
 }
 
 /// The stored handoff without its trailing `<!-- relay-memory: ... -->` JSON
-/// comment (which is machine state, not context for the caller).
+/// comment (which is machine state, not context for the caller). One helper,
+/// shared with the disk writer so file and pickup agree on "markdown".
 fn pickup_markdown(handoff_md: &str) -> &str {
-    let trimmed = handoff_md.trim_end();
-    let body = trimmed.strip_suffix("-->").unwrap_or(trimmed);
-    match body.rfind("<!-- relay-memory: ") {
-        Some(start) => body[..start].trim_end(),
-        None => trimmed,
-    }
+    crate::work_compactor::handoff_markdown(handoff_md)
 }
 
 fn pickup_response(

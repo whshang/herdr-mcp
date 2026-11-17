@@ -747,6 +747,22 @@ fn dedupe_tasks(tasks: &mut Vec<RelayTask>) {
 /// Render the fixed-section handoff document plus the trailing structured
 /// block. Section order is contractual (entry-agnostic readers rely on it).
 pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
+    let mut out = render_handoff_markdown(memory);
+    // The trailing block is the rollback bridge: an older binary reads the
+    // items from here. It stays in SQLite only (#H2) and never in the file.
+    // `<!--` inside item text must never terminate the block early or shadow
+    // the outer open marker; \u0021 decodes back to `!` in valid JSON.
+    let json = serde_json::to_string(memory)
+        .unwrap_or_else(|_| "{}".to_owned())
+        .replace("<!--", "<\\u0021--");
+    out.push_str(&format!("\n\n{MEMORY_OPEN}{json}{MEMORY_CLOSE}\n"));
+    out
+}
+
+/// The disk-visible document: the same fixed sections, without the trailing
+/// `relay-memory` JSON. Characters counted for the `HANDOFF_MAX_CHARS` budget
+/// are the ones an agent actually reads on disk (#H2).
+pub(crate) fn render_handoff_markdown(memory: &RelayMemory) -> String {
     // Only rules, the task list and source session paths; newest first.
     // Agents may edit items in place (`- [id] text`, tasks
     // `- [id] (status) text`); edits are folded back on the next tick.
@@ -781,13 +797,85 @@ pub(crate) fn render_handoff(memory: &RelayMemory) -> String {
             normalize_legacy_times(&single_line(line))
         ));
     }
-    // `<!--` inside item text must never terminate the block early or shadow
-    // the outer open marker; \u0021 decodes back to `!` in valid JSON.
-    let json = serde_json::to_string(memory)
-        .unwrap_or_else(|_| "{}".to_owned())
-        .replace("<!--", "<\\u0021--");
-    out.push_str(&format!("\n\n{MEMORY_OPEN}{json}{MEMORY_CLOSE}\n"));
     out
+}
+
+/// The disk document for a memory whose markdown exceeds the character budget.
+///
+/// SQLite keeps every item (rollback compatibility); the file only shows what
+/// fits, oldest-first by section, and states how many items it omitted. The
+/// view is a pure function of the memory, so "no hand edit" stays detectable.
+fn render_handoff_markdown_bounded(memory: &RelayMemory) -> String {
+    let full = render_handoff_markdown(memory);
+    if full.chars().count() <= HANDOFF_MAX_CHARS {
+        return full;
+    }
+    let mut view = memory.clone();
+    for omitted in 0..10_000usize {
+        let rendered = render_handoff_markdown(&view);
+        if rendered.chars().count() <= HANDOFF_MAX_CHARS.saturating_sub(160) {
+            return format!(
+                "{rendered}\n> 已省略 {omitted} 条（超出 HANDOFF_MAX_CHARS 预算；完整条目保存在本地状态，可用 work.pickup 读取）。\n"
+            );
+        }
+        // Oldest/done work leaves the file first; nothing is ever cut mid-item.
+        if let Some(position) = view
+            .tasks
+            .iter()
+            .rposition(|task| task.status == "done")
+            .or_else(|| view.tasks.len().checked_sub(1))
+        {
+            view.tasks.remove(position);
+        } else if view.mistakes.pop().is_some()
+            || view.preferences.pop().is_some()
+            || view.sources.pop().is_some()
+        {
+            // dropped one whole item
+        } else if view.current_state.pop().is_some() {
+            // shave the derived state text one char at a time as a last resort
+        } else {
+            return format!("{rendered}\n> 已省略部分条目（超出预算）。\n");
+        }
+    }
+    full
+}
+
+/// Fold a hand-edited file while keeping every memory item the bounded file
+/// does not show. A truncated file is not evidence that its omitted items were
+/// deleted (#H2), so they stay in the authoritative memory.
+fn fold_file_edits_keeping_unseen(memory: &mut RelayMemory, file_md: &str, now_ms: i64) {
+    let before = memory.clone();
+    if !fold_file_edits(memory, file_md, now_ms) {
+        return;
+    }
+    let visible = |id: &str| file_md.contains(&format!("[{id}]"));
+    for item in before.preferences {
+        if !visible(&item.id) && !memory.preferences.iter().any(|kept| kept.id == item.id) {
+            memory.preferences.push(item);
+        }
+    }
+    for item in before.mistakes {
+        if !visible(&item.id) && !memory.mistakes.iter().any(|kept| kept.id == item.id) {
+            memory.mistakes.push(item);
+        }
+    }
+    for task in before.tasks {
+        if !visible(&task.id) && !memory.tasks.iter().any(|kept| kept.id == task.id) {
+            memory.tasks.push(task);
+        }
+    }
+}
+
+/// The markdown part of a stored handoff: SQLite keeps the authoritative text
+/// **with** the trailing `relay-memory` JSON for rollback, while the file, the
+/// edit comparison and the character budget use only this part (#H2).
+pub(crate) fn handoff_markdown(handoff_md: &str) -> &str {
+    let trimmed = handoff_md.trim_end();
+    let body = trimmed.strip_suffix(MEMORY_CLOSE).unwrap_or(trimmed);
+    match body.rfind(MEMORY_OPEN) {
+        Some(start) => body[..start].trim_end(),
+        None => trimmed,
+    }
 }
 
 /// Rules recorded here are project-scoped; agents must keep them out of
@@ -1017,7 +1105,7 @@ fn apply_fallback(memory: &mut RelayMemory, legacy: &str, events: &[WorkEvent]) 
 /// fit, it is written over budget with complete items.
 fn enforce_budget(memory: &mut RelayMemory) {
     for _ in 0..200 {
-        if render_handoff(memory).chars().count() <= HANDOFF_MAX_CHARS {
+        if render_handoff_markdown(memory).chars().count() <= HANDOFF_MAX_CHARS {
             return;
         }
         if !memory.recent.is_empty() {
@@ -1257,15 +1345,33 @@ fn compact_scope(
         // Merge base: structured memory from the relay-memory block, with a
         // legacy free-form document carried as context for migration.
         let (base, legacy) = split_memory(&previous.handoff_md);
+        // #H2: the file holds markdown only, so "hand edited" means the file
+        // differs from the markdown part of the recorded state — never from
+        // the recorded state's trailing relay-memory JSON.
+        let base_memory = parsed_memory(&previous.handoff_md);
+        let previous_disk = base_memory
+            .as_ref()
+            .map(render_handoff_markdown_bounded)
+            .unwrap_or_else(|| handoff_markdown(&previous.handoff_md).to_owned());
+        let previous_disk = previous_disk.trim_end().to_owned();
+        // A truncated disk view may legitimately show fewer items than the
+        // memory holds, so its edits must fold additively.
+        let truncated_view = base_memory
+            .as_ref()
+            .is_some_and(|base| render_handoff_markdown(base).chars().count() > HANDOFF_MAX_CHARS);
         let workspace = git_context(Path::new(worktree));
         // Rebuild from the merge base + whatever HANDOFF.md currently holds,
         // so a retry after a concurrent agent edit folds that edit in too.
         let mut build = |file_md: Option<&str>, ops: Option<&HandoffOps>| {
             let mut memory = base.clone();
             if let Some(file_md) = file_md
-                && file_md != previous.handoff_md
+                && file_md.trim_end() != previous_disk
             {
-                fold_file_edits(&mut memory, file_md, now_ms);
+                if truncated_view {
+                    fold_file_edits_keeping_unseen(&mut memory, file_md, now_ms);
+                } else {
+                    fold_file_edits(&mut memory, file_md, now_ms);
+                }
             }
             record_sources(&mut memory, &events);
             memory.workspace = workspace.clone();
@@ -1294,17 +1400,20 @@ fn compact_scope(
             .ok()
             .and_then(|content| serde_json::from_str::<HandoffOps>(&content).ok())
             .filter(|ops| !ops.is_empty());
-        let handoff_md = write_handoff_guarded(Path::new(worktree), |file_md| {
+        let rendered = write_handoff_guarded(Path::new(worktree), |file_md| {
             let mut memory = build(file_md, semantic_ops.as_ref());
             if semantic_ops.is_none() {
                 apply_fallback(&mut memory, &legacy, &events);
             }
             enforce_budget(&mut memory);
-            render_handoff(&memory)
+            RenderedHandoff {
+                stored: render_handoff(&memory),
+                disk: render_handoff_markdown_bounded(&memory),
+            }
         });
-        let (handoff_md, write_error) = match handoff_md {
-            GuardedWrite::Written(handoff_md) => (handoff_md, None),
-            GuardedWrite::Failed(handoff_md, error) => (handoff_md, Some(error)),
+        let (handoff_md, write_error) = match rendered {
+            GuardedWrite::Written(rendered) => (rendered.stored, None),
+            GuardedWrite::Failed(rendered, error) => (rendered.stored, Some(error)),
             // The file kept changing under us: keep the cursor so the next
             // tick retries instead of overwriting an agent edit.
             GuardedWrite::Conflict => return Err(HANDOFF_CONFLICT_ERROR.to_owned()),
@@ -1493,7 +1602,18 @@ fn reconcile_handoff_files(
         // The handoff as recorded before this tick: a file that still matches
         // it carries no agent edit.
         let recorded = state.handoff_md.clone();
+        // #H2: the disk comparison and the fold-decision use the markdown part
+        // of the recorded state, because the file never carries the JSON block.
         let base = parsed_memory(&recorded);
+        let truncated_view = base
+            .as_ref()
+            .is_some_and(|base| render_handoff_markdown(base).chars().count() > HANDOFF_MAX_CHARS);
+        let recorded_markdown = base
+            .as_ref()
+            .map(render_handoff_markdown_bounded)
+            .unwrap_or_else(|| handoff_markdown(&recorded).to_owned())
+            .trim_end()
+            .to_owned();
         // The tick render: fold an agent-edited file first (stamping its edits
         // with the current tick, not the state's last write time, so an old
         // file cannot instantaneously age the tasks it adds), then close the
@@ -1504,8 +1624,14 @@ fn reconcile_handoff_files(
         let mut render = |file_md: Option<&str>| match &base {
             Some(memory) => {
                 let mut memory = memory.clone();
-                if let Some(file_md) = file_md.filter(|file_md| *file_md != recorded) {
-                    fold_file_edits(&mut memory, file_md, now_ms);
+                if let Some(file_md) =
+                    file_md.filter(|file_md| file_md.trim_end() != recorded_markdown)
+                {
+                    if truncated_view {
+                        fold_file_edits_keeping_unseen(&mut memory, file_md, now_ms);
+                    } else {
+                        fold_file_edits(&mut memory, file_md, now_ms);
+                    }
                 }
                 // Merged-ref evidence is read from the memory actually being
                 // refreshed, i.e. after the file fold, so a merged-PR task the
@@ -1514,16 +1640,24 @@ fn reconcile_handoff_files(
                 // memory holds no open task.
                 let refs = merged.for_memory(&memory, worktree);
                 refresh_tasks(&mut memory, refs, now_ms);
-                render_handoff(&memory)
+                enforce_budget(&mut memory);
+                RenderedHandoff {
+                    stored: render_handoff(&memory),
+                    disk: render_handoff_markdown_bounded(&memory),
+                }
             }
             // A legacy free-form handoff has no memory to refresh yet; it is
-            // migrated by compaction when new events arrive.
-            None => recorded.clone(),
+            // migrated by compaction when new events arrive. It has no JSON
+            // block, so both forms are the recorded text.
+            None => RenderedHandoff {
+                stored: recorded.clone(),
+                disk: recorded.clone(),
+            },
         };
         if crate::macos_permissions::runtime_must_not_probe(&normalize_lexical(worktree))
             || !worktree.is_dir()
         {
-            let refreshed = render(None);
+            let refreshed = render(None).stored;
             if refreshed != recorded {
                 state.handoff_md = refreshed;
                 if let Err(error) = store.put_work_state(&state) {
@@ -1555,17 +1689,19 @@ fn reconcile_handoff_files(
             None => render(None),
         };
         let needs_write = match &current {
-            Some(content) => *content != refreshed,
+            // #H2: an unchanged disk file matches the markdown part, so a tick
+            // without a hand edit never rewrites HANDOFF.md.
+            Some(content) => *content != refreshed.disk,
             // Do not materialize empty placeholder files in worktrees that
             // never produced a handoff.
-            None => !recorded.trim().is_empty(),
+            None => !recorded_markdown.trim().is_empty(),
         };
-        let mut handoff = refreshed;
+        let mut handoff = refreshed.stored;
         let mut error: Option<String> = None;
         if needs_write {
             (handoff, error) = match write_handoff_guarded(worktree, render) {
-                GuardedWrite::Written(handoff) => (handoff, None),
-                GuardedWrite::Failed(handoff, error) => (handoff, Some(error)),
+                GuardedWrite::Written(rendered) => (rendered.stored, None),
+                GuardedWrite::Failed(rendered, error) => (rendered.stored, Some(error)),
                 // The file kept changing: keep the recorded memory so the next
                 // tick retries instead of racing the agent edit.
                 GuardedWrite::Conflict => (recorded, Some(HANDOFF_CONFLICT_ERROR.to_owned())),
@@ -1602,10 +1738,18 @@ fn read_handoff_file(target: &Path) -> Option<String> {
     fs::read_to_string(target).ok()
 }
 
+/// One render: the authoritative SQLite text (markdown + relay-memory JSON)
+/// and the disk document (markdown only).
+#[derive(Debug, Clone)]
+struct RenderedHandoff {
+    stored: String,
+    disk: String,
+}
+
 enum GuardedWrite {
-    Written(String),
+    Written(RenderedHandoff),
     /// The rendered handoff plus the write error (e.g. a symlinked target).
-    Failed(String, String),
+    Failed(RenderedHandoff, String),
     /// HANDOFF.md changed between read and write on every attempt.
     Conflict,
 }
@@ -1617,13 +1761,14 @@ enum GuardedWrite {
 /// per-tick state (the merged-ref cache), hence `FnMut`.
 fn write_handoff_guarded(
     worktree: &Path,
-    mut render: impl FnMut(Option<&str>) -> String,
+    mut render: impl FnMut(Option<&str>) -> RenderedHandoff,
 ) -> GuardedWrite {
     let target = worktree.join("HANDOFF.md");
     for _ in 0..HANDOFF_WRITE_ATTEMPTS {
         let seen = read_handoff_file(&target);
         let handoff = render(seen.as_deref());
-        return match write_handoff(worktree, &handoff, seen.as_deref()) {
+        // Only the markdown goes to disk; `stored` is what SQLite records.
+        return match write_handoff(worktree, &handoff.disk, seen.as_deref()) {
             Ok(true) => GuardedWrite::Written(handoff),
             Ok(false) => continue,
             Err(error) => GuardedWrite::Failed(handoff, error),
@@ -2625,10 +2770,10 @@ mod tests {
         assert_eq!(memory.current_state, "parser rework underway");
         assert_eq!(memory.recent, vec!["test: [edit] changed parser"]);
         assert_eq!(state.log_cursors_json, r#"{"pi":7}"#);
-        assert_eq!(
-            fs::read_to_string(root.join("HANDOFF.md")).unwrap(),
-            state.handoff_md
-        );
+        assert!(disk_matches_state(
+            &fs::read_to_string(root.join("HANDOFF.md")).unwrap(),
+            &state
+        ));
         assert_eq!(
             fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
             "HANDOFF.md\nAGENTS.md\n"
@@ -4058,7 +4203,7 @@ mod tests {
         assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
         let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
         assert!(!on_disk.contains("[t1]"), "{on_disk}");
-        assert_eq!(on_disk, state.handoff_md);
+        assert!(disk_matches_state(&on_disk, &state), "{on_disk}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4108,7 +4253,7 @@ mod tests {
         assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
         let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
         assert!(!on_disk.contains("PR #42"), "{on_disk}");
-        assert_eq!(on_disk, state.handoff_md);
+        assert!(disk_matches_state(&on_disk, &state), "{on_disk}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4546,7 +4691,7 @@ mod tests {
         let root = temp_dir("guard");
         fs::create_dir(root.join(".git")).unwrap();
         let target = root.join("HANDOFF.md");
-        let initial = render_handoff(&RelayMemory::default());
+        let initial = render_handoff_markdown(&RelayMemory::default());
         fs::write(&target, &initial).unwrap();
         let edited = initial.replace("### 错题集\n", "### 错题集\n\n- never force-push main\n");
         let renders = AtomicUsize::new(0);
@@ -4565,7 +4710,10 @@ mod tests {
                 status: "todo".to_owned(),
                 updated_ms: None,
             });
-            render_handoff(&memory)
+            RenderedHandoff {
+                stored: render_handoff(&memory),
+                disk: render_handoff_markdown_bounded(&memory),
+            }
         });
         assert!(matches!(result, GuardedWrite::Written(_)));
         assert_eq!(renders.load(Ordering::SeqCst), 2);
@@ -4580,7 +4728,10 @@ mod tests {
                 format!("agent {}", renders.fetch_add(1, Ordering::SeqCst)),
             )
             .unwrap();
-            "compactor".to_owned()
+            RenderedHandoff {
+                stored: "compactor".to_owned(),
+                disk: "compactor".to_owned(),
+            }
         });
         assert!(matches!(result, GuardedWrite::Conflict));
         assert!(fs::read_to_string(&target).unwrap().starts_with("agent "));
@@ -4626,7 +4777,156 @@ mod tests {
             .work_state("proj", root.to_str().unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(state.handoff_md, on_disk);
+        assert!(disk_matches_state(&on_disk, &state), "{on_disk}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// #H2: the disk file carries the markdown part only; SQLite keeps the
+    /// authoritative text including the relay-memory block.
+    fn disk_matches_state(on_disk: &str, state: &WorkState) -> bool {
+        on_disk.trim_end() == handoff_markdown(&state.handoff_md).trim_end()
+            && state.handoff_md.contains(MEMORY_OPEN)
+    }
+
+    /// relay memory | Given a 3 MB old-format handoff holding 1,000 PR items
+    /// (markdown plus the relay-memory block) | When a tick writes the file |
+    /// Then SQLite still holds all 1,000 items (rollback keeps them visible),
+    /// while HANDOFF.md carries no relay-memory JSON and fits the character
+    /// budget counted on markdown alone.
+    #[test]
+    fn huge_old_format_handoff_writes_markdown_only_and_keeps_every_item() {
+        let root = temp_dir("h2-huge");
+        fs::create_dir(root.join(".git")).unwrap();
+        let store = StateStore::open(":memory:").unwrap();
+        let memory = RelayMemory {
+            tasks: (0..1_000)
+                .map(|index| RelayTask {
+                    id: format!("t{index}"),
+                    text: format!("PR #{} relay task {}", 1000 + index, "y".repeat(64)),
+                    status: "todo".to_owned(),
+                    updated_ms: None,
+                })
+                .collect(),
+            ..RelayMemory::default()
+        };
+        let stored = render_handoff(&memory);
+        let legacy_padding =
+            "## 历史 PR 记录\n\n".to_owned() + &"- legacy PR row here\n".repeat(200_000);
+        let handoff_md = format!("{legacy_padding}{stored}");
+        assert!(handoff_md.len() > 3 * 1024 * 1024);
+        store
+            .put_work_state(&WorkState {
+                project_ref: "proj".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md,
+                through_event_id: 0,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 2).unwrap();
+
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        // Rollback compatibility: every item is still in the authoritative
+        // state's relay-memory block.
+        assert_eq!(parsed_memory(&state.handoff_md).unwrap().tasks.len(), 1_000);
+        let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
+        assert!(
+            !on_disk.contains("<!-- relay-memory:"),
+            "disk carries no JSON"
+        );
+        assert!(
+            on_disk.chars().count() <= HANDOFF_MAX_CHARS,
+            "disk chars {} over budget",
+            on_disk.chars().count()
+        );
+        assert!(on_disk.contains("已省略"), "{on_disk}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay memory | Given a HANDOFF.md the compactor just wrote | When the
+    /// next tick sees no hand edit | Then the file is not written again (same
+    /// content and same mtime), even though SQLite also stores the JSON block.
+    #[test]
+    fn tick_without_a_hand_edit_does_not_rewrite_handoff_md() {
+        let root = temp_dir("h2-nowrite");
+        fs::create_dir(root.join(".git")).unwrap();
+        let store = StateStore::open(":memory:").unwrap();
+        append(&store, &root, "first", 1);
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 2).unwrap();
+        let target = root.join("HANDOFF.md");
+        let before = fs::read_to_string(&target).unwrap();
+        let modified = fs::metadata(&target).unwrap().modified().unwrap();
+        assert!(!before.contains("<!-- relay-memory:"), "{before}");
+
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 3).unwrap();
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 4).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), before);
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), modified);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay memory | Given a truncated disk view of 1,000 items | When an
+    /// agent hand-edits HANDOFF.md | Then the edit folds back into SQLite and
+    /// the items the bounded file never showed are not erased.
+    #[test]
+    fn hand_edit_of_a_truncated_handoff_folds_without_erasing_unseen_items() {
+        let root = temp_dir("h2-partial-fold");
+        fs::create_dir(root.join(".git")).unwrap();
+        let store = StateStore::open(":memory:").unwrap();
+        let memory = RelayMemory {
+            tasks: (0..1_000)
+                .map(|index| RelayTask {
+                    id: format!("t{index}"),
+                    text: format!("relay task {} {}", index, "z".repeat(64)),
+                    status: "todo".to_owned(),
+                    updated_ms: None,
+                })
+                .collect(),
+            ..RelayMemory::default()
+        };
+        store
+            .put_work_state(&WorkState {
+                project_ref: "proj".to_owned(),
+                worktree: root.to_string_lossy().into_owned(),
+                handoff_md: render_handoff(&memory),
+                through_event_id: 0,
+                log_cursors_json: "{}".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 2).unwrap();
+        let target = root.join("HANDOFF.md");
+        let on_disk = fs::read_to_string(&target).unwrap();
+        assert!(on_disk.chars().count() <= HANDOFF_MAX_CHARS);
+        assert!(!on_disk.contains("[t999]"), "{on_disk}");
+
+        // Agents edit inside the task list, before the following heading.
+        let edited = on_disk.replace(
+            "\n## 历史会话路径\n",
+            "\n- [t9999] (todo) agent added this task\n\n## 历史会话路径\n",
+        );
+        assert!(edited.contains("[t9999]"), "{edited}");
+        fs::write(&target, &edited).unwrap();
+        compact_tick(&store, &FakeSummarizer(Err("down")), &|_| Ok(0), 3).unwrap();
+
+        let state = store
+            .work_state("proj", root.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let saved = parsed_memory(&state.handoff_md).unwrap();
+        assert!(
+            saved.tasks.iter().any(|task| task.id == "t9999"),
+            "edit folded"
+        );
+        assert_eq!(saved.tasks.len(), 1_001, "unseen items kept");
+        let rewritten = fs::read_to_string(&target).unwrap();
+        assert!(!rewritten.contains("<!-- relay-memory:"), "{rewritten}");
+        assert!(rewritten.chars().count() <= HANDOFF_MAX_CHARS);
         fs::remove_dir_all(root).unwrap();
     }
 
