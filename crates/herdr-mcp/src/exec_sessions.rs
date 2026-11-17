@@ -871,7 +871,9 @@ impl ExecRegistry {
     /// pane keeps running under a real session id: the monitor reaps it when
     /// the launch line completes, and `herdr_exec_kill` reclaims the pane if it
     /// never does. Without this the pane would be unaddressable forever.
-    #[cfg(unix)]
+    ///
+    /// Platform-neutral on purpose: the Windows candidate build also compiles
+    /// this start path, so a `cfg(unix)`-only helper breaks that lane.
     fn track_orphan_pane_session(&self, session: &Arc<Session>) -> Result<(), String> {
         self.inner
             .state_store
