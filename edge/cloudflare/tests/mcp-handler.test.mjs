@@ -1,14 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { EPOCH1_CONTRACT } from "../dist/contracts/epoch1.js";
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
 import { EPOCH4_CONTRACT } from "../dist/contracts/epoch4.js";
 import { EPOCH5_CONTRACT } from "../dist/contracts/epoch5.js";
 import { EPOCH6_CONTRACT } from "../dist/contracts/epoch6.js";
 import { EPOCH8_CONTRACT } from "../dist/contracts/epoch8.js";
-import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
+import { isCompatibleRuntimeContract, RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
 import { encodeDeviceRef } from "../dist/device-refs.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
@@ -277,12 +276,21 @@ test("initialize negotiates unknown protocol versions down to SDK wire", async (
   assert.equal(r.body.result.protocolVersion, "2025-11-25");
 });
 
-test("user keeps the retired Node epoch1 contract | Given the legacy profile is fixed | When the profile is inspected | Then its 17-tool identity and missing herdr_skill remain unchanged", () => {
-  assert.equal(EPOCH1_CONTRACT.contract_epoch, 1);
-  assert.equal(EPOCH1_CONTRACT.contract_hash, "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d");
-  assert.equal(EPOCH1_CONTRACT.tool_count, 17);
-  assert.equal(EPOCH1_CONTRACT.tools.length, 17);
-  assert.equal(EPOCH1_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), false);
+const RETIRED_EPOCH1_IDENTITY = {
+  contract_epoch: 1,
+  contract_hash: "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d",
+};
+
+test("user cannot attach a retired epoch1 runtime | Given the epoch1 catalog is retired | When its frozen identity is checked against the Edge runtime window | Then the identity is refused and never advertised", async () => {
+  assert.equal(
+    isCompatibleRuntimeContract(RETIRED_EPOCH1_IDENTITY.contract_epoch, RETIRED_EPOCH1_IDENTITY.contract_hash),
+    false,
+  );
+  assert.equal(isCompatibleRuntimeContract(EPOCH2_CONTRACT.contract_epoch, EPOCH2_CONTRACT.contract_hash), true);
+  const d = deps();
+  const r = await handleMcp(req(2, "tools/list", {}), "w1", d.value);
+  assert.notEqual(r.body.result._meta.herdr.contract_epoch, RETIRED_EPOCH1_IDENTITY.contract_epoch);
+  assert.notEqual(r.body.result._meta.herdr.contract_hash, RETIRED_EPOCH1_IDENTITY.contract_hash);
 });
 
 test("tools/list exposes runtime tools plus edge-local herdr_devices", async () => {

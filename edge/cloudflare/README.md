@@ -45,7 +45,7 @@ edge/cloudflare/
 │   ├── canonical-imports.ts   ← canonical v1 type/validation port (isolated build)
 │   ├── env.ts                ← typed bindings
 │   ├── version.ts            ← Edge identity / env-resolved public contract epoch + hash
-│   ├── contracts/            ← frozen epoch1–epoch7 catalogs + public contract pointer
+│   ├── contracts/            ← frozen epoch2–epoch8 catalogs + runtime window + public contract pointer
 │   ├── limits.ts             ← capacities, timeouts, frame budgets, op classification
 │   ├── errors.ts             ← error taxonomy + retry/ambiguity classification
 │   ├── pending.ts            ← bounded pending-request registry + request ids
