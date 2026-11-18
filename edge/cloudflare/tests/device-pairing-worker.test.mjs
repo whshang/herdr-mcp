@@ -544,8 +544,8 @@ test("user receives normalized Vercel evaluation | Given a decision-vercel Jev r
 
 test("health and info expose the same explicit first-party public contract identity", async () => {
   for (const [edgeEnv, expectedEpoch] of [
-    ["dev", 8],
-    ["prod", 8],
+    ["dev", 9],
+    ["prod", 9],
     [undefined, 3],
     ["unknown", 3],
   ]) {
@@ -566,16 +566,16 @@ test("health and info expose the same explicit first-party public contract ident
       health.runtimeContractHash,
       "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
     );
-    assert.equal(health.currentRuntimeContractEpoch, 5);
+    assert.equal(health.currentRuntimeContractEpoch, 6);
     assert.equal(
       health.currentRuntimeContractHash,
-      "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+      "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e",
     );
-    assert.equal(info.runtimeContract.epoch, 6);
-    assert.equal(info.previousRuntimeContract.epoch, 5);
+    assert.equal(info.runtimeContract.epoch, 7);
+    assert.equal(info.previousRuntimeContract.epoch, 6);
     assert.equal(
       info.previousRuntimeContract.hash,
-      "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+      "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e",
     );
   }
 });
