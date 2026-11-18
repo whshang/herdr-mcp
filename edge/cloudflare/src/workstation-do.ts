@@ -1372,6 +1372,27 @@ export class WorkstationDO {
     }
   }
 
+  /**
+   * Durable settlement commit. The completed row and its idempotency evidence
+   * are written in a single multi-key put (atomic in Durable Object storage),
+   * so either both rows commit or neither does. The pending row is deleted
+   * only after that commit succeeds, preserving completed-before-pending-delete.
+   */
+  private async commitSettlementRows(entry: PendingRequest, completion: Completion): Promise<void> {
+    const completedKey = PREFIX_COMPLETED + entry.requestId;
+    const completedRow = encodeCompletedRow(entry, completion);
+    const idemRecord = idempotencyRecordFor(entry, completion.servedAtMs);
+    if (idemRecord === undefined) {
+      await this.state.storage.put(completedKey, completedRow);
+    } else {
+      await this.state.storage.put<unknown>({
+        [completedKey]: completedRow,
+        [PREFIX_IDEM + idemRecord.idempotencyKey]: idemRecord,
+      });
+    }
+    await this.state.storage.delete(PREFIX_PENDING + entry.requestId);
+  }
+
   private async persistSettlement(requestId: string, completion: Completion): Promise<boolean> {
     const candidate = this.registry.get(requestId);
     if (candidate && candidate.opClass === "read") {
@@ -1392,21 +1413,13 @@ export class WorkstationDO {
       ? { ...entry, idempotencyKey: undefined }
       : entry;
 
-    // Persist durably FIRST (completed + idem evidence before the pending
-    // delete). The completed row embeds the idempotency binding, so even if the
-    // separate idem:<key> write fails or a crash lands between writes, the
-    // binding is recovered from the completed row on init. Only after every
-    // write succeeds do we settle the in-memory entry and resolve the waiter. A
-    // mid-sequence failure leaves the pending entry and resolver intact so a
-    // retry can converge; on restart the completed twin wins and the stale
-    // pending row is cleaned up.
+    // Persist durably FIRST (completed + idem evidence in one atomic commit,
+    // then the pending delete). Only after every write succeeds do we settle
+    // the in-memory entry and resolve the waiter. A failure leaves the pending
+    // entry and resolver intact so a retry can converge; on restart the
+    // completed twin wins and the stale pending row is cleaned up.
     try {
-      await this.state.storage.put(PREFIX_COMPLETED + requestId, encodeCompletedRow(settlementEntry, completion) as unknown as string);
-      const idemRecord = idempotencyRecordFor(settlementEntry, completion.servedAtMs);
-      if (idemRecord !== undefined) {
-        await this.state.storage.put(PREFIX_IDEM + idemRecord.idempotencyKey, idemRecord as unknown as string);
-      }
-      await this.state.storage.delete(PREFIX_PENDING + requestId);
+      await this.commitSettlementRows(settlementEntry, completion);
     } catch (persistErr) {
       this.logger.warn("pending.settlement_persist_failed", {
         requestId,
@@ -1448,18 +1461,11 @@ export class WorkstationDO {
       }
       return true;
     }
-    // Persist durably FIRST (completed + idem evidence before the pending
-    // delete); on failure retain the evicted entry's completion state so a
-    // retry can converge without dropping the waiter. The completed row embeds
-    // the idempotency binding, so completed-wins on restart recovers both the
-    // completion and the binding even if the idem:<key> write failed.
+    // Persist durably FIRST (completed + idem evidence in one atomic commit,
+    // then the pending delete); on failure retain the evicted entry's
+    // completion state so a retry can converge without dropping the waiter.
     try {
-      await this.state.storage.put(PREFIX_COMPLETED + requestId, encodeCompletedRow(entry, completion) as unknown as string);
-      const idemRecord = idempotencyRecordFor(entry, completion.servedAtMs);
-      if (idemRecord !== undefined) {
-        await this.state.storage.put(PREFIX_IDEM + idemRecord.idempotencyKey, idemRecord as unknown as string);
-      }
-      await this.state.storage.delete(PREFIX_PENDING + requestId);
+      await this.commitSettlementRows(entry, completion);
     } catch (persistErr) {
       this.logger.warn("pending.evicted_settlement_persist_failed", {
         requestId,
