@@ -53,7 +53,8 @@ A route skipped by its own rate budget does **not** use one of those attempts: t
 - `401`/`403` (Worker) and additionally `400`/`404`/`422` (local) use a fixed 300s cooldown; a quick retry cannot help those.
 - Cooldown writes keep the **later** deadline (`max(existing, new)`), and the failure streak plus deadline live in one record under one lock. Failures that complete out of order therefore cannot shorten a longer cooldown already in force: a 1s backoff recorded after a 300s credential cooldown leaves the 300s in place.
 - A route skipped by its own rate budget is **not** cooled down — the pool simply tries the next route.
-- Pool health is inspectable without changing the status contract: `semanticRouteHealthSnapshot(name)` returns `consecutive_failures` and `cooldown_remaining_ms` for one route, and the local `capability_json` reports `consecutive_failures` per route. Neither ever includes a credential.
+- Pool health is inspectable without changing the status contract: `semanticRouteHealthSnapshot(name)` returns `consecutive_failures` and `cooldown_remaining_ms` for one route, and the local `capability_json` reports `consecutive_failures` and `cooldown_remaining_ms` per route. Chat routes additionally report the background tier's scoped pool health as `background_consecutive_failures` and `background_cooldown_remaining_ms`, so a route failing only under `SemanticTier::Background` no longer shows a zero streak. Neither ever includes a credential.
+- Background-tier chat budgets are tighter than the interactive default's historical allowance: 10s per attempt, 30s pool total (foreground stays 5s/12s), plus the hourly call cap.
 
 ## Rate budget
 
