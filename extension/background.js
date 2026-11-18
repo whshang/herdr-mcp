@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.252";
+const H2W_SCRIPT_VERSION = "0.1.253";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -781,6 +781,59 @@ if (chrome.permissions?.onAdded?.addListener) {
 }
 if (chrome.permissions?.onRemoved?.addListener) {
   chrome.permissions.onRemoved.addListener(() => { void syncSupportedContentScripts(); });
+}
+
+// #1037: the keepalive worker outlives tabs, so per-tab memory must be
+// released when Chrome closes the tab. Persisted archive/contract state stays.
+function reclaimClosedTabState(tabId, now = Date.now()) {
+  if (!Number.isInteger(tabId)) return;
+  tabVersions.delete(tabId);
+  reloadedTabs.delete(tabId);
+  tabRecoveryAttemptAt.delete(tabId);
+  browserTabScopes.delete(tabId);
+  // Keyed by conversation; the durable page-health record carries the cooldown,
+  // so only reservations still inside the cooldown window are worth keeping.
+  for (const [key, at] of pageHealthForceReloadAt) {
+    if (!(now - Number(at || 0) < PAGE_HEALTH_FORCE_RELOAD_COOLDOWN_MS)) pageHealthForceReloadAt.delete(key);
+  }
+}
+
+if (chrome.tabs?.onRemoved?.addListener) {
+  chrome.tabs.onRemoved.addListener((tabId) => { reclaimClosedTabState(tabId); });
+}
+
+function bindingConversationKeys(storeKey, entry) {
+  const keys = [];
+  const sep = String(storeKey || "").lastIndexOf("::");
+  if (sep > 0) keys.push(String(storeKey).slice(0, sep));
+  for (const key of [entry?.convKey, entry?.active_conv_key]) {
+    if (typeof key === "string" && key) keys.push(key);
+  }
+  return keys;
+}
+
+// #1037: every binding write path lands in chrome.storage, so reclaim the
+// per-conversation nudge memory once no remaining binding references it.
+function reclaimUnboundConversationState(oldBindings, newBindings) {
+  const previous = oldBindings && typeof oldBindings === "object" ? oldBindings : {};
+  const next = newBindings && typeof newBindings === "object" ? newBindings : {};
+  const live = new Set();
+  for (const [key, entry] of Object.entries(next)) {
+    for (const convKey of bindingConversationKeys(key, entry)) live.add(convKey);
+  }
+  for (const [key, entry] of Object.entries(previous)) {
+    if (Object.prototype.hasOwnProperty.call(next, key)) continue;
+    for (const convKey of bindingConversationKeys(key, entry)) {
+      if (!live.has(convKey)) forgetConversationNudgeState(convKey);
+    }
+  }
+}
+
+if (chrome.storage?.onChanged?.addListener) {
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local" || !changes?.herdrWakeBindings) return;
+    reclaimUnboundConversationState(changes.herdrWakeBindings.oldValue, changes.herdrWakeBindings.newValue);
+  });
 }
 
 // ---- Toolbar badge (replaces the ambiguous in-page status dot) ----
@@ -3391,6 +3444,7 @@ let pushWorkspaceCatalogAt = 0;
 let stateFetchInFlight = null;
 let localRuntimeReachable = null;
 let localRuntimeCheckedAt = 0;
+const MANUAL_RUNTIME_REACHABILITY_CACHE_MS = 30000;
 const controlCenterPorts = new Set();
 const controlCenterOpenWindows = new Set();
 let controlCenterSnapshotAt = 0;
@@ -3451,13 +3505,43 @@ function noteLocalRuntimeReachability(reachable) {
 }
 
 async function automationRuntimeGate() {
-  const state = await fetchStateFresh();
+  // Concurrent gates (one per visible tab, plus HUD/popup refreshes) share the
+  // single-flight /push/state request; every caller still gets a live result.
+  const state = await fetchState();
   if (state?.ok === true) return { ok: true, state };
   return {
     ok: false,
     reason: "local_runtime_unavailable",
     error: state?.error || (state?.status ? `HTTP ${state.status}` : "local-runtime-unavailable"),
     state,
+  };
+}
+
+// #1036: reachability already maintained by the resident /push/events stream
+// or by a /push/state result younger than the short cache window. Returns null
+// when neither is trustworthy and a fresh check is required.
+function cachedLocalRuntimeReachability(now = Date.now()) {
+  if (localRuntimeReachable === true && pushStream?.connected === true) return true;
+  if (localRuntimeReachable === null || !localRuntimeCheckedAt) return null;
+  return now - localRuntimeCheckedAt < MANUAL_RUNTIME_REACHABILITY_CACHE_MS ? localRuntimeReachable : null;
+}
+
+async function automationStateForConversation(convKey) {
+  const scope = automationScopeForConversation(convKey);
+  // Manual mode never acts on the answer, so the 5s content poll reuses cached
+  // reachability. Auto mode always re-checks so it fails closed immediately.
+  const cachedReachable = scope.enabled ? null : cachedLocalRuntimeReachability();
+  const runtimeAvailable = cachedReachable ?? (await automationRuntimeGate()).ok === true;
+  return {
+    ok: true,
+    ...scope,
+    preference_enabled: scope.enabled,
+    enabled: scope.enabled && runtimeAvailable,
+    effective_enabled: scope.enabled && runtimeAvailable,
+    runtime_available: runtimeAvailable,
+    runtime_checked_at: localRuntimeCheckedAt || null,
+    autoAllow: true,
+    labels: hudLabels(),
   };
 }
 
@@ -3501,7 +3585,7 @@ async function ensurePushStream(bindings) {
   // HUD and popup stay observable regardless of the global/Project automation policy.
   if (pushStream) return;
   const ctrl = new AbortController();
-  pushStream = { ctrl, bootId: null };
+  pushStream = { ctrl, bootId: null, connected: false };
   void runPushStream(ctrl);
 }
 
@@ -3579,6 +3663,7 @@ async function runPushStream(ctrl) {
         continue;
       }
       backoff = 2000;
+      if (pushStream?.ctrl === ctrl) pushStream.connected = true;
       noteLocalRuntimeReachability(true);
       armStallWatchdog();
       callLog(`push connected (shared native stream via ${opened.transport})`);
@@ -3586,9 +3671,11 @@ async function runPushStream(ctrl) {
       disarmStallWatchdog();
       buf += decoder.decode();
       drainBlocks();
+      if (pushStream?.ctrl === ctrl) pushStream.connected = false;
       noteLocalRuntimeReachability(false);
       callLog(`push stream ended; reconnecting in ${backoff}ms`);
     } catch (e) {
+      if (pushStream?.ctrl === ctrl) pushStream.connected = false;
       if (ctrl.signal.aborted || !runtimeAlive()) break;
       noteLocalRuntimeReachability(false);
       callLog(`push disconnected (${e.message}); retrying in ${backoff}ms`);
@@ -5262,6 +5349,22 @@ const idleNudgeInFlight = new Set(); // convKey -> one judge/send attempt at a t
 const lastIdleNudgeResult = new Map(); // convKey -> { at, reason, raw?, nudged }
 const idleNudgeRetryTimers = new Map(); // convKey -> timeout id
 const lastTurnEndedPayload = new Map(); // convKey -> last h2w_turn_ended payload (for cooldown retry)
+// #1037: conversation keys arrive from every visited page, bound or not; keep
+// the per-conversation nudge memory bounded (least recently written evicted).
+const CONVERSATION_NUDGE_STATE_MAX = 256;
+
+function rememberConversationNudgeState(map, convKey, value) {
+  map.delete(convKey);
+  map.set(convKey, value);
+  while (map.size > CONVERSATION_NUDGE_STATE_MAX) map.delete(map.keys().next().value);
+}
+
+function forgetConversationNudgeState(convKey) {
+  lastIdleNudgeAt.delete(convKey);
+  lastJudgedAssistantFp.delete(convKey);
+  lastIdleNudgeResult.delete(convKey);
+  lastTurnEndedPayload.delete(convKey);
+}
 
 const LLM_JUDGE_TIMEOUT_MS = 60000;
 const MANUAL_LLM_JUDGE_TIMEOUT_MS = 15000;
@@ -6053,7 +6156,7 @@ async function handleTimedHandoffSummaryFallback(transferId) {
 
 function rememberIdleNudge(convKey, result) {
   const row = { at: Date.now(), ...result };
-  lastIdleNudgeResult.set(convKey, row);
+  rememberConversationNudgeState(lastIdleNudgeResult, convKey, row);
   callLog(`llm-judge: ${convKey} → ${result.reason}${result.raw != null ? ` raw=${JSON.stringify(result.raw).slice(0, 80)}` : ""}`);
   return result;
 }
@@ -6454,8 +6557,8 @@ function applySupervisorOutcome(convKey, binding, result, assistantText = "") {
       }
       // The supervisor already decided this turn: the same assistant body must
       // not be judged again by the legacy path.
-      if (assistantText) lastJudgedAssistantFp.set(convKey, assistantNudgeFingerprint(assistantText));
-      lastIdleNudgeAt.set(convKey, Date.now());
+      if (assistantText) rememberConversationNudgeState(lastJudgedAssistantFp, convKey, assistantNudgeFingerprint(assistantText));
+      rememberConversationNudgeState(lastIdleNudgeAt, convKey, Date.now());
       setActionBadge("\u2192", "#16a34a", 6000);
       rememberIdleNudge(convKey, {
         nudged: true,
@@ -6639,11 +6742,11 @@ async function runGoalSupervisor(convKey, boundaryEvent, options = {}) {
 async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, cooldownMs, cause = "llm_not_configured") {
   const nudgeText = autoGoalContinueMessage();
   if (!shouldAutoContinueWithoutLlm(userText, assistantText, nudgeText)) {
-    lastJudgedAssistantFp.set(convKey, fp);
+    rememberConversationNudgeState(lastJudgedAssistantFp, convKey, fp);
     clearIdleNudgeRetry(convKey);
     return rememberIdleNudge(convKey, { nudged: false, reason: "fallback_complete", cause, assistant_fp: fp });
   }
-  lastIdleNudgeAt.set(convKey, Date.now());
+  rememberConversationNudgeState(lastIdleNudgeAt, convKey, Date.now());
   const wakeResult = await routeWake(b, {
     status: "auto_continue_fallback_nudge",
     output: `bounded auto-continue fallback; cause=${cause}`,
@@ -6662,7 +6765,7 @@ async function autoContinueWithoutLlm(convKey, b, userText, assistantText, fp, c
       error: wakeResult?.error || wakeResult?.blocked || wakeResult?.reason || "submit-failed",
     });
   }
-  lastJudgedAssistantFp.set(convKey, fp);
+  rememberConversationNudgeState(lastJudgedAssistantFp, convKey, fp);
   return rememberIdleNudge(convKey, { nudged: true, reason: "fallback_continue", cause, assistant_fp: fp, send: nudgeText });
 }
 
@@ -6673,7 +6776,7 @@ async function sendSemanticContinue(convKey, b, fp, cooldownMs, {
   nudgeText = autoGoalContinueMessage(),
   meta = {},
 } = {}) {
-  lastIdleNudgeAt.set(convKey, Date.now());
+  rememberConversationNudgeState(lastIdleNudgeAt, convKey, Date.now());
   setActionBadge("!", "#dc2626", 8000);
   const wakeResult = await routeWake(b, {
     status,
@@ -6693,7 +6796,7 @@ async function sendSemanticContinue(convKey, b, fp, cooldownMs, {
       ...meta,
     });
   }
-  lastJudgedAssistantFp.set(convKey, fp);
+  rememberConversationNudgeState(lastJudgedAssistantFp, convKey, fp);
   return rememberIdleNudge(convKey, {
     nudged: true,
     reason,
@@ -6734,7 +6837,7 @@ async function maybeIdleNudgeInner(msg) {
   if (cooldownSec <= 0) {
     return rememberIdleNudge(msg.convKey || "", { nudged: false, reason: "disabled" });
   }
-  lastTurnEndedPayload.set(convKey, {
+  rememberConversationNudgeState(lastTurnEndedPayload, convKey, {
     convKey,
     userText: msg.userText || "",
     assistantText: msg.assistantText || "",
@@ -6816,7 +6919,7 @@ async function maybeIdleNudgeInner(msg) {
     // guard-denied) is final for this assistant body. Auto's watcher revisits
     // the same settled conversation on its interval, so remember the turn here
     // instead of repeating the planner/semantic work every check.
-    if (!supervisorSent) lastJudgedAssistantFp.set(convKey, fp);
+    if (!supervisorSent) rememberConversationNudgeState(lastJudgedAssistantFp, convKey, fp);
     return rememberIdleNudge(convKey, {
       nudged: supervisorSent,
       reason: supervisor.status === "decided"
@@ -6860,7 +6963,7 @@ async function maybeIdleNudgeInner(msg) {
       });
     }
     if (policy.action === "stop") {
-      lastJudgedAssistantFp.set(convKey, fp);
+      rememberConversationNudgeState(lastJudgedAssistantFp, convKey, fp);
       clearIdleNudgeRetry(convKey);
       return rememberIdleNudge(convKey, {
         nudged: false,
@@ -6877,7 +6980,7 @@ async function maybeIdleNudgeInner(msg) {
     if (judged.ok) {
       const verdict = interpretLlmJudgeReply(judged.content);
       if (verdict.done) {
-        lastJudgedAssistantFp.set(convKey, fp);
+        rememberConversationNudgeState(lastJudgedAssistantFp, convKey, fp);
         clearIdleNudgeRetry(convKey);
         return rememberIdleNudge(convKey, {
           nudged: false,
@@ -12261,20 +12364,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "h2w_automation_state") {
     void (async () => {
       await configReady;
-      const scope = automationScopeForConversation(String(msg.convKey || "").trim());
-      const runtimeGate = await automationRuntimeGate();
-      const runtimeAvailable = runtimeGate.ok === true;
-      sendResponse({
-        ok: true,
-        ...scope,
-        preference_enabled: scope.enabled,
-        enabled: scope.enabled && runtimeAvailable,
-        effective_enabled: scope.enabled && runtimeAvailable,
-        runtime_available: runtimeAvailable,
-        runtime_checked_at: localRuntimeCheckedAt || null,
-        autoAllow: true,
-        labels: hudLabels(),
-      });
+      sendResponse(await automationStateForConversation(String(msg.convKey || "").trim()));
     })();
     return true;
   }
