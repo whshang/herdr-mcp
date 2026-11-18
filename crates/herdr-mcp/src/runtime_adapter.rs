@@ -3528,6 +3528,7 @@ mod tests {
             "herdr-policy-admission-{}.sock",
             std::process::id()
         ));
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let core = RuntimeBackendSelection {
@@ -3696,6 +3697,7 @@ mod tests {
             std::process::id(),
             NEXT_HC_RPC_ID.fetch_add(1, Ordering::Relaxed)
         ));
+        let _sock_guard_sock = crate::test_env::TempUnixSocketGuard::file(&sock);
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
 
@@ -3918,6 +3920,7 @@ mod tests {
         #[test]
         fn connects_to_a_same_uid_peer_with_the_uid_reported_by_the_socket() {
             let socket = peer_socket_path("same-uid");
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let _listener = UnixListener::bind(&socket).unwrap();
             let stream = connect_hc_socket(&socket, Duration::from_millis(200)).unwrap();
             assert_eq!(
@@ -3934,6 +3937,7 @@ mod tests {
         #[test]
         fn advisory_target_changes_when_socket_listener_is_replaced() {
             let socket = peer_socket_path("target-rebind");
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let first_listener = UnixListener::bind(&socket).unwrap();
             let mut client = HerdrCoreClient::new(&socket);
             client.admitted_peer_pid = Some(std::process::id() as i32);
@@ -3971,6 +3975,7 @@ mod tests {
         #[test]
         fn refuses_a_peer_with_another_effective_uid() {
             let socket = PathBuf::from("/tmp/herdr-core-peer-foreign.sock");
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let error = ensure_hc_peer_uid(
                 hc_current_effective_uid() + 1,
                 hc_current_effective_uid(),
@@ -4037,6 +4042,7 @@ mod tests {
         struct MockHcServer {
             socket_path: PathBuf,
             handle: thread::JoinHandle<()>,
+            _socket_guard: crate::test_env::TempUnixSocketGuard,
         }
 
         impl MockHcServer {
@@ -4137,6 +4143,7 @@ mod tests {
                     }
                 });
                 Self {
+                    _socket_guard: crate::test_env::TempUnixSocketGuard::file(&socket_path),
                     socket_path,
                     handle,
                 }

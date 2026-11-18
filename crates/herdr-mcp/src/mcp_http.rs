@@ -4139,7 +4139,9 @@ mod tests {
                 .as_millis()
         ));
         std::fs::create_dir_all(&socket_dir).unwrap();
+        let _sock_guard_socket_dir = crate::test_env::TempUnixSocketGuard::dir(&socket_dir);
         let socket_path = socket_dir.join("h.sock");
+        let _sock_guard_socket_path = crate::test_env::TempUnixSocketGuard::file(&socket_path);
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let store = Arc::new(Mutex::new(
@@ -4771,6 +4773,7 @@ mod tests {
                     .as_nanos(),
                 advertised,
             ));
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let recorded = spawn_inspect_core_fixture(&socket, None, advertised);
             std::fs::write(config_dir.join("config.json"), json!({
                 "runtime": {"backend": "herdr-core", "herdr_core_socket": socket.to_string_lossy()}
@@ -4872,10 +4875,12 @@ mod tests {
             "/tmp/hc-nested-{}-{unique}.sock",
             std::process::id()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let tui_socket = std::path::PathBuf::from(format!(
             "/tmp/tui-nested-{}-{unique}.sock",
             std::process::id()
         ));
+        let _sock_guard_tui_socket = crate::test_env::TempUnixSocketGuard::file(&tui_socket);
         spawn_core_execution_fixture(&core_socket);
         let listener = UnixListener::bind(&tui_socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -5083,6 +5088,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         std::fs::remove_file(&core_socket).ok();
         spawn_core_execution_fixture(&core_socket);
         std::fs::write(
@@ -5293,6 +5299,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let recorded = spawn_recording_core_fixture(&core_socket, None);
         std::fs::write(
             config_dir.join("config.json"),
@@ -5429,6 +5436,8 @@ mod tests {
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         let missing_socket = root.join("no-such-core.sock");
+        let _sock_guard_missing_socket =
+            crate::test_env::TempUnixSocketGuard::file(&missing_socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -5505,6 +5514,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let log = root.join("calls.log");
         let core = start_core_child(&core_socket, &log);
         std::fs::write(
@@ -5630,6 +5640,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let recorded = spawn_recording_core_fixture(&core_socket, None);
         std::fs::write(config_dir.join("config.json"), json!({
             "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
@@ -5756,6 +5767,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let recorded = spawn_recording_core_fixture(&core_socket, None);
         std::fs::write(
             config_dir.join("config.json"),
@@ -6033,6 +6045,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -6261,6 +6274,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -9068,7 +9082,13 @@ mod tests {
     /// each answered with the next scripted response (id mirrored). Same wire
     /// contract as the prompt.rs dispatch tests. Every received request is
     /// recorded so tests can assert what actually reached the Herdr socket.
-    fn spawn_scripted_herdr_socket(responses: Vec<Value>) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
+    fn spawn_scripted_herdr_socket(
+        responses: Vec<Value>,
+    ) -> (
+        PathBuf,
+        crate::test_env::TempUnixSocketGuard,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
@@ -9081,6 +9101,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&socket);
+        let guard = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
@@ -9101,7 +9122,7 @@ mod tests {
                 .unwrap();
             }
         });
-        (socket, requests)
+        (socket, guard, requests)
     }
 
     /// Production-shaped AppState for dispatch tests: the durable task
@@ -9883,7 +9904,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
@@ -10039,7 +10060,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
@@ -10260,7 +10281,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
@@ -10449,7 +10470,7 @@ mod tests {
     #[tokio::test]
     async fn worker_report_rejects_webchat_and_tcp_before_mutation() {
         let root = test_root("worker-report-boundary");
-        let (socket, _) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
@@ -10506,7 +10527,7 @@ mod tests {
     #[tokio::test]
     async fn decision_gate_resolution_rejects_all_mcp_callers_without_mutation() {
         let root = test_root("gate-boundary");
-        let (socket, _) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
@@ -10580,7 +10601,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
@@ -10673,7 +10694,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]).collect();
-        let (socket, requests) = spawn_scripted_herdr_socket(responses);
+        let (socket, _sock_guard, requests) = spawn_scripted_herdr_socket(responses);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10965,7 +10986,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"type": "tab_created", "tab": {"tab_id": "w1:t2", "workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p9", "tab_id": "w1:t2", "workspace_id": "w1"}}),
             json!({"type": "agent_started", "argv": [], "agent": {
@@ -11091,7 +11112,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {
                 "status": "submitted",
@@ -11277,7 +11298,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
@@ -11685,7 +11706,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -11980,7 +12001,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
@@ -12104,7 +12125,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {
                 "status": "submitted",
@@ -12399,7 +12420,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
@@ -12774,7 +12795,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -12918,7 +12939,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
@@ -13098,7 +13119,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         // The same state over the bearer TCP listener: the reserved handoff
         // headers are admitted only from the 0600 Unix IPC listener. Built
@@ -13287,7 +13308,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -13523,7 +13544,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store_for_assertions = state.state_store.clone();
@@ -14203,6 +14224,7 @@ mod tests {
         let root = test_root("core-s2a-routes");
         std::fs::create_dir_all(&root).unwrap();
         let core_socket = root.join("core.sock");
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let core_config_file = root.join("config.json");
         std::fs::write(
             &core_config_file,
@@ -14383,6 +14405,7 @@ mod tests {
         let root = test_root("core-stream-admission");
         std::fs::create_dir_all(&root).unwrap();
         let core_socket = root.join("core.sock");
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let core_config_file = root.join("config.json");
         std::fs::write(
             &core_config_file,
