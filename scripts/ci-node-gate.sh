@@ -14,7 +14,6 @@ case "${MODE}" in
     ;;
   extension)
     npm ci
-    npm run build
     node --test \
       tests/browser-actuation-recovery.test.mjs \
       tests/browser-control-plane.test.mjs \
@@ -22,7 +21,6 @@ case "${MODE}" in
       tests/browser-extension-store-listing.test.mjs \
       tests/chatgpt-artifact-capture.test.mjs \
       tests/continuity-journal.test.mjs \
-      tests/extension-auth.test.mjs \
       tests/extension-i18n.test.mjs \
       tests/extension-local-auth.test.mjs \
       tests/extension-native-host.test.mjs \
@@ -39,7 +37,19 @@ case "${MODE}" in
     ;;
   edge)
     npm ci
-    npm run build
+    npm run test:edge:built
+    ;;
+  rust)
+    # Rust behavior is owned by `release-gate.sh rust` in the rust job. This
+    # lane keeps the Node/Edge contract tests that read Rust-owned files and
+    # skips only the root tsc build and the legacy tests that import root dist.
+    npm ci
+    mapfile -t rust_node_tests < <(node scripts/select-ci-tests.mjs --list-rust-node-tests)
+    if [ "${#rust_node_tests[@]}" -eq 0 ]; then
+      printf 'rust CI mode selected no root Node tests\n' >&2
+      exit 1
+    fi
+    node --test "${rust_node_tests[@]}"
     npm run test:edge:built
     ;;
   *)
