@@ -631,6 +631,7 @@ pub fn run_durable(
                     &working,
                 )
             };
+            projects::invalidate_git_status_cache(&effective_root);
             return finish_durable(store, reservation, request.intent, run);
         }
         #[cfg(not(unix))]
@@ -655,19 +656,16 @@ pub fn run_durable(
     #[cfg(not(unix))]
     let _ = (client, snapshot);
 
-    finish_durable(
-        store,
-        reservation,
-        request.intent,
-        run_native_durable(
-            registry,
-            (&workspace.id, &effective_root),
-            &invocation,
-            &command,
-            timeout_ms,
-            &working,
-        ),
-    )
+    let run = run_native_durable(
+        registry,
+        (&workspace.id, &effective_root),
+        &invocation,
+        &command,
+        timeout_ms,
+        &working,
+    );
+    projects::invalidate_git_status_cache(&effective_root);
+    finish_durable(store, reservation, request.intent, run)
 }
 
 /// Persist the first synchronous submission result for a reserved key.

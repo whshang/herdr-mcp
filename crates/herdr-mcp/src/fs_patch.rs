@@ -259,6 +259,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
                 "hint": "patch rolled back when possible; re-read files and regenerate",
             });
         }
+        projects::invalidate_git_status_cache(&root_path.root);
     }
 
     let mut output = Map::new();
