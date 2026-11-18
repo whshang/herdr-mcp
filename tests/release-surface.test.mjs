@@ -251,15 +251,16 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
   }
 });
 
-test("user Linux CI stays schedulable | Given the CI workflow | When Linux jobs are selected | Then rust and test run on GitHub-hosted ubuntu-latest", async () => {
+test("user Linux CI stays schedulable | Given the CI workflow | When Linux jobs are selected | Then rust and test run on the pinned devin-vm self-hosted runner", async () => {
   const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
   const windows = await readFile(join(ROOT, ".github/workflows/windows-candidate.yml"), "utf8");
   assert.equal(
-    [...ci.matchAll(/^\s*runs-on:\s*ubuntu-latest\s*$/gm)].length,
+    [...ci.matchAll(/^\s*runs-on:\s*\[self-hosted, linux, x64, devin-vm\]\s*$/gm)]
+      .length,
     2,
-    "CI rust and test must both use ubuntu-latest",
+    "CI rust and test must both use the devin-vm self-hosted runner",
   );
-  assert.doesNotMatch(ci, /self-hosted|herdr-box/);
+  assert.doesNotMatch(ci, /ubuntu-latest|herdr-box/);
   assert.match(ci, /rustup toolchain install 1\.97\.1 --profile minimal --component clippy,rustfmt/);
   assert.match(ci, /node-version:\s*22/);
   assert.match(ci, /deno-version:\s*v2\.x/);
