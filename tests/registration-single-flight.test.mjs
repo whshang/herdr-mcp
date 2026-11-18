@@ -210,7 +210,7 @@ function routeWatchHarness({ convKey = KEY_A, registeredConvKey = null, hidden =
     getConversationKey: () => currentConvKey,
   };
   const api = new Function(
-    "setInterval",
+    "mountHiddenIdleInterval",
     "window",
     "document",
     "ADAPTER",
@@ -234,7 +234,7 @@ function routeWatchHarness({ convKey = KEY_A, registeredConvKey = null, hidden =
     };
     `,
   )(
-    (fn) => { ticks.push(fn); return ticks.length; },
+    (fn) => { ticks.push(fn); return null; },
     windowStub,
     documentStub,
     adapterStub,

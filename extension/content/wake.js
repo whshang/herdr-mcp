@@ -9,7 +9,7 @@
 //   continue/handoff switches; other sites are watched during wake-up.
 // Status feedback uses the toolbar badge rather than an ambiguous in-page dot.
 // Keep this version aligned with H2W_SCRIPT_VERSION in background.js.
-const H2W_CONTENT_VERSION = "0.1.251";
+const H2W_CONTENT_VERSION = "0.1.252";
 
 function normalizeHerdrMentionAlias(value) {
   return String(value ?? "").trim().replace(/^@+/, "").replace(/\s+/g, " ");
@@ -3627,6 +3627,73 @@ function normalizeHerdrMentionAlias(value) {
     return true;
   }
 
+  // ---- Hidden-tab idle timer suspension (#1039) ----
+  // Idle hidden AI tabs (no unsettled dispatch, no pending refresh or
+  // registration, no fresh submit anchor, stable route key) suspend the
+  // route-watch and turn-watch intervals so the renderer can sleep. Any wake
+  // signal re-arms them; the next tick lands within one period, which is the
+  // same worst-case latency as the always-on timers.
+  const HIDDEN_TIMER_ACTIVITY_GRACE_MS = 15000;
+  const HIDDEN_TIMER_SUBMIT_ANCHOR_MS = 30000;
+  const hiddenIdleIntervals = [];
+  let hiddenTimerActivityUntil = 0;
+
+  function hasUnsettledBrowserDispatch() {
+    for (const assignment of acceptedDispatchAssignments.values()) {
+      if (!assignment || assignment.reportedAssistantRef) continue;
+      // A probe that exhausted its rejections never retries; it must not pin
+      // the tab awake forever.
+      if (browserResultProbeState?.pending === assignment && browserResultProbeState.rejected >= 3) continue;
+      return true;
+    }
+    return false;
+  }
+
+  function shouldKeepHiddenTimersActive() {
+    if (!document.hidden) return true;
+    const now = Date.now();
+    if (now < hiddenTimerActivityUntil) return true;
+    if (browserPendingDispatchRefresh || registrationInFlight.size > 0) return true;
+    if (hasUnsettledBrowserDispatch()) return true;
+    const submitAt = Number(conversationHealth?.last_user_submit_at || 0);
+    if (submitAt > 0 && now - submitAt <= HIDDEN_TIMER_SUBMIT_ANCHOR_MS) return true;
+    // A hidden session.create worker moves from the new-chat route to /c/<id>
+    // without a history event; an unregistered key keeps the poll alive.
+    return (ADAPTER.getConversationKey() || null) !== (registeredConvKey || null);
+  }
+
+  function noteHiddenTimerActivity() {
+    hiddenTimerActivityUntil = Date.now() + HIDDEN_TIMER_ACTIVITY_GRACE_MS;
+    for (const interval of hiddenIdleIntervals) interval.rearm();
+  }
+
+  function mountHiddenIdleInterval(run, intervalMs, { onResume } = {}) {
+    if (!BROWSER_PERFORMANCE?.createSuspendableInterval) {
+      setInterval(run, intervalMs);
+      return null;
+    }
+    const interval = BROWSER_PERFORMANCE.createSuspendableInterval(run, {
+      intervalMs,
+      keepActive: shouldKeepHiddenTimersActive,
+      onResume,
+    });
+    hiddenIdleIntervals.push(interval);
+    interval.start();
+    return interval;
+  }
+
+  try {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) noteHiddenTimerActivity();
+    });
+    window.addEventListener("popstate", () => { noteHiddenTimerActivity(); });
+    window.addEventListener("hashchange", () => { noteHiddenTimerActivity(); });
+    // Every background command (dispatch, actuation, handshake, control) is a
+    // wake signal. Returning undefined leaves the response channel to the
+    // command listener below.
+    chrome.runtime.onMessage.addListener(() => { noteHiddenTimerActivity(); });
+  } catch (_) { /* timers then simply stay armed */ }
+
   // ---- Message listener ----
   try {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -4503,7 +4570,8 @@ function normalizeHerdrMentionAlias(value) {
     let visibleRouteRegistrationKey = null;
     // One second is fast enough for UI binding while keeping route detection
     // negligible compared with the existing 5s HUD reconciliation interval.
-    setInterval(() => {
+    // Suspends while the tab is hidden and idle (#1039).
+    mountHiddenIdleInterval(() => {
       void observeBrowserResultSettlement().catch(() => {});
       maybeRefreshBrowserPendingDispatchAssignment();
       if (document.hidden) {
@@ -6887,7 +6955,9 @@ function normalizeHerdrMentionAlias(value) {
         })
       : null;
     let lastIntervalAt = Date.now();
-    setInterval(() => {
+    // Suspends while the tab is hidden and idle (#1039); a resumed interval
+    // restarts the drift baseline so the suspension gap is not read as drift.
+    mountHiddenIdleInterval(() => {
       const scheduledAt = Date.now();
       if (document.hidden) {
         lastIntervalAt = scheduledAt;
@@ -6901,7 +6971,7 @@ function normalizeHerdrMentionAlias(value) {
       if (driftMs >= UI_TICK_DRIFT_FLOOR_MS) uiPressure?.recordTimerDrift(driftMs);
       if (tickScheduler) tickScheduler.schedule();
       else onTick();
-    }, 800);
+    }, 800, { onResume: () => { lastIntervalAt = Date.now(); } });
     try {
       const mo = new MutationObserver((records) => {
         if (document.hidden) return;
