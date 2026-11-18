@@ -27,8 +27,8 @@ const GREP_MAX_MATCHES: usize = 1000;
 // Keep the default bounded, but large enough for ordinary implementation files.
 // A 64 KiB ceiling discarded valid rg hits in normal source files and could
 // turn a real match into a successful-looking empty result.
-const GREP_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
-const GREP_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const GREP_DEFAULT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const GREP_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const GREP_COMPACT_AFTER: usize = 24;
 const GREP_RG_TIMEOUT: Duration = Duration::from_secs(5);
 // Remote Link frames default to 256 KiB. Keeping the binary preview at or
@@ -462,6 +462,7 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         LineMatcher::Literal(pattern.to_owned())
     };
 
+    let linked_worktree = is_linked_worktree(&managed.root);
     if should_try_rg(&managed.root)
         && let Some(rg_path) = rg.as_deref()
     {
@@ -475,14 +476,20 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
             max_matches,
             max_bytes,
             timeout: GREP_RG_TIMEOUT,
+            linked_worktree,
             #[cfg(test)]
             before_wait: None,
         }) {
-            GrepRgOutcome::Complete { matches, truncated } => {
+            GrepRgOutcome::Complete {
+                matches,
+                truncated,
+                skipped_large_files,
+            } => {
                 return finish_grep_result(
                     &managed.resolved,
                     matches,
                     truncated,
+                    skipped_large_files,
                     "rg",
                     started_at_ms,
                     started.elapsed().as_millis() as u64,
@@ -504,6 +511,7 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
 
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut skipped_large_files = 0_u64;
     let search_root = glob
         .map(|value| resolve_grep_search_root(&managed.real, value))
         .unwrap_or_else(|| managed.real.clone());
@@ -514,39 +522,50 @@ fn grep_with_backend(snapshot: &Value, args: &Value, rg: Option<PathBuf>) -> Val
         max_matches,
         max_bytes,
     };
-    walk_grep(&search_root, &walk, &mut matches, &mut truncated);
+    walk_grep(
+        &search_root,
+        &walk,
+        &mut matches,
+        &mut truncated,
+        &mut skipped_large_files,
+    );
     finish_grep_result(
         &managed.resolved,
         matches,
         truncated,
+        skipped_large_files,
         "rust",
         started_at_ms,
         started.elapsed().as_millis() as u64,
     )
 }
 
-/// A linked worktree stores its real Git metadata outside the checkout. On
-/// macOS that target can live under a TCC-protected directory (for example
-/// `~/Documents`) even when the checkout itself is under `~/.herdr/worktrees`.
-/// ripgrep discovers Git/ignore metadata and can then block on that protected
-/// target from a launchd runtime. The in-process Rust walker only needs the
-/// already-authorized checkout files, so prefer it for this exact shape.
-fn should_try_rg(managed_root: &Path) -> bool {
+/// A linked worktree keeps its Git metadata outside the checkout in a
+/// `.git` *file*. On macOS that target can live under a TCC-protected
+/// directory even when the checkout itself is under `~/.herdr/worktrees`,
+/// so such roots get the restricted `rg` flag set instead of Git discovery.
+fn is_linked_worktree(managed_root: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        !managed_root.join(".git").is_file()
+        managed_root.join(".git").is_file()
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = managed_root;
-        true
+        false
     }
+}
+
+fn should_try_rg(managed_root: &Path) -> bool {
+    let _ = managed_root;
+    true
 }
 
 fn finish_grep_result(
     resolved_root: &Path,
     matches: Vec<Value>,
     truncated: bool,
+    skipped_large_files: u64,
     engine: &str,
     started_at_ms: u64,
     elapsed_ms: u64,
@@ -559,6 +578,7 @@ fn finish_grep_result(
             "root": resolved_root.to_string_lossy(),
             "engine": engine,
             "truncated": true,
+            "skipped_large_files": skipped_large_files,
             "started_at": iso_from_ms(started_at_ms),
             "elapsed_ms": elapsed_ms,
         });
@@ -587,6 +607,7 @@ fn finish_grep_result(
     output.insert("count".to_owned(), json!(match_count));
     output.insert("truncated".to_owned(), json!(truncated));
     output.insert("engine".to_owned(), json!(engine));
+    output.insert("skipped_large_files".to_owned(), json!(skipped_large_files));
     output.insert("started_at".to_owned(), json!(iso_from_ms(started_at_ms)));
     output.insert("phase".to_owned(), json!("completed"));
     output.insert(
@@ -703,6 +724,9 @@ struct GrepRgOptions<'a> {
     max_matches: usize,
     max_bytes: u64,
     timeout: Duration,
+    /// macOS linked worktree: never let `rg` discover Git metadata — the
+    /// `.git` file can point under a TCC-protected directory.
+    linked_worktree: bool,
     #[cfg(test)]
     before_wait: Option<&'a dyn Fn(u32)>,
 }
@@ -711,6 +735,7 @@ enum GrepRgOutcome {
     Complete {
         matches: Vec<Value>,
         truncated: bool,
+        skipped_large_files: u64,
     },
     TimedOut {
         pid: u32,
@@ -725,6 +750,22 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
         "--color".to_owned(),
         "never".to_owned(),
     ];
+    if options.linked_worktree {
+        // Never touch external Git metadata: a worktree's `.git` file points
+        // outside the checkout, potentially under a TCC-protected directory.
+        // These flags keep `rg` fast without any Git/ignore discovery, and the
+        // explicit exclude keeps the `.git` entry itself out of the walk.
+        args.extend([
+            "--no-require-git".to_owned(),
+            "--no-ignore-vcs".to_owned(),
+            "--no-ignore-parent".to_owned(),
+            "--no-config".to_owned(),
+            "-g".to_owned(),
+            "!.git".to_owned(),
+            "-g".to_owned(),
+            "!.git/**".to_owned(),
+        ]);
+    }
     if !options.regex_mode {
         args.push("-F".to_owned());
     }
@@ -805,6 +846,7 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
 
     let mut matches = Vec::new();
     let mut truncated = output.len() as u64 > stdout_ceiling;
+    let mut skipped_files = std::collections::HashSet::new();
     let retained = &output[..output.len().min(stdout_ceiling as usize)];
     for line in String::from_utf8_lossy(retained).lines() {
         if line.trim().is_empty() {
@@ -817,10 +859,6 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
         let Some((file, line_no, content)) = parse_rg_line(line) else {
             continue;
         };
-        if content.len() as u64 > options.max_bytes {
-            truncated = true;
-            continue;
-        }
         let file_path = PathBuf::from(&file);
         let abs = if file_path.is_absolute() {
             file_path
@@ -829,11 +867,13 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
         };
         if !fs_security::path_within(options.search_root, &abs)
             || fs_security::denied_secret_path(&abs)
+            || skipped_files.contains(&abs)
         {
             continue;
         }
         if fs::metadata(&abs).is_ok_and(|metadata| metadata.len() > options.max_bytes) {
             truncated = true;
+            skipped_files.insert(abs);
             continue;
         }
         matches.push(json!({
@@ -842,7 +882,11 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
             "content": content,
         }));
     }
-    GrepRgOutcome::Complete { matches, truncated }
+    GrepRgOutcome::Complete {
+        matches,
+        truncated,
+        skipped_large_files: skipped_files.len() as u64,
+    }
 }
 
 fn parse_rg_line(line: &str) -> Option<(String, usize, String)> {
@@ -936,6 +980,7 @@ fn walk_grep(
     options: &GrepWalkOptions<'_>,
     output: &mut Vec<Value>,
     truncated: &mut bool,
+    skipped_large_files: &mut u64,
 ) {
     if output.len() >= options.max_matches {
         *truncated = true;
@@ -963,7 +1008,7 @@ fn walk_grep(
             continue;
         };
         if file_type.is_dir() {
-            walk_grep(&full, options, output, truncated);
+            walk_grep(&full, options, output, truncated, skipped_large_files);
             continue;
         }
         if !file_type.is_file()
@@ -978,6 +1023,7 @@ fn walk_grep(
         };
         if metadata.len() > options.max_bytes {
             *truncated = true;
+            *skipped_large_files += 1;
             continue;
         }
         let Ok(data) = fs::read(&full) else {
@@ -1390,6 +1436,7 @@ mod tests {
             max_matches: 10,
             max_bytes: 1024,
             timeout: Duration::from_millis(100),
+            linked_worktree: false,
             before_wait: Some(&wait_until_script_started),
         });
         let GrepRgOutcome::TimedOut { pid } = outcome else {
@@ -1406,6 +1453,66 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// user operator | Given one oversized file that rg reports many hits in
+    /// plus a small file with a hit | When fs_grep finishes with matches |
+    /// Then the oversized file is counted once and the count reaches the
+    /// successful result.
+    #[cfg(unix)]
+    #[test]
+    fn rg_counts_each_oversized_file_once_and_reports_it_on_success() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-rg-skip-dedup-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("big.rs"), "needle\n".repeat(512)).unwrap();
+        fs::write(root.join("small.rs"), "needle\n").unwrap();
+        let fake_rg = root.join("rg");
+        fs::write(
+            &fake_rg,
+            "#!/bin/sh\nprintf 'big.rs:1:needle\\nbig.rs:2:needle\\nbig.rs:3:needle\\nsmall.rs:1:needle\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = try_grep_rg(&GrepRgOptions {
+            rg: &fake_rg,
+            search_root: &root,
+            pattern: "needle",
+            regex_mode: false,
+            case_insensitive: false,
+            glob: None,
+            max_matches: 64,
+            max_bytes: 1024,
+            timeout: Duration::from_secs(10),
+            linked_worktree: false,
+            before_wait: None,
+        });
+        let GrepRgOutcome::Complete {
+            matches,
+            truncated,
+            skipped_large_files,
+        } = outcome
+        else {
+            panic!("fake rg should complete");
+        };
+        assert_eq!(matches.len(), 1);
+        assert!(truncated);
+        assert_eq!(skipped_large_files, 1);
+
+        let result = finish_grep_result(&root, matches, truncated, skipped_large_files, "rg", 0, 1);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["skipped_large_files"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn parse_rg_line_splits_file_line_content() {
         let (file, line, content) = parse_rg_line("/repo/src/lib.rs:3:alpha two").unwrap();
@@ -1417,9 +1524,42 @@ mod tests {
 
     #[test]
     fn empty_truncated_grep_fails_closed() {
-        let result = finish_grep_result(Path::new("/repo"), vec![], true, "rust", 0, 1);
+        let result = finish_grep_result(Path::new("/repo"), vec![], true, 2, "rust", 0, 1);
         assert_eq!(result["ok"], false);
         assert_eq!(result["code"], "grep_incomplete");
+        assert_eq!(result["skipped_large_files"], 2);
+    }
+
+    /// user operator | Given a project file larger than `max_bytes` | When
+    /// fs_grep finds no other hit | Then `grep_incomplete` names how many
+    /// files were skipped for size so the caller can raise `max_bytes`.
+    #[test]
+    fn oversized_file_skip_is_counted_in_grep_incomplete() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-grep-large-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("big.rs"), "needle\n".repeat(2048)).unwrap();
+
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+        // `rg: None` exercises the in-process walk path deterministically.
+        let args = json!({"root": root, "pattern": "needle", "max_bytes": 1024});
+        let result = grep_with_backend(&snapshot, &args, None);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["code"], "grep_incomplete");
+        assert_eq!(result["skipped_large_files"], 1);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -1435,9 +1575,13 @@ mod tests {
         assert!(!grep_prefers_in_process(&json!({"root": parent_escape})));
     }
 
+    /// user operator | Given a macOS linked worktree whose `.git` file points
+    /// under a TCC-protected directory | When fs_grep runs | Then `rg` still
+    /// serves the search, but only with flags that disable all Git/ignore
+    /// discovery and exclude the `.git` entry itself.
     #[cfg(target_os = "macos")]
     #[test]
-    fn linked_worktree_uses_rust_grep_without_spawning_rg() {
+    fn linked_worktree_uses_restricted_rg_without_git_discovery() {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1457,11 +1601,14 @@ mod tests {
         .unwrap();
         fs::write(root.join("src/lib.rs"), "needle\n").unwrap();
 
-        let marker = root.join("fake-rg-ran");
+        let marker = root.join("fake-rg-args");
         let fake_rg = root.join("fake-rg");
         fs::write(
             &fake_rg,
-            format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'src/lib.rs:1:needle\\n'\nexit 0\n",
+                marker.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1473,9 +1620,23 @@ mod tests {
         let args = json!({"root": root, "pattern": "needle", "glob": "*.rs"});
         let result = grep_with_backend(&snapshot, &args, Some(fake_rg));
         assert_eq!(result["ok"], true);
-        assert_eq!(result["engine"], "rust");
+        assert_eq!(result["engine"], "rg");
         assert_eq!(result["count"], 1);
-        assert!(!marker.exists(), "linked worktree unexpectedly spawned rg");
+
+        let invoked = fs::read_to_string(&marker).unwrap();
+        for flag in [
+            "--no-require-git",
+            "--no-ignore-vcs",
+            "--no-ignore-parent",
+            "--no-config",
+            "!.git",
+            "!.git/**",
+        ] {
+            assert!(
+                invoked.lines().any(|arg| arg == flag),
+                "restricted rg invocation missing {flag}: {invoked}"
+            );
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
