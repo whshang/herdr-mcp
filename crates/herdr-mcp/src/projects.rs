@@ -17,11 +17,19 @@ struct GitStatusCacheEntry {
     value: Option<GitStatus>,
 }
 
+/// A probe currently running for one root. `invalidated` is set when a write
+/// under that root lands while the probe is in flight, so the stale result is
+/// never published to the cache.
+struct GitStatusInFlight {
+    done: Mutex<bool>,
+    ready: Condvar,
+    invalidated: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Default)]
 struct GitStatusCacheState {
     entries: HashMap<PathBuf, GitStatusCacheEntry>,
-    in_flight: HashMap<PathBuf, Arc<(Mutex<bool>, Condvar)>>,
-    generation: u64,
+    in_flight: HashMap<PathBuf, Arc<GitStatusInFlight>>,
 }
 
 static GIT_STATUS_CACHE: OnceLock<Mutex<GitStatusCacheState>> = OnceLock::new();
@@ -32,16 +40,27 @@ thread_local! {
 }
 
 #[cfg(test)]
-static GIT_STATUS_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GIT_STATUS_PROBES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
 #[cfg(test)]
-pub(crate) fn reset_git_status_probe_count() {
-    GIT_STATUS_PROBES.store(0, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn reset_git_status_probe_count(root: &Path) {
+    if let Some(probes) = GIT_STATUS_PROBES.get() {
+        probes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(root);
+    }
 }
 
 #[cfg(test)]
-pub(crate) fn git_status_probe_count() -> usize {
-    GIT_STATUS_PROBES.load(std::sync::atomic::Ordering::Relaxed)
+pub(crate) fn git_status_probe_count(root: &Path) -> usize {
+    GIT_STATUS_PROBES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(root)
+        .copied()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -346,27 +365,33 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         if let Some(waiter) = state.in_flight.get(&key).cloned() {
             drop(state);
             let mut done = waiter
-                .0
+                .done
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             while !*done {
                 done = waiter
-                    .1
+                    .ready
                     .wait(done)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
             continue;
         }
-        let waiter = Arc::new((Mutex::new(false), Condvar::new()));
+        let waiter = Arc::new(GitStatusInFlight {
+            done: Mutex::new(false),
+            ready: Condvar::new(),
+            invalidated: std::sync::atomic::AtomicBool::new(false),
+        });
         state.in_flight.insert(key.clone(), waiter.clone());
-        let generation = state.generation;
         drop(state);
 
         let value = git_status_uncached(snapshot, root);
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.generation == generation {
+        if !waiter
+            .invalidated
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let expires_at = Instant::now() + GIT_STATUS_CACHE_TTL;
             state.entries.insert(
                 key.clone(),
@@ -387,10 +412,10 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         }
         state.in_flight.remove(&key);
         *waiter
-            .0
+            .done
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-        waiter.1.notify_all();
+        waiter.ready.notify_all();
         return value;
     }
 }
@@ -403,15 +428,28 @@ pub fn invalidate_git_status_cache(root: &Path) {
     let mut state = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.generation = state.generation.wrapping_add(1);
     state
         .entries
         .retain(|key, _| key != root && !key.starts_with(root));
+    for (key, in_flight) in &state.in_flight {
+        if key == root || key.starts_with(root) {
+            in_flight
+                .invalidated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
     #[cfg(test)]
-    GIT_STATUS_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        *GIT_STATUS_PROBES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(root.to_path_buf())
+            .or_insert(0) += 1;
+    }
     if should_use_stable_broker(snapshot, root) {
         return broker_git_status(snapshot, root);
     }
@@ -700,7 +738,7 @@ mod tests {
         );
         let snapshot = git_snapshot(&root);
         invalidate_git_status_cache(&root);
-        reset_git_status_probe_count();
+        reset_git_status_probe_count(&root);
         let handles = (0..8)
             .map(|_| {
                 let snapshot = snapshot.clone();
@@ -710,7 +748,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        assert_eq!(git_status_probe_count(), 1);
+        assert_eq!(git_status_probe_count(&root), 1);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -728,13 +766,13 @@ mod tests {
         );
         let snapshot = git_snapshot(&root);
         invalidate_git_status_cache(&root);
-        reset_git_status_probe_count();
+        reset_git_status_probe_count(&root);
         let first = derive(&snapshot);
         assert!(!first.projects[&root].dirty);
         std::thread::sleep(GIT_STATUS_CACHE_TTL + Duration::from_millis(40));
         let second = derive(&snapshot);
         assert!(!second.projects[&root].dirty);
-        assert_eq!(git_status_probe_count(), 2);
+        assert_eq!(git_status_probe_count(&root), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
