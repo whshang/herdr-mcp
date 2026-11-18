@@ -8659,6 +8659,7 @@ mod tests {
     fn dispatch_identity_injection_is_opt_in_and_replay_safe() {
         for inject in [false, true] {
             let socket = temp_socket();
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let listener = UnixListener::bind(&socket).unwrap();
             let texts = Arc::new(Mutex::new(Vec::new()));
             let server = scripted_dispatch_server(
@@ -9524,6 +9525,7 @@ mod tests {
     fn spawn_dispatch_creates_one_pane_agent_and_task() {
         let root = spawn_project_root("happy");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9595,6 +9597,7 @@ mod tests {
         let root = spawn_project_root("worktree");
         let checkout = root.join("task-tree");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9679,6 +9682,7 @@ mod tests {
         let root = audit_repo("spawn-audit-failure");
         let checkout = root.join("created");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9743,6 +9747,7 @@ mod tests {
         let root = spawn_project_root("replay");
         let checkout = root.join("replay-tree");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9802,6 +9807,7 @@ mod tests {
     fn spawn_dispatch_split_from_uses_the_named_parent_pane() {
         let root = spawn_project_root("split");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9844,6 +9850,7 @@ mod tests {
     fn spawn_dispatch_narrow_split_fails_before_any_mutation() {
         let root = spawn_project_root("narrow");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
         let (registry, _watch_off) = spawn_registry(&root, 20);
         let args = json!({
@@ -9878,6 +9885,7 @@ mod tests {
     fn spawn_dispatch_agent_start_failure_reports_the_created_pane() {
         let root = spawn_project_root("startfail");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9919,6 +9927,7 @@ mod tests {
     #[test]
     fn spawn_scripted_fake_survives_a_client_that_hangs_up_before_the_reply() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -9947,6 +9956,7 @@ mod tests {
     fn spawn_dispatch_budget_pause_replays_into_the_same_pane() {
         let root = spawn_project_root("budgetpause");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let first_requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -10028,6 +10038,7 @@ mod tests {
     fn spawn_dispatch_readiness_pause_resumes_and_prompts_once() {
         let root = spawn_project_root("readypause");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let first_requests = Arc::new(Mutex::new(Vec::new()));
         let server = repeating_spawn_server(
@@ -10172,6 +10183,7 @@ mod tests {
     fn spawn_dispatch_delegation_refusal_happens_before_any_pane() {
         let root = spawn_project_root("delegation");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -10232,6 +10244,7 @@ mod tests {
     fn spawn_dispatch_delegation_refusal_replays_under_the_same_key() {
         let root = spawn_project_root("delegation-replay");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -10302,6 +10315,7 @@ mod tests {
     fn spawn_dispatch_prompt_failure_reports_the_prompt_step() {
         let root = spawn_project_root("promptfail");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_spawn_server(
             UnixListener::bind(&socket).unwrap(),
@@ -10347,6 +10361,7 @@ mod tests {
     fn spawn_dispatch_validation_failures_have_no_side_effects() {
         let root = spawn_project_root("validate");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
         let (registry, _watch_off) = spawn_registry(&root, 80);
         let client = HerdrClient::new(&socket);
@@ -10455,6 +10470,7 @@ mod tests {
     fn role_dispatch_records_idle_target_and_replays_without_resolution() {
         for selector in ["@codex", "@codex:idle"] {
             let socket = temp_socket();
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let requests = Arc::new(Mutex::new(Vec::new()));
             let server = scripted_read_server(
                 UnixListener::bind(&socket).unwrap(),
@@ -10527,6 +10543,7 @@ mod tests {
     #[test]
     fn role_idle_excludes_caller_busy_unknown_and_other_workspace() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let texts = Arc::new(Mutex::new(Vec::new()));
         let parent = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle"}}});
         let server = scripted_dispatch_server(
@@ -10562,6 +10579,7 @@ mod tests {
     #[test]
     fn role_unavailable_broadcast_and_invalid_limits_never_submit() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let registry = role_registry(json!([
@@ -10714,6 +10732,7 @@ mod tests {
     #[test]
     fn role_dispatch_preserves_delegation_depth_and_self_exclusion() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let texts = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_dispatch_server(
             UnixListener::bind(&socket).unwrap(),
@@ -10763,6 +10782,7 @@ mod tests {
     #[test]
     fn role_cap_serializes_simultaneous_dispatches() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let texts = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_dispatch_server(
             UnixListener::bind(&socket).unwrap(),
@@ -10844,6 +10864,7 @@ mod tests {
     #[test]
     fn clear_dispatch_failure_releases_handoff_mark_and_retry_injects() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
         let idle = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}});
@@ -10904,6 +10925,7 @@ mod tests {
     #[test]
     fn uncertain_dispatch_failure_keeps_handoff_mark() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
         let idle = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}});
@@ -10936,6 +10958,7 @@ mod tests {
     #[test]
     fn successful_prompt_uses_socket_agent_prompt_and_replays_without_resend() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for (index, expected) in ["agent.get", "agent.prompt"].into_iter().enumerate() {
@@ -11000,6 +11023,7 @@ mod tests {
     #[test]
     fn persisted_idempotency_replays_and_conflicts_after_registry_restart() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for (index, expected) in ["agent.get", "agent.prompt"].into_iter().enumerate() {
@@ -11387,6 +11411,7 @@ mod tests {
     #[test]
     fn status_wait_timeout_keeps_dispatch_and_delivery_evidence() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let client = HerdrClient::new(&socket);
         let before = AgentState {
             pane_id: Some("w1:p1".to_owned()),
@@ -11417,6 +11442,7 @@ mod tests {
     #[test]
     fn unresolved_agent_target_is_pre_dispatch_not_human_boundary() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let client = HerdrClient::new(&socket);
         let result = prompt_failure(
             &client,
@@ -12058,6 +12084,7 @@ mod tests {
     #[test]
     fn dispatch_wait_timeout_is_a_checkpoint_without_resubmission() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let texts = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_dispatch_server(
@@ -12826,6 +12853,7 @@ mod tests {
     #[test]
     fn inbox_wait_poll_does_not_repeat_parent_notification_probes() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
         let state_probes = Arc::new(AtomicU64::new(0));
@@ -13006,6 +13034,7 @@ mod tests {
     #[test]
     fn final_excerpt_is_captured_once_at_terminal_transition() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let server = scripted_read_server(
@@ -13085,9 +13114,11 @@ mod tests {
     #[test]
     fn final_excerpt_recovers_logical_lines_from_a_narrow_pane() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let transcript = temp_socket().with_extension("jsonl");
+        let _sock_guard_transcript = crate::test_env::TempUnixSocketGuard::file(&transcript);
         fs::write(
             &transcript,
             concat!(
@@ -13160,9 +13191,11 @@ mod tests {
     #[test]
     fn transcript_excerpt_is_dropped_when_the_pane_moves_during_the_read() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let transcript = temp_socket().with_extension("jsonl");
+        let _sock_guard_transcript = crate::test_env::TempUnixSocketGuard::file(&transcript);
         fs::write(
             &transcript,
             "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"cb604c6f\\nT259-DONE\"}}\n",
@@ -13220,6 +13253,7 @@ mod tests {
     #[test]
     fn final_excerpt_stays_absent_for_a_narrow_pane_without_a_transcript() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let server = scripted_read_server(
@@ -13264,6 +13298,7 @@ mod tests {
     #[test]
     fn final_excerpt_stays_absent_when_the_width_probe_fails() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let server = scripted_read_server(
@@ -13304,6 +13339,7 @@ mod tests {
     #[test]
     fn final_excerpt_is_captured_at_the_readable_width_floor() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let server = scripted_read_server(
@@ -13347,6 +13383,7 @@ mod tests {
     #[test]
     fn final_excerpt_is_omitted_when_the_pane_state_advanced() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13393,6 +13430,7 @@ mod tests {
     fn final_excerpt_omits_live_event_without_state_change_seq_even_when_pre_and_post_agent_get_match()
      {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13445,6 +13483,7 @@ mod tests {
     #[test]
     fn final_excerpt_omits_live_event_without_seq_when_later_same_pane_task_appears_in_batch() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13502,6 +13541,7 @@ mod tests {
     #[test]
     fn final_excerpt_omits_sequenced_event_when_seq_advances_between_pre_and_post_read() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let server = scripted_read_server(
@@ -13547,6 +13587,7 @@ mod tests {
     #[test]
     fn final_excerpt_omits_live_event_without_seq_when_second_same_status_event_follows_in_batch() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13602,6 +13643,7 @@ mod tests {
     #[test]
     fn final_excerpt_omits_live_done_without_seq_when_same_status_pane_updated_follows() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13661,6 +13703,7 @@ mod tests {
     fn final_excerpt_omits_live_event_without_seq_when_pane_already_settled_to_a_later_same_status_task()
      {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         // Every response below belongs to the next task B: the capture must
@@ -13718,6 +13761,7 @@ mod tests {
     fn final_excerpt_omits_live_event_without_seq_when_same_status_snapshot_belongs_to_the_next_task()
      {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         // Every response below belongs to the next task B: the capture must
@@ -13780,6 +13824,7 @@ mod tests {
     #[test]
     fn final_excerpt_omits_sequenced_terminal_event_when_the_pane_advanced_to_another_sequence() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13827,6 +13872,7 @@ mod tests {
     #[test]
     fn final_excerpt_omits_sequenced_event_when_pre_read_seq_did_not_pass_baseline() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13868,6 +13914,7 @@ mod tests {
     #[test]
     fn final_excerpt_captures_when_only_the_identical_transition_repeats_in_batch() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let server = scripted_read_server(
@@ -13929,6 +13976,7 @@ mod tests {
     #[test]
     fn pane_closed_tasks_get_no_final_excerpt() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -13962,6 +14010,7 @@ mod tests {
     fn delivery_uncertain_tasks_get_no_final_excerpt() {
         let _guard = crate::test_env::lock();
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -14017,6 +14066,7 @@ mod tests {
     #[test]
     fn final_excerpt_read_failure_keeps_lifecycle_and_notification() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let _server = scripted_read_server(
@@ -14113,6 +14163,7 @@ mod tests {
     #[test]
     fn parent_wake_line_never_echoes_child_excerpt() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let wake_texts = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -14738,6 +14789,7 @@ mod tests {
     #[test]
     fn foreground_blocker_is_recorded_while_steering_stays_delivered() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let texts = Arc::new(Mutex::new(Vec::new()));
         let server = scripted_dispatch_server(
@@ -15086,6 +15138,7 @@ mod tests {
     #[test]
     fn dispatch_rejects_a_parent_target_that_resolves_to_the_target_pane() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
         let idle = json!({"result": {"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}});
@@ -15192,6 +15245,7 @@ mod tests {
         // parent link names no active task, so only the target and parent are
         // probed once each before the prompt.
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let prompt_texts = Arc::new(Mutex::new(Vec::<String>::new()));
         let worker = json!({"result": {"agent": {"pane_id": "w1:p3", "agent_status": "idle", "state_change_seq": 1}}});
@@ -15513,6 +15567,7 @@ mod tests {
     fn spawn_unknown_model_alias_fails_before_any_mutation() {
         let root = spawn_project_root("s5-unknown");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
         // The watch-off guard owns the crate env lock for its lifetime; all
         // other env mutations in this test run after it is taken.
@@ -15560,6 +15615,7 @@ mod tests {
     fn spawn_model_on_kind_without_list_is_unvalidatable() {
         let root = spawn_project_root("s5-nolist");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
         // The watch-off guard owns the crate env lock for its lifetime.
         let (registry, _watch_off) = spawn_registry(&root, 80);
@@ -15591,6 +15647,7 @@ mod tests {
     fn spawn_validated_model_delivers_model_flag() {
         let root = spawn_project_root("s5-modelflag");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -15673,6 +15730,7 @@ mod tests {
     fn spawn_model_without_schema_delivery_fails_closed() {
         let root = spawn_project_root("s5-nodelivery");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         // The refusal now happens in parse_spawn, before any socket contact:
         // no pane is ever created for a schema that cannot carry a model.
         let listener = refused_spawn_server(&socket);
@@ -15715,6 +15773,7 @@ mod tests {
     fn spawn_dead_on_start_reports_agent_start_failed_with_redacted_tail() {
         let root = spawn_project_root("s5-deadstart");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -15779,6 +15838,7 @@ mod tests {
         let _guard = crate::test_env::lock();
         let root = spawn_project_root("s5-earlyexit");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // agent.get answers ready for the first probe (readiness), then reports
@@ -15881,6 +15941,7 @@ mod tests {
     fn budget_expiry_notifies_parent_once_without_terminating() {
         let (path, mut registry, clock) = worker_registry("s5-budget");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -15951,6 +16012,7 @@ mod tests {
     fn pending_budget_event_is_redelivered_after_a_crash_window() {
         let (path, mut registry, clock) = worker_registry("s5-budget-crash");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -16008,6 +16070,7 @@ mod tests {
     fn budget_interrupt_sends_one_cc_to_the_task_pane() {
         let (path, mut registry, clock) = worker_registry("s5-interrupt");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -16073,6 +16136,7 @@ mod tests {
     fn budget_interrupt_sends_at_most_one_cc_across_two_due_events() {
         let (path, mut registry, clock) = worker_registry("s5-interrupt-once");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -16132,6 +16196,7 @@ mod tests {
     fn budget_interrupt_refuses_when_the_pane_moved_to_a_new_turn() {
         let (path, mut registry, clock) = worker_registry("s5-interrupt-turn");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -16219,6 +16284,7 @@ mod tests {
     fn explicit_stall_expiry_emits_agent_stalled_once() {
         let (path, mut registry, clock) = worker_registry("s5-stall");
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = repeating_spawn_server(
@@ -16271,6 +16337,7 @@ mod tests {
     #[test]
     fn budget_params_are_validated() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
         let registry = PromptRegistry::new();
         let client = HerdrClient::new(&socket);
