@@ -65,7 +65,7 @@ Herdr 0.9.1 saved SSH machines and herdr-mcp Edge devices may coexist for the sa
 
 ### Validation ownership and test selection
 
-The native `herdr-mcp` service/runtime is Rust (`crates/herdr-mcp`). The repository still intentionally contains JavaScript/TypeScript for the browser extension, Cloudflare Edge, documentation/site generation, compatibility paths, cross-language contract tests, and an optional legacy/dev Node Link canary. Production Link ownership completed the G5 cutover and is Rust. The existence of `package.json`, `src/`, or `dist/` does **not** make Node the owner of the `herdr-mcp` runtime.
+The native `herdr-mcp` service/runtime is Rust (`crates/herdr-mcp`). The repository still intentionally contains JavaScript/TypeScript for the browser extension, Cloudflare Edge, documentation/site generation, compatibility paths, cross-language contract tests, and the retained `bin/herdr-extension-host` entrypoint. Production Link ownership completed the G5 cutover and is Rust. The existence of `package.json`, `src/`, or `dist/` does **not** make Node the owner of the `herdr-mcp` runtime.
 
 Choose validation by the component being changed. Do not substitute one lane for another:
 

@@ -39,6 +39,7 @@ import {
   prepareRelease,
   reloadServer,
   _setExecFileWrap,
+  RUST_NATIVE_UPDATE_COMMAND,
 } from "../bin/herdr-self-update";
 
 const SCRIPT = join(process.cwd(), "bin", "herdr-self-update");
@@ -72,6 +73,37 @@ function serverPlistFixture(overrides = {}) {
     },
     KeepAlive: true,
     RunAtLoad: true,
+  };
+}
+
+function rustServerPlistFixture(base) {
+  return {
+    Label: "dev.herdr-mcp.server",
+    ProgramArguments: [join(base, ".config", "herdr-mcp", "runtime", "current", "herdr-mcp"), "candidate"],
+    EnvironmentVariables: {
+      HERDR_MCP_SERVICE_IMPL: "rust-v1",
+      HERDR_MCP_PORT: "8772",
+      HERDR_MCP_TOKEN: TOKEN,
+    },
+    KeepAlive: true,
+    RunAtLoad: true,
+  };
+}
+
+// Legacy self-update only proceeds while the repository still ships the Node entry.
+async function seedLegacyNodeEntry(base) {
+  await mkdir(join(base, "repo", "dist"), { recursive: true });
+  await writeFile(join(base, "repo", "dist", "server.js"), "// legacy node server fixture\n");
+}
+
+function captureStdout() {
+  let captured = "";
+  const origWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (s) => { captured += s; return true; };
+  return {
+    restore() { process.stdout.write = origWrite; },
+    lastJson() { return JSON.parse(captured.trim().split(/\r?\n/).pop() || "{}"); },
+    text() { return captured; },
   };
 }
 
@@ -205,6 +237,7 @@ test("apply --dry-run writes nothing, touches no plists, and runs no launchctl/g
   const serverPath = join(base, "test", "server.plist");
   const linkPath = join(base, "test", "link.plist");
   await writeFile(serverPath, JSON.stringify(serverPlistFixture()));
+  await seedLegacyNodeEntry(base);
   await writeFile(linkPath, JSON.stringify(linkPlistFixture()));
   const beforeServer = await readFile(serverPath, "utf8");
   const beforeLink = await readFile(linkPath, "utf8");
@@ -234,6 +267,7 @@ test("real apply returns immediately with queued 0600 job, lock, and an absolute
   await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "0.3.26" }));
   await mkdir(join(base, "test"), { recursive: true });
   await writeFile(join(base, "test", "server.plist"), JSON.stringify(serverPlistFixture()));
+  await seedLegacyNodeEntry(base);
   await writeFile(join(base, "test", "link.plist"), JSON.stringify(linkPlistFixture()));
   const env = fakeEnv(base);
   const spawned = [];
@@ -278,6 +312,7 @@ test("apply fails closed while another self-update is in flight", async () => {
   await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "0.3.26" }));
   await mkdir(join(base, "test"), { recursive: true });
   await writeFile(join(base, "test", "server.plist"), JSON.stringify(serverPlistFixture()));
+  await seedLegacyNodeEntry(base);
   await writeFile(join(base, "test", "link.plist"), JSON.stringify(linkPlistFixture()));
   const env = fakeEnv(base);
   const paths = { lockPath: env.HERDR_SELF_UPDATE_LOCK_PATH };
@@ -302,6 +337,7 @@ test("stale lock (dead pid) is reaped and apply proceeds", async () => {
   await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "0.3.26" }));
   await mkdir(join(base, "test"), { recursive: true });
   await writeFile(join(base, "test", "server.plist"), JSON.stringify(serverPlistFixture()));
+  await seedLegacyNodeEntry(base);
   await writeFile(join(base, "test", "link.plist"), JSON.stringify(linkPlistFixture()));
   const env = fakeEnv(base);
   // pid 99999 is extremely unlikely to be alive -> stale
@@ -587,6 +623,8 @@ test("dispatch supports check/plan on a fixture repo without side effects", asyn
   await mkdir(join(base, "test"), { recursive: true });
   await writeFile(join(base, "test", "runtime-status.json"), JSON.stringify(fakeStatus("stable-0.3.26")));
   await writeFile(join(base, "test", "runtime-control.json"), JSON.stringify({ desired_active: "stable-0.3.26", revision: 1 }));
+  await writeFile(join(base, "test", "server.plist"), JSON.stringify(serverPlistFixture()));
+  await seedLegacyNodeEntry(base);
   const env = fakeEnv(base);
   let captured = "";
   const origWrite = process.stdout.write.bind(process.stdout);
@@ -646,6 +684,7 @@ test("apply mirrors a queued summary at the skill-visible path (no token, stage=
   await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "0.3.26" }));
   await mkdir(join(base, "test"), { recursive: true });
   await writeFile(join(base, "test", "server.plist"), JSON.stringify(serverPlistFixture()));
+  await seedLegacyNodeEntry(base);
   await writeFile(join(base, "test", "link.plist"), JSON.stringify(linkPlistFixture()));
   const env = fakeEnv(base);
   _setSpawnOverride((cmd, args, opts) => ({ pid: 4242, unref() {} }));
@@ -875,4 +914,122 @@ test("git-aware working-tree snapshot via the production prepareRelease path", a
   await assert.rejects(readFile(join(release, "docs", "_wip", "notes.md")));
   await assert.rejects(readFile(join(release, "site-dist", "index.html")));
   await assert.rejects(readFile(join(release, "node_modules", "pkg", "index.js")));
+});
+
+// --- #1024: retired Node updater must never retarget a Rust-owned service ------
+
+async function retiredFixture(prefix, serverPlist, { legacyEntry = true } = {}) {
+  const base = await mkdtemp(join(tmpdir(), prefix));
+  await mkdir(join(base, "repo"), { recursive: true });
+  await writeFile(join(base, "repo", "package.json"), JSON.stringify({ name: "herdr-mcp", version: "1.3.0" }));
+  await mkdir(join(base, "test"), { recursive: true });
+  const serverPath = join(base, "test", "server.plist");
+  if (serverPlist) await writeFile(serverPath, JSON.stringify(typeof serverPlist === "function" ? serverPlist(base) : serverPlist));
+  await writeFile(join(base, "test", "link.plist"), JSON.stringify(linkPlistFixture()));
+  if (legacyEntry) await seedLegacyNodeEntry(base);
+  return { base, env: fakeEnv(base), serverPath };
+}
+
+async function assertRefusedWithoutSideEffects(fx, expectedCode) {
+  const before = fx.serverPath && (await readFile(fx.serverPath, "utf8").catch(() => null));
+  for (const argv of [["check", "--source", "working-tree"], ["plan", "--source", "remote"], ["apply", "--source", "working-tree", "--dry-run"], ["apply", "--source", "working-tree"]]) {
+    const spawned = [];
+    _setSpawnOverride((cmd, args) => { spawned.push(args); return { pid: 4343, unref() {} }; });
+    const out = captureStdout();
+    try {
+      await dispatch(parseArgs(argv), fx.env);
+    } finally {
+      out.restore();
+      _setSpawnOverride(null);
+    }
+    const json = out.lastJson();
+    assert.equal(json.ok, false, argv.join(" "));
+    assert.equal(json.code, expectedCode, argv.join(" "));
+    assert.equal(json.use, RUST_NATIVE_UPDATE_COMMAND);
+    assert.match(json.message, /herdr-mcp update/);
+    assert.equal(json.plist_modified, false);
+    assert.equal(json.spawned, false);
+    assert.equal(out.text().includes(TOKEN), false);
+    assert.equal(process.exitCode, 2);
+    process.exitCode = 0;
+    assert.deepEqual(spawned, [], `${argv.join(" ")} must never spawn a worker`);
+  }
+  const cli = await runCli(["apply", "--source", "working-tree"], fx.env);
+  assert.equal(cli.code, 2);
+  assert.equal(cli.json.code, expectedCode);
+  assert.equal(cli.stdout.includes(TOKEN), false);
+  if (fx.serverPath) assert.equal(await readFile(fx.serverPath, "utf8").catch(() => null), before);
+  assert.deepEqual(await listFiles(join(fx.base, ".config")), [], "no job, lock, log, backup or summary may be written");
+}
+
+test("user is told to run herdr-mcp update | Given the server plist is owned by the Rust runtime and a stale dist/server.js exists | When check, plan or apply runs | Then it exits 2 without touching the plist or spawning anything", async () => {
+  const fx = await retiredFixture("su-rust-", rustServerPlistFixture);
+  await assertRefusedWithoutSideEffects(fx, "self_update_rust_runtime_owned");
+});
+
+test("user keeps a working Node-shaped service untouched | Given a Node server plist but no dist/server.js after the Node server retirement | When check, plan or apply runs | Then it refuses with self_update_node_entry_missing and changes nothing", async () => {
+  const fx = await retiredFixture("su-nodist-", serverPlistFixture(), { legacyEntry: false });
+  await assertRefusedWithoutSideEffects(fx, "self_update_node_entry_missing");
+});
+
+test("user gets a fail-closed refusal | Given the server plist is missing or not a Node dist/server.js job | When check, plan or apply runs | Then it refuses as self_update_target_unverified without side effects", async () => {
+  await assertRefusedWithoutSideEffects(await retiredFixture("su-noplist-", null), "self_update_target_unverified");
+  const other = { ...serverPlistFixture(), ProgramArguments: ["/usr/local/bin/python3", "/opt/server.py"] };
+  await assertRefusedWithoutSideEffects(await retiredFixture("su-other-", other), "self_update_target_unverified");
+});
+
+test("user still reads self-update status | Given the server plist is owned by the Rust runtime | When status runs | Then the read-only status is returned", async () => {
+  const fx = await retiredFixture("su-rust-status-", rustServerPlistFixture);
+  const r = await runCli(["status"], fx.env);
+  assert.equal(r.code, 0);
+  assert.equal(r.json.code, "runtime_status_not_ready");
+});
+
+test("user sees a refused job instead of a rewritten plist | Given a queued job whose service became Rust-owned before the worker started | When the worker runs | Then the job ends refused, the lock is released, and the plist and generations are untouched", async () => {
+  const fx = await retiredFixture("su-rust-worker-", rustServerPlistFixture);
+  const before = await readFile(fx.serverPath, "utf8");
+  const jobsDir = join(fx.env.HERDR_SELF_UPDATE_HOME, "self-update", "jobs");
+  await mkdir(jobsDir, { recursive: true });
+  const job = {
+    schema_version: 1,
+    job_id: "j-rust",
+    stage: "queued",
+    source: "working-tree",
+    ref: "main",
+    version: "1.3.0",
+    release: join(fx.base, "release"),
+    candidate_generation: "candidate-1.3.0-jrust",
+    stable_generation: "stable-1.3.0",
+    control_path: fx.env.HERDR_RUNTIME_CONTROL_PATH,
+    status_path: fx.env.HERDR_RUNTIME_STATUS_PATH,
+    server_plist: fx.serverPath,
+    link_plist: fx.env.HERDR_LINK_PLIST_PATH,
+    summary_status_path: join(fx.env.HERDR_SELF_UPDATE_HOME, "self-update-status.json"),
+  };
+  const jobPath = join(jobsDir, "j-rust.json");
+  await atomicWriteJson(jobPath, job);
+  await atomicWriteJson(fx.env.HERDR_SELF_UPDATE_LOCK_PATH, { job_id: "j-rust", pid: process.pid });
+  const execCalls = [];
+  _setExecFileWrap(async (cmd, args) => { execCalls.push([cmd, ...args]); return { code: 1, stdout: "", stderr: "" }; });
+  const out = captureStdout();
+  try {
+    await dispatch(parseArgs(["worker", "--job", "j-rust"]), fx.env);
+  } finally {
+    out.restore();
+    _setExecFileWrap(null);
+  }
+  assert.equal(out.lastJson().code, "self_update_rust_runtime_owned");
+  assert.equal(process.exitCode, 2);
+  process.exitCode = 0;
+  const after = JSON.parse(await readFile(jobPath, "utf8"));
+  assert.equal(after.stage, "failed");
+  assert.equal(after.outcome, "refused");
+  assert.match(after.error_message, /herdr-mcp update/);
+  assert.equal(after.rollback_steps, undefined);
+  assert.deepEqual(execCalls, [], "no plutil, launchctl or generation CLI calls");
+  await assert.rejects(readFile(fx.env.HERDR_SELF_UPDATE_LOCK_PATH));
+  assert.equal(await readFile(fx.serverPath, "utf8"), before);
+  await assert.rejects(stat(job.release));
+  const summary = JSON.parse(await readFile(job.summary_status_path, "utf8"));
+  assert.equal(summary.outcome, "refused");
 });
