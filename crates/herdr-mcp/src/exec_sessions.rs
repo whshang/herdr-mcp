@@ -28,6 +28,15 @@ const KILL_GRACE: Duration = Duration::from_millis(1500);
 const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 const RECOVERY_MAX_ENTRIES: usize = 64;
 const PANE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// #1010 1b: bounded backoff for transient persistence failures on the
+/// session-close path (SQLite busy/locked, momentary filesystem errors).
+/// Permanent errors still count once after the last attempt.
+const PERSIST_RETRY_ATTEMPTS: u32 = 3;
+const PERSIST_RETRY_BACKOFF_MS: u64 = 5;
+/// #1010 1b: `.tmp` spool files younger than this are in-flight atomic
+/// commits owned by another concurrent close; only a stale leftover from a
+/// crashed write is eligible for cleanup.
+const SPOOL_TMP_GRACE_MS: u64 = 60_000;
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// Stage at which a utility-pane exec start failed.
@@ -522,7 +531,18 @@ fn clean_expired_spools(state_dir: &Path, unexpired_session_ids: &HashSet<String
                     let _ = fs::remove_file(&path);
                 }
             } else if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
-                let _ = fs::remove_file(&path);
+                // #1010 1b: a young `.tmp` is an in-flight atomic commit by a
+                // concurrent session close; deleting it turns the writer's
+                // rename into an ENOENT persistence failure. Only stale
+                // leftovers past the grace window are removed.
+                let stale = fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_millis(SPOOL_TMP_GRACE_MS));
+                if stale {
+                    let _ = fs::remove_file(&path);
+                }
             }
         }
     }
@@ -1887,6 +1907,86 @@ fn process_group_for_session(pid: u32) -> Option<u32> {
     }
 }
 
+/// #1010 1b: a persistence failure string worth one bounded retry: SQLite
+/// lock contention or a transient filesystem error. Everything else (schema
+/// mismatches, permission denials, missing durable rows) is permanent.
+fn is_transient_persistence_error(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    lowered.contains("locked")
+        || lowered.contains("busy")
+        || lowered.contains("temporar")
+        || lowered.contains("interrupt")
+        || lowered.contains("would block")
+        || lowered.contains("resource temporarily unavailable")
+}
+
+/// #1010 1b: retry the durable settle for transient failures only. The state
+/// store mutex is taken per attempt and released between attempts, so one
+/// slow close never serializes the rest of the registry behind a retry sleep.
+fn settle_closed_evidence(
+    inner: &RegistryInner,
+    session: &Arc<Session>,
+    ended_at: u64,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+) -> Result<(), String> {
+    let mut attempt = 0u32;
+    loop {
+        let result = inner
+            .state_store
+            .lock()
+            .map_err(|_| "exec state store lock poisoned".to_owned())
+            .and_then(|store| {
+                store.settle_exec_session(
+                    &session.id,
+                    "closed",
+                    Some(ended_at),
+                    exit_code,
+                    signal,
+                    ended_at.saturating_add(SESSION_TTL_MS),
+                )
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt + 1 < PERSIST_RETRY_ATTEMPTS
+                    && is_transient_persistence_error(&error) =>
+            {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(
+                    PERSIST_RETRY_BACKOFF_MS * u64::from(attempt),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// #1010 1b: same bounded retry for the disk spool commit. Skipped entirely
+/// when the spool already exists, so a duplicated completion path never pays
+/// for a second identical write.
+fn persist_session_spool(state_dir: &Path, session: &Arc<Session>) -> Result<(), String> {
+    if exec_spool_path(state_dir, &session.id).exists() {
+        return Ok(());
+    }
+    let mut attempt = 0u32;
+    loop {
+        match write_session_spool(state_dir, session) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt + 1 < PERSIST_RETRY_ATTEMPTS
+                    && is_transient_persistence_error(&error) =>
+            {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(
+                    PERSIST_RETRY_BACKOFF_MS * u64::from(attempt),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn persist_closed_evidence(
     inner: &RegistryInner,
     session: &Arc<Session>,
@@ -1894,24 +1994,13 @@ fn persist_closed_evidence(
     exit_code: Option<i32>,
     signal: Option<&str>,
 ) {
-    let result = inner
-        .state_store
-        .lock()
-        .map_err(|_| "exec state store lock poisoned".to_owned())
-        .and_then(|store| {
-            store.settle_exec_session(
-                &session.id,
-                "closed",
-                Some(ended_at),
-                exit_code,
-                signal,
-                ended_at.saturating_add(SESSION_TTL_MS),
-            )
-        });
-    if result.is_err() {
+    // Runs outside `session.status`: callers mark the transition inside the
+    // lock, then persist here so the close path never holds a session mutex
+    // across SQLite or spool I/O.
+    if settle_closed_evidence(inner, session, ended_at, exit_code, signal).is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
-    if let Err(_error) = write_session_spool(&inner.state_dir, session) {
+    if persist_session_spool(&inner.state_dir, session).is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1922,23 +2011,28 @@ fn complete_session(
     exit_code: Option<i32>,
     signal: Option<&str>,
 ) -> bool {
-    let Ok(mut status) = session.status.lock() else {
-        return false;
+    let ended_at = {
+        let Ok(mut status) = session.status.lock() else {
+            return false;
+        };
+        if status.closed {
+            return false;
+        }
+        let ended_at = now_ms();
+        // #1010 1b: commit the transition inside the status lock but persist
+        // the durable evidence after releasing it — SQLite settle and the
+        // spool write never hold `session.status` across disk I/O.
+        status.closed = true;
+        status.exit_code = exit_code;
+        status.signal = signal.map(str::to_owned);
+        status.ended_at_ms = Some(ended_at);
+        ended_at
     };
-    if status.closed {
-        return false;
-    }
-    let ended_at = now_ms();
     if let Some(registry) = registry {
         persist_closed_evidence(registry, session, ended_at, exit_code, signal);
     }
-    status.closed = true;
-    status.exit_code = exit_code;
-    status.signal = signal.map(str::to_owned);
-    status.ended_at_ms = Some(ended_at);
     true
 }
-
 fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
     let entries = store.recoverable_exec_sessions(RECOVERY_MAX_ENTRIES)?;
     let now = now_ms();
@@ -3550,5 +3644,57 @@ mod tests {
 
         drop(restarted);
         let _ = fs::remove_dir_all(&path);
+    }
+
+    /// #1010 1b: 48 short sessions start and close concurrently on one
+    /// registry; every close must persist its spool exactly once with zero
+    /// persistence failures, and the session mutex must not stay held across
+    /// the SQLite settle or the spool write.
+    #[test]
+    fn concurrent_session_close_persists_each_spool_once_without_failures() {
+        let registry = registry();
+        const SESSIONS: usize = 48;
+        let ids: Vec<String> = (0..SESSIONS)
+            .map(|index| {
+                registry
+                    .start(Path::new("/tmp"), &format!("printf 'stress-{index}\\n'"))
+                    .unwrap()["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let views: Vec<Value> = thread::scope(|scope| {
+            let handles: Vec<_> = ids
+                .iter()
+                .map(|id| scope.spawn(|| wait_until_closed(&registry, id, "stdout", 65536)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for (index, view) in views.iter().enumerate() {
+            assert_eq!(view["exit_code"], 0, "session {index}");
+            assert_eq!(view["running"], false, "session {index}");
+            assert_eq!(view["phase"], "completed", "session {index}");
+        }
+        // Completion now publishes `running=false` before the durable settle
+        // and spool commit finish — that is the whole point of moving disk I/O
+        // out of the status lock — so wait for each spool to land rather than
+        // asserting in the same instant.
+        for id in &ids {
+            let spool = exec_spool_path(&registry.inner.state_dir, id);
+            let mut landed = false;
+            for _ in 0..500 {
+                if spool.exists() {
+                    landed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(landed, "missing spool for {id}");
+        }
+        assert_eq!(registry.diagnostics()["persistence_failures"], 0);
     }
 }
