@@ -336,6 +336,10 @@ impl SkillService {
     }
 }
 
+/// Rust-native upgrade entrypoint. The legacy Node `herdr-self-update` updater
+/// refuses to run once the Rust runtime owns the service (#1024).
+const SELF_UPDATE_COMMAND: &str = "herdr-mcp update";
+
 pub fn pointer() -> Value {
     let upstream = current_project_url();
     json!({
@@ -343,7 +347,7 @@ pub fn pointer() -> Value {
         "project_upstream": upstream.trim_start_matches("https://").trim_start_matches("http://"),
         "project_bundled": PROJECT_BUNDLED_SOURCE,
         "native_reference": NATIVE_LOCAL_SOURCE,
-        "self_update": "herdr-self-update",
+        "self_update": SELF_UPDATE_COMMAND,
         "hint": "Load remote-planner policy when the task needs detailed operating rules or Agent control. Use include_native_reference=false unless native Herdr CLI semantics are specifically needed. refresh=true rechecks project policy upstream.",
     })
 }
@@ -793,6 +797,8 @@ mod tests {
         assert_eq!(value["tool"], "herdr_skill");
         assert_eq!(value["project_bundled"], PROJECT_BUNDLED_SOURCE);
         assert_eq!(value["native_reference"], NATIVE_LOCAL_SOURCE);
+        assert_eq!(value["self_update"], "herdr-mcp update");
+        assert!(!value.to_string().contains("herdr-self-update"));
     }
 
     #[test]
