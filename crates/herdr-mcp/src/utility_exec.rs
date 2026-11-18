@@ -22,7 +22,6 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
-const UTILITY_OWNED_WAIT: Duration = Duration::from_secs(2);
 const UTILITY_OWNED_POLL: Duration = Duration::from_millis(100);
 const STALE_SCRIPT_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STRUCTURED_STEPS: usize = 16;
@@ -38,7 +37,8 @@ const EXEC_RECORD_TTL_MS: u64 = 60 * 60_000;
 const MAX_EXEC_REPLAY_JSON_BYTES: usize = 128 * 1024;
 /// Durable operations-ledger kind for `herdr_exec` idempotency.
 const EXEC_OPERATION_KIND: &str = "herdr_exec";
-static UTILITY_SUBMISSION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(unix)]
+static UTILITY_SUBMISSION_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static UTILITY_PANE_IDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -1043,6 +1043,22 @@ fn run_oneshot_readonly(
 }
 
 #[cfg(unix)]
+fn utility_submission_lock(workspace_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = UTILITY_SUBMISSION_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Holders and waiters both keep an Arc. Reclaim other idle buckets.
+    locks.retain(|id, lock| id == workspace_id || Arc::strong_count(lock) > 1);
+    Arc::clone(locks.entry(workspace_id.to_owned()).or_default())
+}
+
+#[cfg(unix)]
+fn utility_owned_wait_budget(timeout_ms: u64) -> Duration {
+    Duration::from_millis((timeout_ms / 2).clamp(2_000, 8_000))
+}
+
+#[cfg(unix)]
 fn run_unix_durable(
     client: &HerdrClient,
     snapshot: &Value,
@@ -1054,8 +1070,8 @@ fn run_unix_durable(
 ) -> Value {
     let (workspace_id, effective_root) = target;
     let started = Instant::now();
-    let submission_guard = UTILITY_SUBMISSION_LOCK
-        .get_or_init(|| Mutex::new(()))
+    let submission_lock = utility_submission_lock(workspace_id);
+    let submission_guard = submission_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (pane_id, created) =
@@ -1088,7 +1104,7 @@ fn run_unix_durable(
         workspace_id,
         &pane_id,
         command,
-        UTILITY_OWNED_WAIT,
+        utility_owned_wait_budget(timeout_ms),
     ) {
         return result;
     }
@@ -1105,6 +1121,7 @@ fn run_unix_durable(
     // Submission ownership has transferred to the durable session. The
     // synchronous wait below must not serialize unrelated later submissions.
     drop(submission_guard);
+    drop(submission_lock);
     let deadline = Duration::from_millis(timeout_ms);
     loop {
         let read = registry.read(session_id, "both", 0, 65_536);
@@ -1595,16 +1612,20 @@ fn wait_for_owned_utility_pane(
         if registry.running_pane_session_id(pane_id).is_none() && readiness.ready {
             return Ok(());
         }
-        if started.elapsed() >= wait_budget {
+        let remaining = wait_budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             break;
         }
-        let remaining = wait_budget.saturating_sub(started.elapsed());
         thread::sleep(UTILITY_OWNED_POLL.min(remaining));
+        let remaining = wait_budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
         let info = client
             .call_with_timeout(
                 "pane.process_info",
                 json!({"pane_id": pane_id}),
-                PRE_SEND_TIMEOUT,
+                PRE_SEND_TIMEOUT.min(remaining),
             )
             .map_err(|error| {
                 utility_pane_control_plane_error(workspace_id, command, error.message)
@@ -2242,6 +2263,139 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn owned_utility_wait_uses_half_the_timeout_with_a_floor_and_ceiling() {
+        for (timeout_ms, expected_ms) in [
+            (1, 2_000),
+            (4_000, 2_000),
+            (6_000, 3_000),
+            (15_000, 7_500),
+            (16_000, 8_000),
+            (30_000, 8_000),
+        ] {
+            assert_eq!(
+                utility_owned_wait_budget(timeout_ms),
+                Duration::from_millis(expected_ms),
+                "timeout_ms={timeout_ms}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_workspace_completes_while_first_workspace_waits_for_its_owner() {
+        use std::io::{BufRead, BufReader, ErrorKind};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::process::Command;
+
+        let base = native_test_dir();
+        let socket = base.join("herdr.sock");
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = HerdrClient::new(&socket);
+        let registry =
+            ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
+        let first = "utility-test-w1";
+        let second = "utility-test-w2";
+        let first_pane = "utility-test-w1:p1";
+        let second_pane = "utility-test-w2:p1";
+        let snapshot = json!({"panes": [
+            {"workspace_id": first, "pane_id": first_pane, "label": UTILITY_LABEL},
+            {"workspace_id": second, "pane_id": second_pane, "label": UTILITY_LABEL}
+        ]});
+
+        let receive = |method: &str, pane: &str| -> (UnixStream, Value) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "waiting for {method} on {pane}");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accepting {method} on {pane}: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], method);
+            assert_eq!(request["params"]["pane_id"], pane);
+            (stream, request)
+        };
+        let reply = |(mut stream, request): (UnixStream, Value), result: Value| {
+            writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
+        };
+        let process_info = |foreground_pid: u64| {
+            json!({"process_info": {
+                "shell_pid": 42,
+                "foreground_process_group_id": foreground_pid,
+                "foreground_processes": [{"pid": foreground_pid, "name": "sh"}]
+            }})
+        };
+        let execute = |request: &Value| {
+            let launch = request["params"]["text"].as_str().unwrap();
+            assert!(
+                Command::new("/bin/sh")
+                    .args(["-c", launch])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        let run = |workspace_id, command| {
+            run_unix_durable(
+                &client,
+                &snapshot,
+                &registry,
+                (workspace_id, &base),
+                command,
+                15_000,
+                &[],
+            )
+        };
+
+        thread::scope(|scope| {
+            let owner = scope.spawn(|| registry.start_in_existing_pane(&base, ":", first_pane));
+            let launch_rpc = receive("pane.send_text", first_pane);
+            let owner_launch = launch_rpc.1.clone();
+            reply(launch_rpc, json!({"ok": true}));
+            let owner = owner.join().unwrap().unwrap();
+
+            let waiting = scope.spawn(|| run(first, "printf first"));
+            reply(receive("pane.process_info", first_pane), process_info(77));
+            // Withhold the response to an owned-wait poll so the first
+            // workspace cannot release its submission lock yet.
+            let pending_poll = receive("pane.process_info", first_pane);
+
+            let independent = scope.spawn(|| run(second, "printf second"));
+            reply(receive("pane.process_info", second_pane), process_info(42));
+            let launch = receive("pane.send_text", second_pane);
+            execute(&launch.1);
+            reply(launch, json!({"ok": true}));
+            let result = independent.join().unwrap();
+            assert_eq!(result["output"], "second", "{result}");
+
+            execute(&owner_launch);
+            let owner = registry.read(owner["session_id"].as_str().unwrap(), "both", 0, 1);
+            assert_eq!(owner["phase"], "completed");
+            reply(pending_poll, process_info(42));
+            let launch = receive("pane.send_text", first_pane);
+            execute(&launch.1);
+            reply(launch, json!({"ok": true}));
+            let result = waiting.join().unwrap();
+            assert_eq!(result["output"], "first", "{result}");
+        });
+        drop(registry);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn herdr_owned_busy_utility_pane_waits_for_shell_before_send() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixListener;
@@ -2311,7 +2465,7 @@ mod tests {
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let server_methods = Arc::clone(&methods);
         let server = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Value = serde_json::from_str(
                     &BufReader::new(stream.try_clone().unwrap())
@@ -2370,12 +2524,13 @@ mod tests {
         assert_eq!(blocked["code"], "utility_pane_not_ready");
         assert_eq!(blocked["delivery_state"], "not_delivered");
         assert_eq!(blocked["owner_session_id"], owner);
+        assert!(blocked["waited_ms"].as_u64().unwrap() >= 60);
 
         assert_eq!(registry.kill(&owner)["ok"], true);
         server.join().unwrap();
         assert_eq!(
             *methods.lock().unwrap(),
-            vec!["pane.send_text", "pane.process_info", "pane.send_keys"],
+            vec!["pane.send_text", "pane.send_keys"],
         );
         drop(registry);
         let _ = fs::remove_dir_all(base);
