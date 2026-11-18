@@ -3,6 +3,9 @@
 // Two capabilities:
 //  - createCoalescedScheduler: throttle high-frequency MutationObserver-driven
 //    callbacks to at most one run per minIntervalMs (default 400ms).
+//  - createSuspendableInterval: a fixed-period interval that clears itself when
+//    a tick finds nothing to keep it alive (e.g. an idle hidden tab) and is
+//    re-armed by an explicit wake signal instead of polling.
 //  - createUiPressureMeter / classifyUiPressure: bounded, fixed-window rolling
 //    aggregation of UI pressure signals (mutation callback rate, sampling/tick
 //    rate, timer drift). Only per-window counters are kept — never a timeline.
@@ -753,6 +756,55 @@
     };
   }
 
+  // Each tick asks keepActive() first; a false answer clears the timer instead
+  // of running the tick, so a suspended interval causes zero wake-ups until
+  // rearm(). rearm() is idempotent and never runs the tick synchronously: the
+  // next tick lands within one period, the same bound as an always-on timer.
+  function createSuspendableInterval(run, {
+    intervalMs,
+    keepActive = () => true,
+    onResume = () => {},
+    setTimer = (fn, delay) => setInterval(fn, delay),
+    clearTimer = (id) => clearInterval(id),
+  } = {}) {
+    if (typeof run !== "function") throw new TypeError("run must be a function");
+    const period = Math.max(1, Number(intervalMs) || 0);
+    let timer = null;
+    let started = false;
+    const suspend = () => {
+      if (timer !== null) clearTimer(timer);
+      timer = null;
+    };
+    const tick = () => {
+      if (!keepActive()) {
+        suspend();
+        return;
+      }
+      run();
+    };
+    const arm = () => {
+      if (timer !== null) return false;
+      timer = setTimer(tick, period);
+      return true;
+    };
+    return {
+      start() {
+        started = true;
+        return arm();
+      },
+      rearm() {
+        if (!started || timer !== null) return false;
+        onResume();
+        return arm();
+      },
+      stop() {
+        started = false;
+        suspend();
+      },
+      active() { return timer !== null; },
+    };
+  }
+
   global.H2W_BROWSER_PERFORMANCE = Object.freeze({
     DEFAULT_MUTATION_COALESCE_MS,
     DEFAULT_PERMISSION_COALESCE_MS,
@@ -765,6 +817,7 @@
     DEFAULT_UI_PRESSURE_POLICY,
     DEFAULT_PAGE_HEALTH_POLICY,
     createCoalescedScheduler,
+    createSuspendableInterval,
     mutationRecordsAreIgnoredChurn,
     mutationTouchesConversationTurns,
     sampleBoundedMessageText,

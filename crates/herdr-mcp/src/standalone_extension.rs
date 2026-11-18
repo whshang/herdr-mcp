@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const REPOSITORY: &str = "whshang/herdr-mcp";
@@ -19,6 +19,11 @@ const RAW_HOST: &str = "raw.githubusercontent.com";
 const MAX_FILES: usize = 512;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// GitHub connect and total-request bounds for the blocking client (#1048):
+/// a half-open TCP connect or a stalled response body must not wedge the
+/// install or updater staging paths on reqwest's unbounded defaults.
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneInstallOptions {
@@ -1730,9 +1735,18 @@ fn resolve_ref(client: &Client, reference: &str) -> Result<String, String> {
 }
 
 fn client() -> Result<Client, String> {
+    client_with_timeouts(GITHUB_CONNECT_TIMEOUT, GITHUB_REQUEST_TIMEOUT)
+}
+
+fn client_with_timeouts(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<Client, String> {
     Client::builder()
         .user_agent(concat!("herdr-mcp/", env!("CARGO_PKG_VERSION")))
         .redirect(Policy::limited(3))
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
         .build()
         .map_err(|e| format!("cannot create GitHub client: {e}"))
 }
@@ -2438,6 +2452,50 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    /// user gets a bounded error instead of a hang | Given a server that
+    /// accepts the request but never writes a response byte | When the
+    /// extension GitHub client calls it | Then the request fails inside the
+    /// configured total-timeout bound.
+    #[test]
+    fn github_client_aborts_a_stalled_response_inside_the_request_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Read;
+                let mut buf = [0u8; 1024];
+                // Consume the request, then hold the connection open without
+                // a single response byte — the half-open case from #1048.
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let client =
+            super::client_with_timeouts(Duration::from_millis(100), Duration::from_millis(500))
+                .unwrap();
+        let url = format!("http://{addr}/x");
+        let started = std::time::Instant::now();
+        let error = client.get(&url).send().unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.is_timeout(), "expected a timeout error, got {error}");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "stalled response must abort near the 500ms bound, took {elapsed:?}"
+        );
+    }
+
+    /// user sees every GitHub request bounded | Given the production client
+    /// factory | When it builds | Then connect and total timeouts are the
+    /// documented #1048 bounds, not reqwest's unbounded defaults.
+    #[test]
+    fn github_client_uses_documented_timeout_bounds() {
+        assert_eq!(super::GITHUB_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(super::GITHUB_REQUEST_TIMEOUT, Duration::from_secs(60));
+        assert!(super::client().is_ok());
+    }
+
     /// user answers at most one prompt | Given a staged extension whose Chrome
     /// alias lives outside the managed tree | When the broker preflight for this
     /// upgrade is still pending | Then staging records readiness as false without

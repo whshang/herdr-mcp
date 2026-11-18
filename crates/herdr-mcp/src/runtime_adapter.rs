@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const HERDR_CORE_PROTOCOL_GENERATION: u32 = 1;
 pub const RUNTIME_BACKEND_ENV: &str = "HERDR_MCP_RUNTIME_BACKEND";
@@ -1970,6 +1971,8 @@ pub struct AdmittedBackendConfig {
     config_file: PathBuf,
     instance: crate::instance::InstanceId,
     env: EnvOverrides,
+    /// Shared by every clone so all request paths reuse one parse (#1038).
+    selection_cache: Arc<AdmittedSelectionCache>,
 }
 
 impl AdmittedBackendConfig {
@@ -1978,6 +1981,7 @@ impl AdmittedBackendConfig {
             config_file: paths.config_file.clone(),
             instance: paths.instance.clone(),
             env: EnvOverrides::from_process()?,
+            selection_cache: Arc::default(),
         })
     }
 
@@ -1993,8 +1997,159 @@ impl AdmittedBackendConfig {
             config_file,
             instance,
             env,
+            selection_cache: Arc::default(),
         }
     }
+
+    /// The selection the pinned config file resolves to now.
+    ///
+    /// Re-parses only when the config source's metadata stamp changed since the
+    /// last successful parse (#1038); see [`config_source_stamp`] for when a
+    /// source is never served from the cache.
+    fn current_selection(&self) -> Result<RuntimeBackendSelection, String> {
+        let stamp = config_source_stamp(&self.config_file, SystemTime::now());
+        if let Some(selection) = stamp
+            .as_ref()
+            .and_then(|stamp| self.selection_cache.lookup(stamp))
+        {
+            return Ok(selection);
+        }
+        #[cfg(test)]
+        self.selection_cache.parses.fetch_add(1, Ordering::Relaxed);
+        // The stamp is taken before the read: a write racing this parse leaves
+        // a newer stamp on disk, so the next check re-parses instead of
+        // trusting a selection stored under the older stamp.
+        let resolved =
+            resolve_backend_selection_from_path(&self.config_file, &self.instance, &self.env);
+        match (&resolved, stamp) {
+            (Ok(selection), Some(stamp)) => self.selection_cache.store(stamp, selection.clone()),
+            _ => self.selection_cache.clear(),
+        }
+        resolved
+    }
+
+    #[cfg(test)]
+    pub(crate) fn config_parse_count(&self) -> u64 {
+        self.selection_cache.parses.load(Ordering::Relaxed)
+    }
+}
+
+/// A file modified this recently is never served from the selection cache: a
+/// second same-length write inside one filesystem timestamp tick would leave
+/// its `(modified, len)` stamp unchanged.
+const ADMITTED_CONFIG_RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Process-local parse cache behind [`verify_admitted_backend_config`] (#1038).
+#[derive(Debug, Default)]
+struct AdmittedSelectionCache {
+    entry: Mutex<Option<(ConfigSourceStamp, RuntimeBackendSelection)>>,
+    #[cfg(test)]
+    parses: AtomicU64,
+}
+
+impl AdmittedSelectionCache {
+    fn lookup(&self, stamp: &ConfigSourceStamp) -> Option<RuntimeBackendSelection> {
+        let entry = self.entry.lock().ok()?;
+        entry
+            .as_ref()
+            .filter(|(cached, _)| cached == stamp)
+            .map(|(_, selection)| selection.clone())
+    }
+
+    fn store(&self, stamp: ConfigSourceStamp, selection: RuntimeBackendSelection) {
+        if let Ok(mut entry) = self.entry.lock() {
+            *entry = Some((stamp, selection));
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut entry) = self.entry.lock() {
+            *entry = None;
+        }
+    }
+}
+
+/// Which file [`Config::read_only_for_instance`] would parse, and its stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigSourceStamp {
+    Json(ConfigFileStamp),
+    Legacy(ConfigFileStamp),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFileStamp {
+    modified: SystemTime,
+    len: u64,
+    /// File identity and inode change time: an atomic rename-replace or a
+    /// permission change moves these even when `(modified, len)` is unchanged.
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+enum ConfigFileState {
+    Present(ConfigFileStamp),
+    Missing,
+    Uncacheable,
+}
+
+/// The metadata stamp of the config source, or `None` when the source must be
+/// read on every check: an absent config (its broken-symlink and ancestor
+/// checks need the full read path, and there is nothing to parse), a metadata
+/// error, a non-regular file, or a file modified within
+/// [`ADMITTED_CONFIG_RACY_WINDOW`].
+fn config_source_stamp(config_file: &Path, now: SystemTime) -> Option<ConfigSourceStamp> {
+    match config_file_state(config_file, now) {
+        ConfigFileState::Present(stamp) => Some(ConfigSourceStamp::Json(stamp)),
+        ConfigFileState::Uncacheable => None,
+        ConfigFileState::Missing => {
+            match config_file_state(&config_file.with_file_name("config.toml"), now) {
+                ConfigFileState::Present(stamp) => Some(ConfigSourceStamp::Legacy(stamp)),
+                ConfigFileState::Missing | ConfigFileState::Uncacheable => None,
+            }
+        }
+    }
+}
+
+fn config_file_state(path: &Path, now: SystemTime) -> ConfigFileState {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symlink is not "missing": the read path refuses it.
+            return match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ConfigFileState::Missing
+                }
+                _ => ConfigFileState::Uncacheable,
+            };
+        }
+        Err(_) => return ConfigFileState::Uncacheable,
+    };
+    if !metadata.is_file() {
+        return ConfigFileState::Uncacheable;
+    }
+    let Ok(modified) = metadata.modified() else {
+        return ConfigFileState::Uncacheable;
+    };
+    match now.duration_since(modified) {
+        Ok(age) if age >= ADMITTED_CONFIG_RACY_WINDOW => {}
+        _ => return ConfigFileState::Uncacheable,
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    ConfigFileState::Present(ConfigFileStamp {
+        modified,
+        len: metadata.len(),
+        #[cfg(unix)]
+        identity,
+    })
 }
 
 /// The same comparison as [`verify_admitted_backend`], read through the pinned
@@ -2009,8 +2164,7 @@ pub fn verify_admitted_backend_config(
     admitted: &RuntimeBackendSelection,
     config: &AdmittedBackendConfig,
 ) -> Result<RuntimeBackendSelection, String> {
-    let selection =
-        resolve_backend_selection_from_path(&config.config_file, &config.instance, &config.env)?;
+    let selection = config.current_selection()?;
     admission_drift(admitted, &selection)?;
     Ok(selection)
 }
@@ -3346,6 +3500,162 @@ fn map_hc_io_error(error: std::io::Error, socket_path: &Path) -> HerdrCoreError 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admitted_cache_fixture(name: &str) -> (PathBuf, AdmittedBackendConfig) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-admitted-cache-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_file = root.join("config.json");
+        let config = AdmittedBackendConfig::from_parts(
+            config_file,
+            crate::instance::InstanceId::default_instance(),
+            EnvOverrides::default(),
+        );
+        (root, config)
+    }
+
+    fn write_config_aged(path: &Path, content: &str, age: Duration) {
+        std::fs::write(path, content).unwrap();
+        set_config_age(path, age);
+    }
+
+    fn set_config_age(path: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    const CORE_CONFIG: &str =
+        r#"{"runtime":{"backend":"herdr-core","herdr_core_socket":"/isolated/core.sock"}}"#;
+
+    /// A `tui` config padded to exactly `CORE_CONFIG`'s length.
+    fn tui_config() -> String {
+        format!(
+            "{:<width$}",
+            r#"{"runtime":{"backend":"tui"}}"#,
+            width = CORE_CONFIG.len()
+        )
+    }
+
+    fn tui_admission() -> RuntimeBackendSelection {
+        resolve_backend_selection_with_env(None, false, &EnvOverrides::default()).unwrap()
+    }
+
+    /// #1038: a steady config is parsed once; a changed mtime or an atomic
+    /// same-length replace is re-parsed, and the #936 drift refusal still fires.
+    #[test]
+    fn admitted_config_check_reparses_only_when_the_config_stamp_changes() {
+        let tui_config = tui_config();
+        assert_eq!(tui_config.len(), CORE_CONFIG.len());
+        let (root, config) = admitted_cache_fixture("stamp");
+        let path = root.join("config.json");
+        let admitted = tui_admission();
+        write_config_aged(&path, &tui_config, Duration::from_secs(120));
+
+        for _ in 0..3 {
+            assert_eq!(
+                verify_admitted_backend_config(&admitted, &config).unwrap(),
+                admitted
+            );
+        }
+        assert_eq!(config.config_parse_count(), 1, "steady config re-parsed");
+        let shared = config.clone();
+        verify_admitted_backend_config(&admitted, &shared).unwrap();
+        assert_eq!(shared.config_parse_count(), 1, "clones share one cache");
+
+        // Same length, different (still old) mtime: re-parsed, drift refused.
+        write_config_aged(&path, CORE_CONFIG, Duration::from_secs(90));
+        let error = verify_admitted_backend_config(&admitted, &config).unwrap_err();
+        assert!(
+            error.contains("runtime backend selection changed"),
+            "{error}"
+        );
+        assert_eq!(config.config_parse_count(), 2);
+        verify_admitted_backend_config(&admitted, &config).unwrap_err();
+        assert_eq!(config.config_parse_count(), 2, "drifted config re-parsed");
+
+        // Atomic rename-replace with the same length and mtime: a new file
+        // identity, so the replacement is parsed rather than served stale.
+        let staged = root.join("config.json.next");
+        write_config_aged(&staged, &tui_config, Duration::from_secs(90));
+        let previous_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(previous_modified)
+            .unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        assert_eq!(
+            verify_admitted_backend_config(&admitted, &config).unwrap(),
+            admitted
+        );
+        assert_eq!(config.config_parse_count(), 3);
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        assert_eq!(config.config_parse_count(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1038: sources whose stamp cannot prove "unchanged" are read on every
+    /// check — a just-written file, a failed parse, and an absent config.
+    #[test]
+    fn admitted_config_check_rereads_recent_invalid_and_absent_sources() {
+        let (root, config) = admitted_cache_fixture("uncached");
+        let path = root.join("config.json");
+        let admitted = tui_admission();
+
+        std::fs::write(&path, tui_config()).unwrap();
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        assert_eq!(config.config_parse_count(), 2, "recent write was cached");
+
+        write_config_aged(&path, "{not json", Duration::from_secs(120));
+        assert!(
+            verify_admitted_backend_config(&admitted, &config)
+                .unwrap_err()
+                .contains("invalid config")
+        );
+        verify_admitted_backend_config(&admitted, &config).unwrap_err();
+        assert_eq!(config.config_parse_count(), 4, "a failed parse was cached");
+
+        std::fs::remove_file(&path).unwrap();
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        assert_eq!(config.config_parse_count(), 6, "absent config was cached");
+
+        // A dangling symlink is not "absent": it still fails closed.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("missing-target.json"), &path).unwrap();
+            verify_admitted_backend_config(&admitted, &config).unwrap_err();
+            verify_admitted_backend_config(&admitted, &config).unwrap_err();
+        }
+
+        // A legacy TOML source is stamped and cached like the JSON one.
+        let _ = std::fs::remove_file(&path);
+        write_config_aged(
+            &root.join("config.toml"),
+            "# legacy config\n",
+            Duration::from_secs(120),
+        );
+        let before = config.config_parse_count();
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        assert_eq!(config.config_parse_count(), before + 1);
+        set_config_age(&root.join("config.toml"), Duration::from_secs(60));
+        verify_admitted_backend_config(&admitted, &config).unwrap();
+        assert_eq!(config.config_parse_count(), before + 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[cfg(unix)]
     #[test]

@@ -1,7 +1,19 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+const RUST_WORKFLOWS = new Set([
+  ".github/workflows/rust-release.yml",
+  ".github/workflows/rust-release-recover.yml",
+  ".github/workflows/windows-candidate.yml",
+]);
+
+const ROOT_BUILT_DIST_IMPORT = /["']\.\.\/dist\//;
 
 const DOC_TESTS = new Set([
   "tests/agent-install-doc.test.mjs",
@@ -47,12 +59,35 @@ function isEdgePath(path) {
   return path.startsWith("edge/cloudflare/") || EDGE_TESTS.has(path);
 }
 
+function isRustPath(path) {
+  return (
+    path.startsWith("crates/") ||
+    path.startsWith(".cargo/") ||
+    path === "Cargo.toml" ||
+    path === "Cargo.lock" ||
+    path === "rust-toolchain.toml" ||
+    RUST_WORKFLOWS.has(path)
+  );
+}
+
+// Root tests that import the legacy root `dist/*.js` only exercise `src/*.ts`;
+// every other root test (including cross-language assertions on Rust sources)
+// runs without the root `tsc` build.
+export function listRootTestsWithoutBuiltDist(root = ROOT) {
+  return readdirSync(join(root, "tests"))
+    .filter((name) => name.endsWith(".test.mjs"))
+    .sort()
+    .map((name) => "tests/" + name)
+    .filter((rel) => !ROOT_BUILT_DIST_IMPORT.test(readFileSync(join(root, rel), "utf8")));
+}
+
 export function classifyChangedFiles(files) {
   const changed = [...new Set(files.filter(Boolean))];
   if (changed.length === 0) return "full";
   if (changed.every(isDocPath)) return "docs";
   if (changed.every(isExtensionPath)) return "extension";
   if (changed.every(isEdgePath)) return "edge";
+  if (changed.every(isRustPath)) return "rust";
   return "full";
 }
 
@@ -77,6 +112,11 @@ function resolveBase(requestedBase) {
 }
 
 function main() {
+  if (process.argv[2] === "--list-rust-node-tests") {
+    process.stdout.write(listRootTestsWithoutBuiltDist().join("\n") + "\n");
+    return;
+  }
+
   const eventName = process.env.CI_EVENT_NAME || "";
   if (eventName !== "pull_request") {
     process.stdout.write("mode=full\n");
