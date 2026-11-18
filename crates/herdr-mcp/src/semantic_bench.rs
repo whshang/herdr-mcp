@@ -476,7 +476,7 @@ fn live_route_bench_records_raw_samples() {
 
     let (config_path, semantic) =
         load_semantic_config().expect("config.json with semantic routes is required");
-    let routes = bench_routes(&semantic.routes, filter.as_deref(), &config_path);
+    let routes = bench_routes(&semantic.semantic.routes, filter.as_deref(), &config_path);
     assert!(
         !routes.is_empty(),
         "no usable semantic route: check config.json permissions (routes need a secret-readable file) and {ENV_ROUTES}"
