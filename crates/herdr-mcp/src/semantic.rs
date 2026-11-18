@@ -31,8 +31,8 @@ const CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHAT_POOL_BUDGET: Duration = Duration::from_secs(12);
 /// Background callers (summaries, digests, memory compaction) are not latency
 /// sensitive, so they get a far larger allowance than interactive calls.
-const BACKGROUND_CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
-const BACKGROUND_CHAT_POOL_BUDGET: Duration = Duration::from_secs(120);
+const BACKGROUND_CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKGROUND_CHAT_POOL_BUDGET: Duration = Duration::from_secs(30);
 /// Rolling one-hour cap on background chat calls so an automation loop cannot
 /// drain provider quota that interactive callers depend on.
 const BACKGROUND_CHAT_HOURLY_CAP: usize = 120;
@@ -1184,13 +1184,20 @@ fn clear_route_cooldowns() {
     }
 }
 
-/// Time left on a route's cooldown, for tests that must prove a cooldown was
-/// not shortened by a later failure.
-#[cfg(test)]
+/// Time left on a route's cooldown, for `capability_json` and for tests that
+/// must prove a cooldown was not shortened by a later failure.
 fn route_cooldown_remaining(id: &str) -> Option<Duration> {
     let health = route_health().lock().ok()?;
     let until = health.get(id)?.cooldown_until?;
     until.checked_duration_since(Instant::now())
+}
+
+/// Milliseconds left on a route's active cooldown, for `capability_json`;
+/// a missing or elapsed deadline reports 0.
+fn route_cooldown_remaining_ms(id: &str) -> u64 {
+    route_cooldown_remaining(id)
+        .map(|remaining| remaining.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Timeout allowance for one route pool run: `attempt` caps a single route call,
@@ -1529,7 +1536,7 @@ impl SemanticService {
         )
     }
 
-    /// Background-tier chat: 60s per route attempt, 120s total, separate
+    /// Background-tier chat: 10s per route attempt, 30s total, separate
     /// cooldown state, and subject to the hourly background call cap.
     // Entry point for background callers (summaries, digests, compaction);
     // the extension surface reaches the same path via `"tier": "background"`.
@@ -1692,7 +1699,7 @@ impl SemanticService {
                 route_detail_json(provider.id(), provider.protocol(), provider.model())
             }).collect::<Vec<_>>(),
             "chat_routes": self.chat_providers.iter().map(|provider| {
-                route_detail_json(provider.id(), provider.protocol(), provider.model())
+                chat_route_detail_json(provider.id(), provider.protocol(), provider.model())
             }).collect::<Vec<_>>(),
             "provider_state": if !configured {
                 "not_configured"
@@ -1737,7 +1744,21 @@ fn route_detail_json(name: &str, protocol: &str, model: &str) -> Value {
         "model": model,
         "pinned": pinned,
         "consecutive_failures": current_route_failure_streak(name),
+        "cooldown_remaining_ms": route_cooldown_remaining_ms(name),
     })
+}
+
+/// Chat routes additionally carry the background-tier pool state: background
+/// callers record failures under the `background:` scope key, which the shared
+/// foreground-only streak would never show.
+fn chat_route_detail_json(name: &str, protocol: &str, model: &str) -> Value {
+    let mut detail = route_detail_json(name, protocol, model);
+    let background_key = format!("{}{}", SemanticTier::Background.cooldown_scope(), name);
+    detail["background_consecutive_failures"] =
+        json!(current_route_failure_streak(&background_key));
+    detail["background_cooldown_remaining_ms"] =
+        json!(route_cooldown_remaining_ms(&background_key));
+    detail
 }
 
 pub fn extension_status_json() -> Value {
@@ -3686,13 +3707,13 @@ mod tests {
         assert_eq!(foreground.cooldown_scope, "");
 
         let background = SemanticTier::Background.chat_budget(Duration::from_secs(600));
-        assert_eq!(background.attempt, Duration::from_secs(60));
-        assert_eq!(background.total, Duration::from_secs(120));
+        assert_eq!(background.attempt, Duration::from_secs(10));
+        assert_eq!(background.total, Duration::from_secs(30));
         assert_eq!(background.cooldown_scope, "background:");
 
-        let capped = SemanticTier::Background.chat_budget(Duration::from_secs(30));
-        assert_eq!(capped.attempt, Duration::from_secs(30));
-        assert_eq!(capped.total, Duration::from_secs(30));
+        let capped = SemanticTier::Background.chat_budget(Duration::from_secs(20));
+        assert_eq!(capped.attempt, Duration::from_secs(10));
+        assert_eq!(capped.total, Duration::from_secs(20));
     }
 
     #[test]
@@ -3732,6 +3753,37 @@ mod tests {
         );
         assert!(route_is_cooling_down("background:tier-route"));
         assert!(!route_is_cooling_down("tier-route"));
+
+        clear_route_pool_state();
+    }
+
+    /// user operator | Given a chat route failing only under the background
+    /// tier | When `capability_json` reports that route | Then the
+    /// background-scoped streak and cooldown are visible while the shared
+    /// foreground fields stay zero.
+    #[test]
+    fn chat_route_detail_reports_background_scoped_pool_health() {
+        let _guard = crate::test_env::lock();
+        clear_route_pool_state();
+
+        let background = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200))
+            .scoped(SemanticTier::Background.cooldown_scope());
+        let _ = execute_route_pool(
+            1,
+            background,
+            |_| "tier-route".to_owned(),
+            |_, _| Err::<usize, _>(SemanticError::new("timeout")),
+        );
+
+        let detail = chat_route_detail_json("tier-route", "openai", "model-1");
+        assert_eq!(detail["consecutive_failures"], 0);
+        assert_eq!(detail["background_consecutive_failures"], 1);
+        assert_eq!(detail["cooldown_remaining_ms"], 0);
+        assert!(detail["background_cooldown_remaining_ms"].as_u64().unwrap() > 0);
+
+        // The foreground-scope detail helper stays unaware of the tier split.
+        let plain = route_detail_json("tier-route", "openai", "model-1");
+        assert_eq!(plain["consecutive_failures"], 0);
 
         clear_route_pool_state();
     }
