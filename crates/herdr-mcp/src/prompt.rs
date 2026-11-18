@@ -1230,13 +1230,19 @@ impl PromptRegistry {
     /// `agent.task.status` with `{"target": "..."}` alone: answer "which task is
     /// holding this pane" without pulling a whole inbox page. The active task
     /// on the target wins; otherwise the most recent task summary for it.
-    pub fn task_status_by_target(&self, target: &str) -> Value {
+    /// A caller-scoped parent session only ever sees its own tasks.
+    pub fn task_status_by_target(&self, target: &str, parent_session_ref: Option<&str>) -> Value {
         let now = self.now_ms();
         match self.list_active_tasks() {
             Ok(tasks) => {
                 if let Some(task) = tasks
                     .iter()
-                    .filter(|task| task_matches_target(task, target, None))
+                    .filter(|task| {
+                        task_matches_target(task, target, None)
+                            && parent_session_ref.is_none_or(|parent_session_ref| {
+                                task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                            })
+                    })
                     .max_by_key(|task| task.updated_at_ms)
                 {
                     return json!({
@@ -1255,7 +1261,12 @@ impl PromptRegistry {
         match self.list_terminal_tasks() {
             Ok(tasks) => match tasks
                 .iter()
-                .filter(|task| task_matches_target(task, target, None))
+                .filter(|task| {
+                    task_matches_target(task, target, None)
+                        && parent_session_ref.is_none_or(|parent_session_ref| {
+                            task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                        })
+                })
                 .max_by_key(|task| task.updated_at_ms)
             {
                 Some(task) => json!({
@@ -4392,7 +4403,7 @@ pub fn task_call_with_parent_session(
                 if target.is_empty() || target.len() > 256 {
                     return invalid("target must be a non-empty string up to 256 bytes");
                 }
-                return registry.task_status_by_target(target);
+                return registry.task_status_by_target(target, caller_parent_session_ref);
             }
             let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
                 return invalid("task_id is required");
@@ -12548,6 +12559,74 @@ mod tests {
         );
         assert_eq!(status["ok"], false);
         assert_eq!(status["code"], "agent_task_not_found");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user orchestrator | Given a parent-scoped caller and tasks on the same
+    /// target owned by a different parent session | When agent.task.status is
+    /// queried with `target` alone | Then foreign-parent tasks stay invisible
+    /// and only the caller's own task is returned.
+    #[test]
+    fn task_status_by_target_scopes_to_caller_parent_session() {
+        let (db_path, registry) = task_registry("status-by-target-scope");
+        for (task_id, lifecycle, age_ms) in [
+            (
+                "dispatch:prompt:foreign-active",
+                PromptTaskLifecycle::Running,
+                100,
+            ),
+            (
+                "dispatch:prompt:foreign-terminal",
+                PromptTaskLifecycle::Completed,
+                50,
+            ),
+        ] {
+            let mut task = escalation_task(task_id, "w9:p9", lifecycle, age_ms);
+            task.pane_id = Some("w9:p9".to_owned());
+            task.parent_session_ref = Some("session:foreign".to_owned());
+            registry.save_task(&task, None).unwrap();
+        }
+
+        // A parent-scoped caller must not see another session's tasks here.
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            Some("session:caller"),
+        );
+        assert_eq!(status["ok"], false, "{status}");
+        assert_eq!(status["code"], "agent_task_not_found");
+
+        // The caller's own task on the same pane is still returned.
+        let mut own = escalation_task(
+            "dispatch:prompt:own",
+            "w9:p9",
+            PromptTaskLifecycle::Completed,
+            10,
+        );
+        own.pane_id = Some("w9:p9".to_owned());
+        own.parent_session_ref = Some("session:caller".to_owned());
+        registry.save_task(&own, None).unwrap();
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            Some("session:caller"),
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["task_id"], own.task_id);
+
+        // Unscoped callers keep the existing cross-session view.
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            None,
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["task_id"], "dispatch:prompt:foreign-active");
 
         drop(registry);
         remove_task_db(&db_path);
