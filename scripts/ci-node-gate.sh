@@ -41,10 +41,13 @@ case "${MODE}" in
     ;;
   rust)
     # Rust behavior is owned by `release-gate.sh rust` in the rust job. This
-    # lane keeps the Node/Edge contract tests that read Rust-owned files and
-    # skips only the root tsc build and the legacy tests that import root dist
-    # (they cover the legacy `src/*.ts` Node code, not Rust).
+    # lane keeps the Node/Edge contract tests that read Rust-owned files. The
+    # cross-language contracts among them are documented to run after a root
+    # build, so `npm run build` stays here; only the legacy tests that import
+    # root dist (they cover `src/*.ts` Node code, not Rust) are left out of the
+    # selected list.
     npm ci
+    npm run build
     rust_node_tests=()
     while IFS= read -r rust_node_test; do
       [ -n "${rust_node_test}" ] && rust_node_tests+=("${rust_node_test}")

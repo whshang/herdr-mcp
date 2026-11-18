@@ -622,10 +622,16 @@ test("user gets narrow extension and Edge CI without the legacy root build | Giv
   }
 });
 
-test("user gets Rust-only CI that still runs Rust-reading Node and Edge contracts | Given the selective Node gate | When the rust mode runs | Then it skips the root build but runs the non-dist root tests and the Edge suite", async () => {
+test("user gets Rust-only CI that still runs Rust-reading Node and Edge contracts | Given the selective Node gate | When the rust mode runs | Then it builds the root tree before the cross-language Node tests and then runs the Edge suite", async () => {
   const gate = await readFile(join(ROOT, "scripts/ci-node-gate.sh"), "utf8");
   const rust = ciNodeGateBranch(gate, "rust");
-  assert.doesNotMatch(rust, /npm run build\b(?!:)/);
+  const rootBuild = rust.indexOf("npm run build");
+  const nodeTests = rust.indexOf('node --test "${rust_node_tests[@]}"');
+  assert.ok(rootBuild >= 0, "rust mode must build the root tree for cross-language contracts");
+  assert.ok(
+    rootBuild < nodeTests,
+    "the root build must run before the cross-language Node tests",
+  );
   assert.match(rust, /select-ci-tests\.mjs --list-rust-node-tests/);
   assert.match(rust, /node --test "\$\{rust_node_tests\[@\]\}"/);
   assert.match(rust, /npm run test:edge:built/);
