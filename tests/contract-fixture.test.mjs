@@ -63,9 +63,9 @@ test("user keeps relay runtime identity aligned | Given deployed relay speaks th
   }
 });
 
-test("user keeps Edge runtime identity aligned | Given frozen epoch-2 and runtime-exec-v5 descriptors | When Edge compatibility identities are read | Then current and rollback identities match", async () => {
+test("user keeps Edge runtime identity aligned | Given epoch-2 through epoch-6 descriptors | When Edge compatibility identities are read | Then current and rollback identities match", async () => {
   const descriptor = JSON.parse(
-    await readFile(new URL("contracts/runtime-exec-v5.json", root), "utf8"),
+    await readFile(new URL("contracts/runtime-exec-v6.json", root), "utf8"),
   );
   const source = await readFile(
     new URL("edge/cloudflare/src/contracts/runtime.ts", root),
@@ -84,15 +84,24 @@ test("user keeps Edge runtime identity aligned | Given frozen epoch-2 and runtim
   assert.equal(Number(epochMatch[1]), descriptor.contract_epoch);
   assert.equal(hashMatch[1], descriptor.contract_hash);
   assert.equal(Number(countMatch[1]), descriptor.tool_count);
-  // The acceptance window is the current identity plus the previous
-  // runtime execution identity and the frozen epoch-2 catalog.
+  // The acceptance window is the current identity plus epoch 5, epoch 4 and
+  // the frozen epoch-2 catalog.
   assert.match(
     source,
-    /COMPATIBLE_RUNTIME_CONTRACTS = \[\s*RUNTIME_EXECUTION_CONTRACT,\s*PREVIOUS_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH2_CONTRACT,\s*\]/,
+    /COMPATIBLE_RUNTIME_CONTRACTS = \[\s*RUNTIME_EXECUTION_CONTRACT,\s*PREVIOUS_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH4_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH2_CONTRACT,\s*\]/,
+  );
+  assert.match(source, /contract_epoch: 6,/);
+  assert.match(
+    source,
+    /contract_hash: "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e"/,
   );
   assert.match(source, /contract_epoch: 4,/);
   assert.match(
     source,
-    /PREVIOUS_RUNTIME_EXECUTION_CONTRACT = \{\s*contract_epoch: 4,\s*contract_hash: "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",\s*tool_count: 18,\s*\}/,
+    /PREVIOUS_RUNTIME_EXECUTION_CONTRACT = \{\s*contract_epoch: 5,\s*contract_hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",\s*tool_count: 18,\s*\}/,
+  );
+  assert.match(
+    source,
+    /EPOCH4_RUNTIME_EXECUTION_CONTRACT = \{\s*contract_epoch: 4,\s*contract_hash: "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",\s*tool_count: 18,\s*\}/,
   );
 });
