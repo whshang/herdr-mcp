@@ -2,14 +2,56 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import worker from "../dist/index.js";
+import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 import { EPOCH3_CONTRACT } from "../dist/contracts/epoch3.js";
-import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
+import {
+  EPOCH4_RUNTIME_EXECUTION_CONTRACT,
+  PREVIOUS_RUNTIME_EXECUTION_CONTRACT,
+  RUNTIME_EXECUTION_CONTRACT,
+  isCompatibleRuntimeContract,
+} from "../dist/contracts/runtime.js";
 import { DeviceRegistryDO } from "../dist/device-registry-do.js";
 import { makeLimits } from "../dist/limits.js";
 import { handleMcp } from "../dist/mcp-handler.js";
 import { OAuthStoreDO } from "../dist/oauth-store-do.js";
 
 const req = (id, method, params = {}) => ({ jsonrpc: "2.0", id, method, params });
+
+test("runtime compatibility accepts the epoch 6/5/4/2 window and rejects hash mismatches", () => {
+  assert.equal(
+    isCompatibleRuntimeContract(
+      RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+      RUNTIME_EXECUTION_CONTRACT.contract_hash,
+    ),
+    true,
+  );
+  assert.equal(
+    isCompatibleRuntimeContract(
+      PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+      PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash,
+    ),
+    true,
+  );
+  assert.equal(
+    isCompatibleRuntimeContract(
+      EPOCH4_RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+      EPOCH4_RUNTIME_EXECUTION_CONTRACT.contract_hash,
+    ),
+    true,
+  );
+  assert.equal(
+    isCompatibleRuntimeContract(EPOCH2_CONTRACT.contract_epoch, EPOCH2_CONTRACT.contract_hash),
+    true,
+  );
+  assert.equal(isCompatibleRuntimeContract(2, "sha256:wrong"), false);
+  assert.equal(
+    isCompatibleRuntimeContract(
+      RUNTIME_EXECUTION_CONTRACT.contract_epoch,
+      PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_hash,
+    ),
+    false,
+  );
+});
 
 class Storage {
   constructor() { this.map = new Map(); this._queue = Promise.resolve(); }
@@ -197,7 +239,7 @@ test("owner-approved possession capability controls fleet without authorizing si
   assert.equal((await h.call("pane.list", { ...cap })).result.code, "invalid_params");
   const tools = await worker.fetch(mcpRequest("planner", 2, "tools/list", {}), h.env);
   assert.deepEqual((await tools.json()).result.tools, EPOCH3_CONTRACT.tools);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 6);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(tools.headers.get("mcp-session-id"), null);
   const records = JSON.stringify([...h.oauthStorage.map]);
@@ -274,7 +316,7 @@ test("fleet private method schemas are discoverable without changing the base pu
   assert.deepEqual(listed.body.result.tools, EPOCH3_CONTRACT.tools);
   assert.equal(EPOCH3_CONTRACT.contract_epoch, 3);
   assert.equal(listed.body.result.tools.length, 19);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 6);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
 });
 

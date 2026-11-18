@@ -28,7 +28,7 @@ const contractFixture = JSON.parse(
   await readFile(new URL("../contracts/epoch2.json", import.meta.url), "utf8"),
 );
 
-test("runtime execution contract epoch 4 is independent of the public contract epochs", () => {
+test("runtime execution contract epoch 6 is independent of the public contract epochs", () => {
   const frozenHash = contractFixture.contract_hash;
   const frozenEpoch = contractFixture.contract_epoch;
   const frozenCount = contractFixture.tool_count;
@@ -40,14 +40,10 @@ test("runtime execution contract epoch 4 is independent of the public contract e
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 
-  // Deployed Edge still advertises the epoch-5 identity (previous window slot).
-  // The Rust runtime moved to epoch 6 in this change; the Edge descriptor is a
-  // frozen source constant until the Edge companion ships. Sibling repo
-  // herdr-edge must update `edge/cloudflare/src/contracts/runtime.ts` +
-  // `test-compat` so the next Edge release advertises epoch 6 / v6 hash.
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 5);
+  // Edge and Rust advertise the same current epoch-6 runtime identity.
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 6);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e");
 
   assert.equal(EDGE_EPOCH, 3);
   assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
