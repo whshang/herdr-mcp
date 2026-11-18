@@ -132,7 +132,9 @@ export class DeviceRegistryDO {
    * Keys are storage-key suffixes after `device:`. Every mutation path writes
    * `DEVICE_PREFIX + record.device_id`, so suffix and `device_id` coincide for
    * all real records; keying by suffix also preserves `getDevice` semantics
-   * for a stored record whose `device_id` field disagrees with its key.
+   * for a stored record whose `device_id` field disagrees with its key. To
+   * keep the map a faithful mirror of storage even for such records, updates
+   * are keyed by the exact suffix each write used, never by `device_id`.
    */
   private devicesCache: Map<string, DeviceRecord> | null = null;
   /**
@@ -144,10 +146,11 @@ export class DeviceRegistryDO {
 
   constructor(private readonly state: DurableObjectState, private readonly env: Env) {}
 
-  private noteDevicesChanged(records: Iterable<DeviceRecord>): void {
+  /** `entries` are `[storage-key suffix, record]` pairs — the suffix each write used. */
+  private noteDevicesChanged(entries: Iterable<readonly [string, DeviceRecord]>): void {
     this.deviceWriteEpoch += 1;
     if (this.devicesCache === null) return;
-    for (const record of records) this.devicesCache.set(record.device_id, record);
+    for (const [suffix, record] of entries) this.devicesCache.set(suffix, record);
   }
 
   private noteDevicesRollback(): void {
@@ -304,7 +307,7 @@ export class DeviceRegistryDO {
     }
 
     await this.state.storage.put(DEVICE_PREFIX + deviceId, next);
-    this.noteDevicesChanged([next]);
+    this.noteDevicesChanged([[deviceId, next]]);
 
     // Routable writes always refresh the local fence after the registry write.
     // This makes a widening transition retry-convergent: if the first attempt
@@ -419,7 +422,7 @@ export class DeviceRegistryDO {
 
     // The DO transaction is the authoritative serialization point: concurrent
     // consumes interleave only here, so exactly one ever sees the live record.
-    const mutated: DeviceRecord[] = [];
+    const mutated: [string, DeviceRecord][] = [];
     const result = await this.state.storage.transaction(async (tx) => {
       const record = await tx.get<PairingRecord>(storageKey);
       if (!record) return { ok: false as const, code: "pairing_rejected" as const };
@@ -465,7 +468,7 @@ export class DeviceRegistryDO {
         await tx.delete(storageKey);
         if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
         await tx.put(DEVICE_PREFIX + existing.device_id, updated);
-        mutated.push(updated);
+        mutated.push([existing.device_id, updated]);
         await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
         await tx.put(canonicalIndexKey, existing.device_id);
         // Keep any legacy workstation index as a compatibility tombstone. It
@@ -498,7 +501,7 @@ export class DeviceRegistryDO {
       };
       await tx.delete(storageKey);
       await tx.put(DEVICE_PREFIX + deviceId, device);
-      mutated.push(device);
+      mutated.push([deviceId, device]);
       await tx.put(WORKSTATION_PREFIX + deviceId, deviceId);
       await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
       return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret, recovered_existing: false as const };
@@ -567,7 +570,7 @@ export class DeviceRegistryDO {
     }
     const verifier = body.credential_verifier_sha256;
     const now = Date.now();
-    const mutated: DeviceRecord[] = [];
+    const mutated: [string, DeviceRecord][] = [];
     const result = await this.state.storage.transaction(async (tx) => {
       const existing = parseDeviceRecord(await tx.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
       if (!existing) return { ok: false as const, code: "device_not_found" as const };
@@ -596,7 +599,7 @@ export class DeviceRegistryDO {
       if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
       await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
       await tx.put(DEVICE_PREFIX + existing.device_id, updated);
-      mutated.push(updated);
+      mutated.push([existing.device_id, updated]);
       await tx.put(canonicalIndexKey, existing.device_id);
       return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, updated_at_ms: now };
     }).catch((err) => {
@@ -644,7 +647,7 @@ export class DeviceRegistryDO {
       updated_at_ms: Date.now(),
     };
     await this.state.storage.put(DEVICE_PREFIX + deviceId, renamed);
-    this.noteDevicesChanged([renamed]);
+    this.noteDevicesChanged([[deviceId, renamed]]);
     await this.projectExecutionFence(renamed);
     return json({ ok: true, device_id: renamed.device_id, name: renamed.name, updated_at_ms: renamed.updated_at_ms, wrote_registry: true });
   }
@@ -681,7 +684,7 @@ export class DeviceRegistryDO {
     let wroteRegistry = false;
     if (!alreadyRevoked) {
       await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
-      this.noteDevicesChanged([revoked]);
+      this.noteDevicesChanged([[canonical, revoked]]);
       wroteRegistry = true;
     }
 
@@ -730,7 +733,7 @@ export class DeviceRegistryDO {
     const name = requestedName.length > 0 && requestedName.length <= 128 ? requestedName : workstationId;
     const now = Date.now();
 
-    const mutated: DeviceRecord[] = [];
+    const mutated: [string, DeviceRecord][] = [];
     const result = await this.state.storage.transaction(async (tx) => {
       const indexKey = WORKSTATION_PREFIX + workstationId;
       const existingId = await tx.get<string>(indexKey);
@@ -754,7 +757,7 @@ export class DeviceRegistryDO {
         revoked_at_ms: null,
       };
       await tx.put(DEVICE_PREFIX + deviceId, device);
-      mutated.push(device);
+      mutated.push([deviceId, device]);
       await tx.put(indexKey, deviceId);
       return { ok: true as const, created: true, device };
     }).catch((err) => {

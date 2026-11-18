@@ -130,6 +130,33 @@ test("user device directory reads hit durable storage once then serve from memor
   assert.equal(storage.deviceReads, 1, "post-mutation reads stay in memory");
 });
 
+test("user sees revocation under the stored key even when record identity differs | Given a device record whose storage-key suffix differs from its device_id | When the device is revoked through the registry | Then reads by that key observe the revoked state", async () => {
+  const { storage, registry } = makeRegistry({
+    WORKSTATION_DO: {
+      idFromName: (name) => name,
+      get: () => ({
+        fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } }),
+      }),
+    },
+  });
+  // Legacy/hand-repaired data may key a record under a suffix that disagrees
+  // with its device_id field; getDevice deliberately resolves by key.
+  storage.map.set(`device:${DEVICE_A}`, record(DEVICE_B));
+
+  // Warm the directory cache so the stale entry lives in memory.
+  const list = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+  assert.equal(list.status, 200);
+
+  const revoke = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}/revoke`, { method: "POST" }));
+  assert.equal(revoke.status, 200);
+
+  const get = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_A}`));
+  assert.equal(get.status, 200);
+  const device = (await get.json()).device;
+  assert.equal(device.authorization, "revoked", "the keyed entry must reflect the committed revoke");
+  assert.equal(device.device_id, DEVICE_B, "the stored identity field is preserved");
+});
+
 test("device registry preserves legacy workstation mapping and sorts by immutable device id", async () => {
   const { registry } = makeRegistry();
   for (const entry of [record(DEVICE_B), record(DEVICE_A, { workstation_id: "prod-real-runtime" })]) {
