@@ -111,7 +111,7 @@ test("recently disconnected workstation waits and wakes immediately when a valid
   assert.deepEqual(events, [], "reconnect grace must remain process-local with zero DO writes/alarms");
 });
 
-test("retired epoch1 hello is refused by the real Durable Object hello path | Given an epoch1 runtime identity | When it sends hello to the production WorkstationDO | Then the ack reports contract_mismatch and the socket is closed", async () => {
+test("user cannot attach a retired epoch1 runtime through the Durable Object | Given an epoch1 runtime identity | When it sends hello to the production WorkstationDO | Then the ack reports contract_mismatch and the socket is closed", async () => {
   const { subject } = makeSubject();
   await init(subject);
   const sent = [];
