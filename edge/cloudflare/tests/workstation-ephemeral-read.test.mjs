@@ -11,10 +11,11 @@ class FakeStorage {
     this.failWrites = false;
   }
   async get(key) { return this.map.get(key); }
-  async put(key, value) {
-    this.events.push(["put", String(key)]);
+  async put(keyOrEntries, value) {
+    const entries = typeof keyOrEntries === "string" ? { [keyOrEntries]: value } : keyOrEntries;
+    for (const key of Object.keys(entries)) this.events.push(["put", key]);
     if (this.failWrites) throw new Error("rows_written quota exceeded");
-    this.map.set(key, value);
+    for (const [key, entry] of Object.entries(entries)) this.map.set(key, entry);
   }
   async delete(key) {
     this.events.push(["delete", String(key)]);

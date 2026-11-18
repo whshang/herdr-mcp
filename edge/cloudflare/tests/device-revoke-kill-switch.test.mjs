@@ -24,14 +24,23 @@ class FakeStorage {
     this.fail = null;
     /** Optional per-key put gates: map key -> promise awaited before the write. */
     this.putGates = new Map();
+    /** Key lists of every put commit, in order (one entry per storage.put). */
+    this.putCommits = [];
   }
   async get(key) { return this.map.get(key); }
-  async put(key, value) {
-    const gate = this.putGates.get(String(key));
-    if (gate) await gate;
+  /** Single key or multi-key entries object; a multi-key put is one atomic
+   *  commit (all keys written or none), matching Durable Object storage. */
+  async put(keyOrEntries, value) {
+    const entries = typeof keyOrEntries === "string" ? { [keyOrEntries]: value } : keyOrEntries;
+    const keys = Object.keys(entries);
+    for (const key of keys) {
+      const gate = this.putGates.get(key);
+      if (gate) await gate;
+    }
     this.writeCount += 1;
-    if (this.fail && this.fail("put", key)) throw new Error("injected storage fault");
-    this.map.set(key, structuredClone(value));
+    this.putCommits.push(keys);
+    if (this.fail && keys.some((key) => this.fail("put", key))) throw new Error("injected storage fault");
+    for (const key of keys) this.map.set(key, structuredClone(entries[key]));
   }
   async delete(key) {
     this.writeCount += 1;
@@ -987,7 +996,7 @@ const CRASH_SCOPED_IDEM_KEY = idempotencyScopeKey({
   callerKey: CRASH_CALLER_KEY,
 });
 
-async function settleWithFault(b, fault, toolResultValue) {
+async function admitCrashMutation(b) {
   const socket = await connectDevice(envFor(b), b);
   const inflight = b.ws.subject.forwardInternal({
     kind: "request",
@@ -1001,7 +1010,11 @@ async function settleWithFault(b, fault, toolResultValue) {
   });
   await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal(b.ws.storage.map.has("pending:crash-settle-mut"), true, "pending row must exist pre-settle");
+  return { inflight, socket, pendingRow: structuredClone(b.ws.storage.map.get("pending:crash-settle-mut")) };
+}
 
+async function settleWithFault(b, fault, toolResultValue) {
+  const { inflight, socket, pendingRow } = await admitCrashMutation(b);
   b.ws.storage.fail = fault;
   const frame = {
     protocol_version: 1,
@@ -1016,7 +1029,7 @@ async function settleWithFault(b, fault, toolResultValue) {
   // under test. We only need the persistSettlement attempt to have run.
   void b.ws.subject.webSocketMessage(socket, JSON.stringify(frame));
   await new Promise((resolve) => setTimeout(resolve, 5));
-  return { inflight, socket };
+  return { inflight, socket, pendingRow };
 }
 
 function envFor(b) {
@@ -1034,7 +1047,7 @@ function snapshotRows(storage) {
 test("crash recovery: completed-put failure retains pending + resolver; retry after fault persists completion and binding", async () => {
   const env = makeEnv();
   const b = await pair(env, "crash-completed-fail");
-  // Fail ONLY the completed: put; idem + pending-delete are never reached.
+  // Fail the completed: key of the atomic completed+idem put; pending-delete is never reached.
   const { inflight } = await settleWithFault(b, (op, key) => op === "put" && key.startsWith("completed:"), { ok: "executed-once" });
 
   // Nothing durably committed: no completed, no idem; pending retained with the
@@ -1063,42 +1076,43 @@ test("crash recovery: completed-put failure retains pending + resolver; retry af
   assert.equal(b.ws.subject.resolvers.size, 0, "waiter settled, not hung");
 });
 
-test("crash recovery: idem-put failure after completed success -> restart recovers completion + binding from completed row", async () => {
+test("user keeps a recoverable pending mutation when the settlement commit fails | Given a mutating request with an idempotency key awaiting settlement | When the single completed+idem batch put faults on the idem key | Then neither row is written, pending survives intact, and a restart or retry still converges", async () => {
   const env = makeEnv();
   const b = await pair(env, "crash-idem-fail");
-  // Fail ONLY the idem: put; completed succeeds, pending delete is never reached.
-  const { inflight } = await settleWithFault(b, (op, key) => op === "put" && key.startsWith("idem:"), { ok: "executed-once" });
+  // Fault ONLY the idem key; because completed + idem share one atomic put,
+  // the completed row must not land either.
+  const { inflight, pendingRow } = await settleWithFault(b, (op, key) => op === "put" && key.startsWith("idem:"), { ok: "executed-once" });
 
-  // The crash state: completed present, idem absent, pending stale.
   const rows = snapshotRows(b.ws.storage);
-  assert.deepEqual(rows.completed, ["crash-settle-mut"], "completed committed before idem write");
-  assert.deepEqual(rows.idem, [], "idem write failed -> missing evidence row");
-  assert.deepEqual(rows.pending, ["crash-settle-mut"], "pending delete not reached (crash between writes)");
+  assert.deepEqual(rows.completed, [], "atomic batch failed -> no completed row");
+  assert.deepEqual(rows.idem, [], "atomic batch failed -> no idem row");
+  assert.deepEqual(rows.pending, ["crash-settle-mut"], "pending retained for recovery");
+  assert.deepEqual(b.ws.storage.map.get("pending:crash-settle-mut"), pendingRow, "pending row unchanged");
+  assert.equal(b.ws.subject.registry.activeCount(), 1, "pending entry retained in registry");
+  assert.equal(b.ws.subject.resolvers.size, 1, "resolver retained, waiter not hung");
 
-  // REBUILD (process restart) from the same storage.
+  // REBUILD (process restart) from the same storage: the pending row is still
+  // the durable source of truth and no completion was fabricated.
   const rebuilt = makeWorkstation(b.workstation_id, b.ws.storage);
   await rebuilt.subject.fetch(new Request("https://do.internal/internal/status"));
+  assert.equal(rebuilt.storage.map.has("pending:crash-settle-mut"), true, "pending survives restart");
+  assert.equal(rebuilt.storage.map.has("completed:crash-settle-mut"), false, "no completion fabricated on restart");
+  assert.equal(rebuilt.subject.registry.get("crash-settle-mut")?.requestId, "crash-settle-mut", "pending rehydrated as recoverable");
 
-  // completed-wins: pending never resurrects; idempotency binding recovered
-  // from the embedded binding inside the completed row.
-  assert.equal(rebuilt.subject.registry.activeCount(), 0, "completed request must not resurrect as pending");
-  assert.equal(rebuilt.storage.map.has("pending:crash-settle-mut"), false, "stale pending cleaned by completed-wins");
-  assert.equal(rebuilt.storage.map.has("completed:crash-settle-mut"), true, "completed survives restart");
-
-  // Same-key retry returns the prior completion, never re-executes.
-  const replay = rebuilt.subject.registry.replay({
-    principalRef: CRASH_PRINCIPAL,
-    callerKey: CRASH_CALLER_KEY,
-    requestHash: CRASH_REQUEST_HASH,
-  }, "herdr_prompt");
-  assert.equal(replay.status, "hit", "same-key retry must hit the recovered binding");
-  assert.equal(replay.completion.status, "ok");
-  assert.deepEqual(replay.completion.result, { ok: "executed-once" }, "prior completion returned, no re-execution");
-
-  // The original in-process waiter is gone with the old isolate; nothing pends.
-  assert.equal(rebuilt.subject.registry.activeCount(), 0);
-  assert.equal(rebuilt.subject.resolvers.size, 0);
-  void inflight;
+  // Clear the fault; the in-process retry commits completed + idem together.
+  b.ws.storage.fail = null;
+  b.ws.storage.putCommits.length = 0;
+  const completion = { status: "ok", result: { ok: "executed-once" }, servedAtMs: Date.now() };
+  assert.equal(await b.ws.subject.persistSettlement("crash-settle-mut", completion), true, "retry settlement succeeds");
+  assert.deepEqual(
+    b.ws.storage.putCommits.map((keys) => [...keys].sort()),
+    [["completed:crash-settle-mut", `idem:${CRASH_SCOPED_IDEM_KEY}`].sort()],
+    "completed + idem land in exactly one storage commit",
+  );
+  assert.equal(b.ws.storage.map.has("pending:crash-settle-mut"), false, "pending removed after commit");
+  const body = await (await inflight).json();
+  assert.deepEqual(body.completion.result, { ok: "executed-once" });
+  assert.equal(b.ws.subject.resolvers.size, 0, "waiter settled, not hung");
 });
 
 test("crash recovery: pending-delete failure after completed+idem success -> restart keeps completed-wins, pending cleaned, binding restored", async () => {
@@ -1107,7 +1121,17 @@ test("crash recovery: pending-delete failure after completed+idem success -> res
   // Fail ONLY the pending: delete; completed + idem both commit first.
   const { inflight } = await settleWithFault(b, (op, key) => op === "delete" && key.startsWith("pending:"), { ok: "executed-once" });
 
-  // Crash state: completed + idem present, stale pending remains.
+  // Crash state: completed + idem present (committed together), stale pending remains.
+  assert.equal(
+    b.ws.storage.putCommits.filter((keys) => keys.includes("completed:crash-settle-mut")).length,
+    1,
+    "completed + idem committed in a single put",
+  );
+  assert.deepEqual(
+    b.ws.storage.map.get(`idem:${CRASH_SCOPED_IDEM_KEY}`)?.requestId,
+    "crash-settle-mut",
+    "idem evidence durably bound to the settled request",
+  );
   const rows = snapshotRows(b.ws.storage);
   assert.deepEqual(rows.completed, ["crash-settle-mut"], "completed committed");
   assert.deepEqual(rows.idem, [CRASH_SCOPED_IDEM_KEY], "idem committed before pending delete");
@@ -1132,6 +1156,62 @@ test("crash recovery: pending-delete failure after completed+idem success -> res
   }, "herdr_prompt");
   assert.equal(replay.status, "hit");
   assert.deepEqual(replay.completion.result, { ok: "executed-once" });
+  void inflight;
+});
+
+test("user keeps a recoverable evicted mutation when the settlement commit fails | Given an evicted mutating request with an idempotency key | When the single completed+idem batch put faults | Then neither row is written and pending survives intact", async () => {
+  const env = makeEnv();
+  const b = await pair(env, "evict-batch-fail");
+  const { inflight, pendingRow } = await admitCrashMutation(b);
+  const entry = b.ws.subject.registry.get("crash-settle-mut");
+  b.ws.storage.fail = (op, key) => op === "put" && key.startsWith("idem:");
+  const completion = { status: "ok", result: { ok: "evicted-once" }, servedAtMs: Date.now() };
+
+  assert.equal(await b.ws.subject.persistEvictedSettlement(entry, completion), false, "faulted eviction settlement reports failure");
+  const rows = snapshotRows(b.ws.storage);
+  assert.deepEqual(rows.completed, [], "atomic batch failed -> no completed row");
+  assert.deepEqual(rows.idem, [], "atomic batch failed -> no idem row");
+  assert.deepEqual(b.ws.storage.map.get("pending:crash-settle-mut"), pendingRow, "pending row unchanged and recoverable");
+  assert.equal(b.ws.subject.resolvers.size, 1, "resolver retained, waiter not hung");
+
+  b.ws.storage.fail = null;
+  b.ws.storage.putCommits.length = 0;
+  assert.equal(await b.ws.subject.persistEvictedSettlement(entry, completion), true, "retry after fault clears succeeds");
+  assert.deepEqual(
+    b.ws.storage.putCommits.map((keys) => [...keys].sort()),
+    [["completed:crash-settle-mut", `idem:${CRASH_SCOPED_IDEM_KEY}`].sort()],
+    "completed + idem land in exactly one storage commit",
+  );
+  assert.equal(b.ws.storage.map.has("pending:crash-settle-mut"), false, "pending removed after commit");
+  assert.deepEqual((await (await inflight).json()).completion.result, { ok: "evicted-once" });
+});
+
+test("user keeps durable evicted settlement evidence when the pending delete fails | Given an evicted mutating request with an idempotency key | When the pending delete faults after the atomic put | Then completed and idem are both persisted and a restart does not resurrect pending", async () => {
+  const env = makeEnv();
+  const b = await pair(env, "evict-delete-fail");
+  const { inflight } = await admitCrashMutation(b);
+  const entry = b.ws.subject.registry.get("crash-settle-mut");
+  b.ws.storage.fail = (op, key) => op === "delete" && key.startsWith("pending:");
+  const completion = { status: "ok", result: { ok: "evicted-once" }, servedAtMs: Date.now() };
+
+  assert.equal(await b.ws.subject.persistEvictedSettlement(entry, completion), false, "faulted pending delete reports failure");
+  const rows = snapshotRows(b.ws.storage);
+  assert.deepEqual(rows.completed, ["crash-settle-mut"], "completed persisted");
+  assert.deepEqual(rows.idem, [CRASH_SCOPED_IDEM_KEY], "idem persisted with completed");
+  assert.deepEqual(rows.pending, ["crash-settle-mut"], "pending delete failed -> stale row remains");
+
+  b.ws.storage.fail = null;
+  const rebuilt = makeWorkstation(b.workstation_id, b.ws.storage);
+  await rebuilt.subject.fetch(new Request("https://do.internal/internal/status"));
+  assert.equal(rebuilt.subject.registry.activeCount(), 0, "completed request must not resurrect as pending");
+  assert.equal(rebuilt.storage.map.has("pending:crash-settle-mut"), false, "stale pending cleaned on restart");
+  const replay = rebuilt.subject.registry.replay({
+    principalRef: CRASH_PRINCIPAL,
+    callerKey: CRASH_CALLER_KEY,
+    requestHash: CRASH_REQUEST_HASH,
+  }, "herdr_prompt");
+  assert.equal(replay.status, "hit", "same-key retry hits the persisted binding");
+  assert.deepEqual(replay.completion.result, { ok: "evicted-once" });
   void inflight;
 });
 
