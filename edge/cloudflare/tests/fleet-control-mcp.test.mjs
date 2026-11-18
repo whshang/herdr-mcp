@@ -17,7 +17,7 @@ import { OAuthStoreDO } from "../dist/oauth-store-do.js";
 
 const req = (id, method, params = {}) => ({ jsonrpc: "2.0", id, method, params });
 
-test("runtime compatibility accepts the epoch 6/5/4/2 window and rejects hash mismatches", () => {
+test("user accepts compatible runtime identities | Given epoch 6, 5, 4, and 2 hashes | When Edge validates a runtime identity | Then matching pairs pass and mismatched hashes fail", () => {
   assert.equal(
     isCompatibleRuntimeContract(
       RUNTIME_EXECUTION_CONTRACT.contract_epoch,

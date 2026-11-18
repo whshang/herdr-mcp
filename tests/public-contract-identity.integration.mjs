@@ -28,7 +28,7 @@ const contractFixture = JSON.parse(
   await readFile(new URL("../contracts/epoch2.json", import.meta.url), "utf8"),
 );
 
-test("runtime execution contract epoch 6 is independent of the public contract epochs", () => {
+test("user keeps runtime execution separate from public epochs | Given independent public and runtime contracts | When current identities are read | Then epoch 6 runtime remains distinct from public epochs", () => {
   const frozenHash = contractFixture.contract_hash;
   const frozenEpoch = contractFixture.contract_epoch;
   const frozenCount = contractFixture.tool_count;
