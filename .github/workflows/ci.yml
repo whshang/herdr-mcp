@@ -14,11 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # GitHub-hosted Linux. Rust, Node, Deno, and the compiler cache are
-  # installed in-job; the Node gate downloads the pinned Herdr binary.
+  # Same-repository triggers run on the devin-vm self-hosted runner (warm
+  # Cargo/npm caches); external fork PRs fall back to isolated GitHub-hosted
+  # ubuntu-latest so untrusted code never reaches the persistent runner.
   # Windows Candidate stays on its own GitHub-hosted workflow.
   rust:
-    runs-on: [self-hosted, linux, x64, devin-vm]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "x64", "devin-vm"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     env:
       CARGO_INCREMENTAL: "0"
@@ -62,7 +63,7 @@ jobs:
           node --test edge/cloudflare/tests/edge-runtime-harness.test.mjs
 
   test:
-    runs-on: [self-hosted, linux, x64, devin-vm]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "x64", "devin-vm"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
