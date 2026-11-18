@@ -219,6 +219,10 @@ impl Default for SupervisorState {
 
 #[cfg(any(target_os = "macos", test))]
 impl SupervisorState {
+    fn changed_from(&self, before: &Self) -> bool {
+        self != before
+    }
+
     fn transition(&mut self, state: &str, reason: Option<String>) {
         if self.health_state != state || self.last_reason != reason {
             self.last_transition_at_ms = now_ms();
@@ -258,6 +262,17 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(any(target_os = "macos", test))]
+const SNAPSHOT_PROBE_INTERVAL_MS: u64 = 10_000;
+
+#[cfg(any(target_os = "macos", test))]
+fn snapshot_probe_due(health_state: &str, last_probe_at_ms: Option<u64>, now: u64) -> bool {
+    health_state != "healthy"
+        || last_probe_at_ms.map_or(true, |last| {
+            now.saturating_sub(last) >= SNAPSHOT_PROBE_INTERVAL_MS
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -435,6 +450,7 @@ mod platform {
     struct ReconcileResult {
         value: Value,
         child: Option<ManagedHerdrChild>,
+        state: SupervisorState,
     }
 
     impl ReconcileResult {
@@ -442,6 +458,7 @@ mod platform {
             Self {
                 value: state.as_json(),
                 child: None,
+                state: state.clone(),
             }
         }
     }
@@ -470,7 +487,7 @@ mod platform {
         if !paths.plist.exists() || !is_loaded()? {
             return Ok(false);
         }
-        Ok(probe_herdr(paths.socket()?).state == "healthy")
+        Ok(probe_herdr(paths.socket()?, true).state == "healthy")
     }
 
     pub(super) fn run(command: HerdrSupervisorCommand) -> Result<ExitCode, String> {
@@ -479,6 +496,7 @@ mod platform {
                 let paths = SupervisorPaths::discover()?;
                 let state = load_state(&paths)?;
                 let loaded = is_loaded()?;
+                let probe = probe_herdr(paths.socket()?, true);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
@@ -490,6 +508,10 @@ mod platform {
                         "loaded": loaded,
                         "socket": paths.socket()?,
                         "state": state.as_json(),
+                        "health_probe": {
+                            "state": probe.state,
+                            "reason": probe.reason,
+                        },
                     }))
                     .map_err(|error| error.to_string())?
                 );
@@ -749,20 +771,23 @@ mod platform {
         let Some(_lock) = RecoveryLock::acquire(&paths.lock)? else {
             return Ok(json!({"ok": true, "state": "recovery_in_progress"}));
         };
-        let result = reconcile_once(&paths)?;
+        let state = load_state(&paths)?;
+        let result = reconcile_once(&paths, state, true)?;
         Ok(result.value)
     }
 
     fn run_daemon() -> Result<(), String> {
         let paths = SupervisorPaths::discover()?;
         let mut owned_child: Option<ManagedHerdrChild> = None;
+        let mut last_snapshot_probe_at_ms = None;
         loop {
+            let mut state = load_state(&paths)?;
             if let Some(child) = owned_child.as_mut()
                 && let Some(status) = child
                     .try_wait()
                     .map_err(|error| format!("cannot inspect supervised Herdr child: {error}"))?
             {
-                let mut state = load_state(&paths)?;
+                let before = state.clone();
                 state.owned_pid = None;
                 if status.success() {
                     if state.desired_running {
@@ -782,24 +807,30 @@ mod platform {
                         Some(format!("supervised Herdr exited unexpectedly: {status}")),
                     );
                 }
-                save_state(&paths, &state)?;
+                save_state_if_changed(&paths, &before, &state)?;
                 owned_child = None;
             }
 
-            if !load_state(&paths)?.desired_running {
+            if !state.desired_running {
                 thread::sleep(DAEMON_POLL);
                 continue;
             }
 
             if let Some(_lock) = RecoveryLock::acquire(&paths.lock)? {
-                let result = reconcile_once(&paths)?;
+                let snapshot_due =
+                    snapshot_probe_due(&state.health_state, last_snapshot_probe_at_ms, now_ms());
+                let result = reconcile_once(&paths, state, snapshot_due)?;
+                if snapshot_due {
+                    last_snapshot_probe_at_ms = Some(now_ms());
+                }
                 if owned_child.is_none() {
                     owned_child = result.child;
                 }
+                state = result.state;
             }
 
             if let Some(child) = owned_child.as_mut() {
-                let mut state = load_state(&paths)?;
+                let before = state.clone();
                 let recycle_owned = state.desired_running
                     && state.failure_streak >= OWNED_UNHEALTHY_RECYCLE_THRESHOLD
                     && matches!(
@@ -824,34 +855,38 @@ mod platform {
                             state.failure_streak
                         )),
                     );
-                    save_state(&paths, &state)?;
+                    save_state_if_changed(&paths, &before, &state)?;
                 }
             }
             thread::sleep(DAEMON_POLL);
         }
     }
 
-    fn reconcile_once(paths: &SupervisorPaths) -> Result<ReconcileResult, String> {
-        let mut state = load_state(paths)?;
+    fn reconcile_once(
+        paths: &SupervisorPaths,
+        mut state: SupervisorState,
+        force_snapshot: bool,
+    ) -> Result<ReconcileResult, String> {
+        let before = state.clone();
         if state.owned_pid.is_some_and(|pid| !process_alive(pid)) {
             state.owned_pid = None;
         }
-        let probe = probe_herdr(paths.socket()?);
+        let probe = probe_herdr(paths.socket()?, force_snapshot);
         if probe.state == "healthy" {
             state.failure_streak = 0;
             state.next_attempt_at_ms = None;
             state.transition("healthy", None);
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
         if !state.desired_running {
             state.transition("user_stopped", probe.reason);
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
         if state.health_state == "session_restore_blocked" {
             state.last_reason = probe.reason;
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
         let now = now_ms();
@@ -860,7 +895,7 @@ mod platform {
             .is_some_and(|deadline| now < deadline)
         {
             state.transition("recovery_cooldown", probe.reason);
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
 
@@ -868,7 +903,7 @@ mod platform {
             state.failure_streak = state.failure_streak.saturating_add(1);
             state.next_attempt_at_ms = Some(now + recovery_delay_ms(state.failure_streak));
             state.transition(probe.state, probe.reason);
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
 
@@ -892,7 +927,7 @@ mod platform {
                         .to_owned(),
                 ),
             );
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
         if probe.state == "socket_missing" && server_running.is_none() {
@@ -905,14 +940,14 @@ mod platform {
                         .to_owned(),
                 ),
             );
-            save_state(paths, &state)?;
+            save_state_if_changed(paths, &before, &state)?;
             return Ok(ReconcileResult::state(&state));
         }
 
         state.failure_streak = state.failure_streak.saturating_add(1);
         state.next_attempt_at_ms = Some(now + recovery_delay_ms(state.failure_streak));
         state.transition(probe.state, probe.reason);
-        save_state(paths, &state)?;
+        save_state_if_changed(paths, &before, &state)?;
         Ok(ReconcileResult::state(&state))
     }
 
@@ -981,7 +1016,7 @@ mod platform {
                 save_state(paths, state)?;
                 return Ok(ReconcileResult::state(state));
             }
-            last_probe = probe_herdr(paths.socket()?);
+            last_probe = probe_herdr(paths.socket()?, true);
             if last_probe.state == "healthy" {
                 state.failure_streak = 0;
                 state.next_attempt_at_ms = None;
@@ -990,6 +1025,7 @@ mod platform {
                 return Ok(ReconcileResult {
                     value: state.as_json(),
                     child: Some(child),
+                    state: state.clone(),
                 });
             }
             thread::sleep(STARTUP_POLL);
@@ -1018,6 +1054,7 @@ mod platform {
         Ok(ReconcileResult {
             value: state.as_json(),
             child: Some(child),
+            state: state.clone(),
         })
     }
 
@@ -1039,7 +1076,7 @@ mod platform {
         }
     }
 
-    fn probe_herdr(socket: &Path) -> HealthProbe {
+    fn probe_herdr(socket: &Path, include_snapshot: bool) -> HealthProbe {
         if !socket.exists() {
             return HealthProbe {
                 state: "socket_missing",
@@ -1059,6 +1096,12 @@ mod platform {
                     "ping_unavailable"
                 },
                 reason: Some(error.to_string()),
+            };
+        }
+        if !include_snapshot {
+            return HealthProbe {
+                state: "healthy",
+                reason: None,
             };
         }
         match client.call_with_timeout("session.snapshot", json!({}), RPC_TIMEOUT) {
@@ -1184,6 +1227,17 @@ mod platform {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|error| format!("cannot encode Herdr supervisor state: {error}"))?;
         atomic_write(&paths.state, &bytes, 0o600)
+    }
+
+    fn save_state_if_changed(
+        paths: &SupervisorPaths,
+        before: &SupervisorState,
+        state: &SupervisorState,
+    ) -> Result<(), String> {
+        if state.changed_from(before) {
+            save_state(paths, state)?;
+        }
+        Ok(())
     }
 
     fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -1478,5 +1532,23 @@ mod tests {
         let decoded: SupervisorState = serde_json::from_slice(&encoded).unwrap();
         assert!(!decoded.desired_running);
         assert_eq!(decoded.health_state, "user_stopped");
+    }
+
+    #[test]
+    fn steady_state_does_not_mark_supervisor_state_dirty() {
+        let state = SupervisorState::default();
+        assert!(!state.changed_from(&state));
+
+        let mut changed = state.clone();
+        changed.health_state = "healthy".to_owned();
+        assert!(changed.changed_from(&state));
+    }
+
+    #[test]
+    fn snapshot_probe_is_periodic_and_immediate_for_unhealthy_recovery() {
+        assert!(snapshot_probe_due("unknown", Some(9_999), 10_000));
+        assert!(snapshot_probe_due("healthy", None, 0));
+        assert!(!snapshot_probe_due("healthy", Some(1_000), 10_999));
+        assert!(snapshot_probe_due("healthy", Some(1_000), 11_000));
     }
 }
