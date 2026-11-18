@@ -2641,7 +2641,7 @@ mod tests {
         let started = registry
             .start(
                 Path::new("/tmp"),
-                "awk 'BEGIN{for(i=0;i<90;i++) print \"line-\" i}'",
+                "awk 'BEGIN{for(i=0;i<240;i++) print \"line-\" i}'",
             )
             .unwrap();
         let id = started["session_id"].as_str().unwrap().to_owned();
@@ -2651,14 +2651,14 @@ mod tests {
         assert_eq!(view["session_id"], id);
         assert_eq!(view["truncated"], false);
         assert_eq!(view["compacted"], true);
-        assert_eq!(view["counts"]["lines"], 90);
-        assert_eq!(view["counts"]["omitted_lines"], 30);
+        assert_eq!(view["counts"]["lines"], 240);
+        assert_eq!(view["counts"]["omitted_lines"], 80);
         let text = view["text"].as_str().unwrap();
         assert!(text.contains("line-0\n"));
-        assert!(text.contains("line-19\n"));
-        assert!(text.contains("…[omitted 30 lines]…"));
-        assert!(text.contains("line-89\n"));
-        assert!(!text.contains("line-40\n"));
+        assert!(text.contains("line-39\n"));
+        assert!(text.contains("…[omitted 80 lines]…"));
+        assert!(text.contains("line-239\n"));
+        assert!(!text.contains("line-60\n"));
         assert_eq!(view["next_offset"], view["bytes_total"]);
         assert!(view["bytes_total"].as_u64().unwrap() > text.len() as u64);
 
@@ -2673,7 +2673,7 @@ mod tests {
     #[test]
     fn uniform_json_success_compacts_but_chunk_reads_recover_raw_bytes() {
         let registry = registry();
-        let command = r#"awk 'BEGIN{printf "["; for(i=0;i<200;i++){if(i)printf ","; printf "{\"id\":%d,\"name\":\"worker-%03d\",\"status\":\"idle\",\"workspace\":\"w1\"}",i,i}; printf "]"}'"#;
+        let command = r#"awk 'BEGIN{printf "["; for(i=0;i<600;i++){if(i)printf ","; printf "{\"id\":%d,\"name\":\"worker-%03d\",\"status\":\"idle\",\"workspace\":\"w1\"}",i,i}; printf "]"}'"#;
         let started = registry.start(Path::new("/tmp"), command).unwrap();
         let id = started["session_id"].as_str().unwrap().to_owned();
         let view = wait_until_closed(&registry, &id, "stdout", 65_536);
@@ -2697,9 +2697,9 @@ mod tests {
         }
         assert_eq!(raw.len(), total);
         let decoded: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(decoded.as_array().unwrap().len(), 200);
+        assert_eq!(decoded.as_array().unwrap().len(), 600);
         assert_eq!(decoded[0]["name"], "worker-000");
-        assert_eq!(decoded[199]["name"], "worker-199");
+        assert_eq!(decoded[599]["name"], "worker-599");
     }
 
     #[test]
