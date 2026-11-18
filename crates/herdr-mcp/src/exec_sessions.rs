@@ -3338,14 +3338,14 @@ mod tests {
         let marker_content = fs::read_to_string(&marker_path).unwrap();
         assert_eq!(marker_content.matches("marker-run").count(), 1);
 
+        wait_for_durable_evidence(&path, &id);
+
         #[cfg(unix)]
         {
             let spool = exec_spool_path(&path, &id);
             let mode = fs::metadata(&spool).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-
-        wait_for_durable_evidence(&path, &id);
 
         drop(registry);
 
