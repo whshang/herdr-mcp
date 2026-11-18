@@ -3788,6 +3788,52 @@ mod tests {
         clear_route_pool_state();
     }
 
+    /// user operator | Given a chat route failing only under the background
+    /// tier | When the public `capability_json` surface is read | Then its
+    /// `chat_routes` entries carry the `background_*` pool fields — the
+    /// contract callers must not silently regress to the narrower helper.
+    #[test]
+    fn capability_json_chat_routes_report_background_pool_health() {
+        let _guard = crate::test_env::lock();
+        clear_route_pool_state();
+
+        let service = SemanticService {
+            providers: Vec::new(),
+            chat_providers: vec![Box::new(
+                OpenAiChatProvider::new(
+                    "tier-route".to_owned(),
+                    "key-t".to_owned(),
+                    "http://127.0.0.1:9/unused".to_owned(),
+                    "model-1".to_owned(),
+                )
+                .unwrap(),
+            )],
+        };
+
+        let background = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200))
+            .scoped(SemanticTier::Background.cooldown_scope());
+        let _ = execute_route_pool(
+            1,
+            background,
+            |_| "tier-route".to_owned(),
+            |_, _| Err::<usize, _>(SemanticError::new("timeout")),
+        );
+
+        let capability = service.capability_json();
+        let detail = capability["chat_routes"]
+            .as_array()
+            .expect("chat_routes is an array")
+            .iter()
+            .find(|route| route["name"] == "tier-route")
+            .expect("capability_json must list the chat route");
+        assert_eq!(detail["consecutive_failures"], 0);
+        assert_eq!(detail["background_consecutive_failures"], 1);
+        assert_eq!(detail["cooldown_remaining_ms"], 0);
+        assert!(detail["background_cooldown_remaining_ms"].as_u64().unwrap() > 0);
+
+        clear_route_pool_state();
+    }
+
     #[test]
     fn background_hourly_cap_rejects_once_full_and_recovers_after_window() {
         let mut calls = VecDeque::new();
