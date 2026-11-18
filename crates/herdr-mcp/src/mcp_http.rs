@@ -9082,7 +9082,13 @@ mod tests {
     /// each answered with the next scripted response (id mirrored). Same wire
     /// contract as the prompt.rs dispatch tests. Every received request is
     /// recorded so tests can assert what actually reached the Herdr socket.
-    fn spawn_scripted_herdr_socket(responses: Vec<Value>) -> (PathBuf, Arc<Mutex<Vec<Value>>>) {
+    fn spawn_scripted_herdr_socket(
+        responses: Vec<Value>,
+    ) -> (
+        PathBuf,
+        crate::test_env::TempUnixSocketGuard,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
 
@@ -9095,6 +9101,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&socket);
+        let guard = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
@@ -9115,7 +9122,7 @@ mod tests {
                 .unwrap();
             }
         });
-        (socket, requests)
+        (socket, guard, requests)
     }
 
     /// Production-shaped AppState for dispatch tests: the durable task
@@ -9897,11 +9904,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10054,13 +10060,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state_with_snapshot(
             &root,
             &socket,
@@ -10276,11 +10281,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10466,11 +10470,10 @@ mod tests {
     #[tokio::test]
     async fn worker_report_rejects_webchat_and_tcp_before_mutation() {
         let root = test_root("worker-report-boundary");
-        let (socket, _) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         let tcp = candidate_router(state.clone());
         state.trusted_extension_ipc = true;
@@ -10524,11 +10527,10 @@ mod tests {
     #[tokio::test]
     async fn decision_gate_resolution_rejects_all_mcp_callers_without_mutation() {
         let root = test_root("gate-boundary");
-        let (socket, _) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         let tcp = candidate_router(state.clone());
         state.trusted_extension_ipc = true;
@@ -10599,11 +10601,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10693,8 +10694,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]).collect();
-        let (socket, requests) = spawn_scripted_herdr_socket(responses);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, _sock_guard, requests) = spawn_scripted_herdr_socket(responses);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10986,7 +10986,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"type": "tab_created", "tab": {"tab_id": "w1:t2", "workspace_id": "w1"},
                 "root_pane": {"pane_id": "w1:p9", "tab_id": "w1:t2", "workspace_id": "w1"}}),
             json!({"type": "agent_started", "argv": [], "agent": {
@@ -10997,7 +10997,6 @@ mod tests {
                 "pane_id": "w1:p9", "agent_status": "generating", "state_change_seq": 2,
             }}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut state = dispatch_test_state_with_snapshot(
@@ -11113,7 +11112,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {
                 "status": "submitted",
@@ -11130,7 +11129,6 @@ mod tests {
                 "agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 7},
             }}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -11300,7 +11298,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
@@ -11316,7 +11314,6 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 16}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 17}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -11709,8 +11706,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -12005,11 +12001,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -12130,7 +12125,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {
                 "status": "submitted",
@@ -12144,7 +12139,6 @@ mod tests {
             }}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let broker = state.browser_actuation.clone();
@@ -12426,13 +12420,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state_with_snapshot(
             &root,
             &socket,
@@ -12802,8 +12795,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -12947,11 +12939,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(vec![
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(vec![
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -13128,8 +13119,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         // The same state over the bearer TCP listener: the reserved handoff
         // headers are admitted only from the 0600 Unix IPC listener. Built
@@ -13318,8 +13308,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -13555,8 +13544,7 @@ mod tests {
             script.push(json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": seq}}));
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
-        let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, _sock_guard, _herdr_requests) = spawn_scripted_herdr_socket(script);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store_for_assertions = state.state_store.clone();

@@ -1663,7 +1663,11 @@ mod tests {
     async fn spawn_unix_server(
         body: String,
         runtime_generation: &str,
-    ) -> (std::path::PathBuf, oneshot::Receiver<String>) {
+    ) -> (
+        std::path::PathBuf,
+        oneshot::Receiver<String>,
+        crate::test_env::TempUnixSocketGuard,
+    ) {
         let runtime_generation = runtime_generation.to_owned();
         let socket = std::env::temp_dir().join(format!(
             "herdr-mcp-local-mcp-{}-{}.sock",
@@ -1674,6 +1678,7 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_file(&socket);
+        let guard = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let (request_tx, request_rx) = oneshot::channel();
         tokio::spawn(async move {
@@ -1712,7 +1717,7 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.shutdown().await;
         });
-        (socket, request_rx)
+        (socket, request_rx, guard)
     }
 
     async fn spawn_disconnect_observer() -> (String, oneshot::Receiver<()>, oneshot::Receiver<()>) {
@@ -1900,8 +1905,8 @@ mod tests {
     #[tokio::test]
     async fn worker_report_uses_trusted_ipc_and_fails_closed() {
         let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
-        let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, request_rx, _sock_guard) =
+            spawn_unix_server(response.to_string(), "rust-test").await;
         let mut config = LocalMcpConfig::new("token-test", "sha256:test");
         config.trusted_ipc_socket = Some(socket.clone());
         config.runtime_generation = Some("rust-test".to_owned());
@@ -1960,8 +1965,8 @@ mod tests {
     #[tokio::test]
     async fn webchat_caller_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
         let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
-        let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
-        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let (socket, request_rx, _sock_guard) =
+            spawn_unix_server(response.to_string(), "rust-test").await;
         let mut config = LocalMcpConfig::new("token-test", "sha256:test");
         config.trusted_ipc_socket = Some(socket.clone());
         config.runtime_generation = Some("rust-test".to_owned());
