@@ -73,7 +73,7 @@ Choose validation by the component being changed. Do not substitute one lane for
 | --- | --- | --- |
 | Rust runtime, MCP, service manager, updater, native host, Rust Link/candidate code | `cargo fmt --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace` | This is the Rust runtime gate used by `.github/workflows/ci.yml`. `npm test` is never evidence that this lane passed. |
 | Browser extension (`extension/**`) | Targeted `node --test ...` for the changed modules, `node tests/manual/extension_smoke.mjs`, and `node tests/manual/background_bind_test.mjs` when background/binding behavior changes | Prefer targeted extension tests during iteration. Run the full JS/TS CI lane only when cross-cutting compatibility coverage is needed. |
-| Cloudflare Edge / JS public-contract compatibility | `npm run build` followed by the relevant Node tests and `npm run test:edge` | Edge remains a JS/TS validation lane even though the local service runtime is Rust. |
+| Cloudflare Edge / JS public-contract compatibility | `npm run test:edge` (builds the Edge worker itself); run `npm run build` first only when the relevant root Node tests import root `dist/` | Edge remains a JS/TS validation lane even though the local service runtime is Rust. |
 | Legacy/compatibility TypeScript under `src/**`, generated `dist/**`, or cross-language contracts | `npm run build` before Node tests; run both Node and Rust gates when the contract is shared | Generated `dist/**` is a test/build artifact, not production runtime identity. |
 
 For a full local reproduction of the GitHub JavaScript/TypeScript `test` job, preserve the CI ordering:
