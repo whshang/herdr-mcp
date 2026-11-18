@@ -105,3 +105,49 @@ impl Drop for TuiConfigGuard {
         }
     }
 }
+
+/// #1007: cleanup guard for Unix socket files that tests bind under
+/// `env::temp_dir()` or `/tmp` to stay below `SUN_LEN`.
+///
+/// `Drop` removes the socket file, ignoring `NotFound` so tests that already
+/// unlink the socket themselves keep passing. `dir` removes a directory the
+/// test created only to hold a short socket path.
+pub(crate) struct TempUnixSocketGuard {
+    path: std::path::PathBuf,
+    remove_dir: bool,
+}
+
+impl TempUnixSocketGuard {
+    /// Guard a socket file: `Drop` runs `fs::remove_file`, ignoring `NotFound`.
+    pub(crate) fn file(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            remove_dir: false,
+        }
+    }
+
+    /// Guard a directory created solely for socket files: `Drop` runs
+    /// `fs::remove_dir_all`, ignoring `NotFound`.
+    pub(crate) fn dir(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            remove_dir: true,
+        }
+    }
+}
+
+impl Drop for TempUnixSocketGuard {
+    fn drop(&mut self) {
+        let result = if self.remove_dir {
+            std::fs::remove_dir_all(&self.path)
+        } else {
+            std::fs::remove_file(&self.path)
+        };
+        if let Err(error) = result {
+            // `NotFound` is fine (the test may have cleaned up itself); every
+            // other removal failure stays non-fatal so teardown never masks
+            // the real assertion that failed first.
+            let _ = error;
+        }
+    }
+}
