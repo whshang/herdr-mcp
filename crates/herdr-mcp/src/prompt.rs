@@ -1252,7 +1252,7 @@ impl PromptRegistry {
                 });
             }
         }
-        match self.list_tasks(512) {
+        match self.list_terminal_tasks() {
             Ok(tasks) => match tasks
                 .iter()
                 .filter(|task| task_matches_target(task, target, None))
@@ -1285,7 +1285,7 @@ impl PromptRegistry {
         before_ms: Option<u64>,
         parent_session_ref: Option<&str>,
     ) -> Value {
-        let tasks = match self.list_tasks(512) {
+        let tasks = match self.list_terminal_tasks() {
             Ok(tasks) => tasks,
             Err(error) => {
                 return json!({
@@ -2837,6 +2837,29 @@ impl PromptRegistry {
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
         store
             .operation_ledgers_by_phase(PROMPT_TASK_OPERATION_KIND, "active")?
+            .into_iter()
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
+            .collect()
+    }
+
+    /// Every terminal-phase task ledger, unbounded like `list_active_tasks`:
+    /// a target-scoped status read or a scoped bulk ack must consider every
+    /// receipt in its scope, not only the most recent 512. A receipt beyond
+    /// that window must never be reported as not-found or counted as already
+    /// acknowledged (#1005 review: unscanned receipts are not acked).
+    fn list_terminal_tasks(&self) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        store
+            .operation_ledgers_by_phase(PROMPT_TASK_OPERATION_KIND, "terminal")?
             .into_iter()
             .map(|record| {
                 let mut task = decode_task_record(&record)?;
@@ -12584,6 +12607,65 @@ mod tests {
         );
         assert_eq!(bad["ok"], false);
         assert_eq!(bad["code"], "invalid_params");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user orchestrator | Given a terminal receipt pushed out of the recent
+    /// ledger window by hundreds of newer active tasks | When a scoped ack and
+    /// a target-scoped status read run | Then both still find that receipt —
+    /// an unscanned receipt is never counted as acknowledged or not-found.
+    #[test]
+    fn task_ack_scoped_and_status_reach_receipts_beyond_the_recent_window() {
+        let (db_path, registry) = task_registry("ack-scope-window");
+        let mut old = escalation_task(
+            "dispatch:prompt:w9-old",
+            "child",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        old.workspace_id = Some("w9".to_owned());
+        old.pane_id = Some("w9:p9".to_owned());
+        registry.save_task(&old, None).unwrap();
+        for index in 0..520 {
+            registry
+                .save_task(
+                    &escalation_task(
+                        &format!("dispatch:prompt:active-{index}"),
+                        "child",
+                        PromptTaskLifecycle::Running,
+                        1,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let ack = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"workspace_id": "w9"}),
+            None,
+        );
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(
+            ack["acked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "dispatch:prompt:w9-old"),
+            "expected w9-old in {ack}"
+        );
+
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            None,
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["task_id"], "dispatch:prompt:w9-old");
 
         drop(registry);
         remove_task_db(&db_path);
