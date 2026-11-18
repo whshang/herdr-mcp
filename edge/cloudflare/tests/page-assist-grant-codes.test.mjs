@@ -15,7 +15,14 @@ class FakeStorage {
   }
   async get(key) { return this.map.get(key); }
   async put(key, value) { this.map.set(key, structuredClone(value)); }
-  async delete(key) { return this.map.delete(key); }
+  async delete(keyOrKeys) {
+    if (Array.isArray(keyOrKeys)) {
+      let deleted = 0;
+      for (const key of keyOrKeys) if (this.map.delete(key)) deleted += 1;
+      return deleted;
+    }
+    return this.map.delete(keyOrKeys);
+  }
   async list({ prefix } = {}) {
     return new Map([...this.map].filter(([key]) => !prefix || key.startsWith(prefix)));
   }

@@ -42,10 +42,15 @@ class FakeStorage {
     if (this.fail && keys.some((key) => this.fail("put", key))) throw new Error("injected storage fault");
     for (const key of keys) this.map.set(key, structuredClone(entries[key]));
   }
-  async delete(key) {
+  async delete(keyOrKeys) {
     this.writeCount += 1;
-    if (this.fail && this.fail("delete", key)) throw new Error("injected storage fault");
-    return this.map.delete(key);
+    if (this.fail && this.fail("delete", keyOrKeys)) throw new Error("injected storage fault");
+    if (Array.isArray(keyOrKeys)) {
+      let deleted = 0;
+      for (const key of keyOrKeys) if (this.map.delete(key)) deleted += 1;
+      return deleted;
+    }
+    return this.map.delete(keyOrKeys);
   }
   async list({ prefix } = {}) {
     return new Map([...this.map].filter(([key]) => !prefix || key.startsWith(prefix)));
