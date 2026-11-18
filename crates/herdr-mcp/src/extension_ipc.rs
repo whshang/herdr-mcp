@@ -598,6 +598,7 @@ mod tests {
     #[tokio::test]
     async fn bind_secures_socket_and_drop_removes_owned_inode() {
         let path = temp_path();
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         let (listener, guard) = ExtensionIpcSocket::bind(&path).await.unwrap();
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
@@ -610,6 +611,7 @@ mod tests {
     #[tokio::test]
     async fn live_socket_is_never_unlinked_by_second_bind() {
         let path = temp_path();
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         let (listener, guard) = ExtensionIpcSocket::bind(&path).await.unwrap();
         let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
         drop(client);
@@ -624,6 +626,7 @@ mod tests {
     #[tokio::test]
     async fn stale_socket_is_replaced_but_regular_file_is_refused() {
         let path = temp_path();
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         let stale = tokio::net::UnixListener::bind(&path).unwrap();
         drop(stale);
         wait_until_socket_stale(&path).await;
@@ -644,6 +647,7 @@ mod tests {
         use axum::{Router, routing::get};
 
         let path = temp_path();
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         let (listener, guard) = ExtensionIpcSocket::bind(&path).await.unwrap();
         let bounded =
             BoundedExtensionIpcListener::new(listener, Duration::from_millis(300)).unwrap();
@@ -699,6 +703,7 @@ mod tests {
         use axum::{Router, routing::post};
 
         let path = temp_path();
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         let (listener, guard) = ExtensionIpcSocket::bind(&path).await.unwrap();
         let bounded =
             BoundedExtensionIpcListener::new(listener, Duration::from_millis(200)).unwrap();

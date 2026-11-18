@@ -2146,6 +2146,7 @@ mod tests {
         ));
         fs::create_dir_all(&base).unwrap();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let server_methods = Arc::clone(&methods);
@@ -2249,6 +2250,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -2306,6 +2308,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let server_methods = Arc::clone(&methods);
@@ -2443,6 +2446,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let recorded = Arc::clone(&methods);
@@ -2538,6 +2542,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let recorded = Arc::clone(&methods);
@@ -2635,6 +2640,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             // split, rename, wait_for_output, send_text, then two pane.close
@@ -2724,6 +2730,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -2772,6 +2779,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             // split, rename (error), wait_for_output, send_text, pane.close.
@@ -2852,6 +2860,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let methods = Arc::new(Mutex::new(Vec::<String>::new()));
         let recorded = Arc::clone(&methods);
@@ -2937,6 +2946,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for _ in 0..3 {
@@ -3076,6 +3086,7 @@ mod tests {
 
         let base = native_test_dir();
         let socket = base.join("herdr.sock");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for _ in 0..1 {
