@@ -607,6 +607,7 @@ fn finish_grep_result(
     output.insert("count".to_owned(), json!(match_count));
     output.insert("truncated".to_owned(), json!(truncated));
     output.insert("engine".to_owned(), json!(engine));
+    output.insert("skipped_large_files".to_owned(), json!(skipped_large_files));
     output.insert("started_at".to_owned(), json!(iso_from_ms(started_at_ms)));
     output.insert("phase".to_owned(), json!("completed"));
     output.insert(
@@ -845,7 +846,7 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
 
     let mut matches = Vec::new();
     let mut truncated = output.len() as u64 > stdout_ceiling;
-    let mut skipped_large_files = 0_u64;
+    let mut skipped_files = std::collections::HashSet::new();
     let retained = &output[..output.len().min(stdout_ceiling as usize)];
     for line in String::from_utf8_lossy(retained).lines() {
         if line.trim().is_empty() {
@@ -858,11 +859,6 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
         let Some((file, line_no, content)) = parse_rg_line(line) else {
             continue;
         };
-        if content.len() as u64 > options.max_bytes {
-            truncated = true;
-            skipped_large_files += 1;
-            continue;
-        }
         let file_path = PathBuf::from(&file);
         let abs = if file_path.is_absolute() {
             file_path
@@ -871,12 +867,13 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
         };
         if !fs_security::path_within(options.search_root, &abs)
             || fs_security::denied_secret_path(&abs)
+            || skipped_files.contains(&abs)
         {
             continue;
         }
         if fs::metadata(&abs).is_ok_and(|metadata| metadata.len() > options.max_bytes) {
             truncated = true;
-            skipped_large_files += 1;
+            skipped_files.insert(abs);
             continue;
         }
         matches.push(json!({
@@ -888,7 +885,7 @@ fn try_grep_rg(options: &GrepRgOptions<'_>) -> GrepRgOutcome {
     GrepRgOutcome::Complete {
         matches,
         truncated,
-        skipped_large_files,
+        skipped_large_files: skipped_files.len() as u64,
     }
 }
 
@@ -1453,6 +1450,66 @@ mod tests {
             "fake rg never reached its long-running state before the timeout"
         );
         assert!(unsafe { libc::kill(pid as i32, 0) } != 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user operator | Given one oversized file that rg reports many hits in
+    /// plus a small file with a hit | When fs_grep finishes with matches |
+    /// Then the oversized file is counted once and the count reaches the
+    /// successful result.
+    #[cfg(unix)]
+    #[test]
+    fn rg_counts_each_oversized_file_once_and_reports_it_on_success() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-rg-skip-dedup-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("big.rs"), "needle\n".repeat(512)).unwrap();
+        fs::write(root.join("small.rs"), "needle\n").unwrap();
+        let fake_rg = root.join("rg");
+        fs::write(
+            &fake_rg,
+            "#!/bin/sh\nprintf 'big.rs:1:needle\\nbig.rs:2:needle\\nbig.rs:3:needle\\nsmall.rs:1:needle\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_rg, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = try_grep_rg(&GrepRgOptions {
+            rg: &fake_rg,
+            search_root: &root,
+            pattern: "needle",
+            regex_mode: false,
+            case_insensitive: false,
+            glob: None,
+            max_matches: 64,
+            max_bytes: 1024,
+            timeout: Duration::from_secs(10),
+            linked_worktree: false,
+            before_wait: None,
+        });
+        let GrepRgOutcome::Complete {
+            matches,
+            truncated,
+            skipped_large_files,
+        } = outcome
+        else {
+            panic!("fake rg should complete");
+        };
+        assert_eq!(matches.len(), 1);
+        assert!(truncated);
+        assert_eq!(skipped_large_files, 1);
+
+        let result = finish_grep_result(&root, matches, truncated, skipped_large_files, "rg", 0, 1);
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["skipped_large_files"], 1);
         fs::remove_dir_all(root).unwrap();
     }
 
