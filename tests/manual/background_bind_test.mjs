@@ -63,7 +63,7 @@ const storage = { herdrWakeBindings: {}, herdrMcpUrl: "http://127.0.0.1:8772", t
 const sessionStorage = {};
 const listeners = {
   onMessage: [], onConnect: [], onStartup: [], onInstalled: [], onActivated: [], onActionClicked: [],
-  onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [], onPermissionAdded: [], onPermissionRemoved: [],
+  onSidePanelOpened: [], onSidePanelClosed: [], onAlarm: [], onPermissionAdded: [], onPermissionRemoved: [], onTabRemoved: [],
 };
 const grantedOrigins = new Set([
   "https://chat.z.ai/*",
@@ -103,6 +103,7 @@ let testClockOffsetMs = 0;
 Date.now = () => realDateNow() + testClockOffsetMs;
 let mockStateWorkspaces = [];
 let mockLocalRuntimeAvailable = true;
+let nativePushStateRequests = 0;
 let mockNativeHostLastError = null;
 let hangAutomationNotifications = false;
 let failQueuedInsertStorage = false;
@@ -401,6 +402,7 @@ globalThis.chrome = {
         return;
       }
       if (message.path === "/push/state") {
+        nativePushStateRequests += 1;
         if (!mockLocalRuntimeAvailable) {
           callback({ ok: false, error: "connect ECONNREFUSED 127.0.0.1:8772" });
           return;
@@ -820,6 +822,7 @@ globalThis.chrome = {
     },
   },
   tabs: {
+    onRemoved: { addListener: (fn) => listeners.onTabRemoved.push(fn) },
     async query({ url }) {
       const patterns = (Array.isArray(url) ? url : [url]).filter(Boolean);
       const matchesPattern = (value, pattern) => {
@@ -2347,6 +2350,32 @@ console.log("\n[plain ChatGPT conversation automation]");
   const onlineState = await onlineStateP;
   ok(onlineState?.enabled === true && onlineState?.runtime_available === true,
     "effective automation resumes after the local runtime is reachable again", JSON.stringify(onlineState));
+
+  // #1036: manual-mode 5s polls reuse the reachability just observed instead
+  // of one /push/state request per tab per tick.
+  const manualPollsBefore = nativePushStateRequests;
+  const manualStates = await Promise.all([361, 362, 363].map((tabId) => new Promise((resolve) => {
+    onMsg({ type: "h2w_automation_state", convKey: `https://chatgpt.com/c/manual-poll-${tabId}` },
+      { tab: { id: tabId, url: `https://chatgpt.com/c/manual-poll-${tabId}` } }, resolve);
+  })));
+  ok(manualStates.every((state) => state?.ok === true
+      && state.preference_enabled === false
+      && state.effective_enabled === false
+      && state.runtime_available === true)
+      && nativePushStateRequests === manualPollsBefore,
+    "user manual-mode tabs reuse cached runtime reachability | Given Auto is off and the runtime was just reached | When three tabs poll h2w_automation_state together | Then each sees the runtime available and no extra /push/state request is made",
+    JSON.stringify({ manualStates, requests: nativePushStateRequests - manualPollsBefore }));
+
+  // #1037: closing a tab is reclaimed by the registered chrome.tabs.onRemoved hook
+  // and the worker keeps serving the remaining tabs.
+  ok(listeners.onTabRemoved.length === 1, "background registers one chrome.tabs.onRemoved reclamation hook");
+  for (const fn of listeners.onTabRemoved) fn(361, { windowId: 1, isWindowClosing: false });
+  const afterCloseState = await new Promise((resolve) => {
+    onMsg({ type: "h2w_automation_state", convKey: CHATGPT_AUTO_CONV },
+      { tab: { id: 355, url: CHATGPT_AUTO_CONV } }, resolve);
+  });
+  ok(afterCloseState?.ok === true && afterCloseState?.enabled === true,
+    "closing another tab leaves Auto state for the open tab intact", JSON.stringify(afterCloseState));
 
   let resolveOtherHud;
   const otherHudP = new Promise((r) => { resolveOtherHud = r; });

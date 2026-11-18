@@ -1227,6 +1227,111 @@ impl PromptRegistry {
         }
     }
 
+    /// `agent.task.status` with `{"target": "..."}` alone: answer "which task is
+    /// holding this pane" without pulling a whole inbox page. The active task
+    /// on the target wins; otherwise the most recent task summary for it.
+    /// A caller-scoped parent session only ever sees its own tasks.
+    pub fn task_status_by_target(&self, target: &str, parent_session_ref: Option<&str>) -> Value {
+        let now = self.now_ms();
+        match self.list_active_tasks() {
+            Ok(tasks) => {
+                if let Some(task) = tasks
+                    .iter()
+                    .filter(|task| {
+                        task_matches_target(task, target, None)
+                            && parent_session_ref.is_none_or(|parent_session_ref| {
+                                task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                            })
+                    })
+                    .max_by_key(|task| task.updated_at_ms)
+                {
+                    return json!({
+                        "ok": true,
+                        "task_state": "active",
+                        "task": task.public_json_at(now),
+                    });
+                }
+            }
+            Err(error) => {
+                return json!({
+                    "ok": false, "code": "agent_task_store_unavailable", "message": error,
+                });
+            }
+        }
+        match self.list_terminal_tasks() {
+            Ok(tasks) => match tasks
+                .iter()
+                .filter(|task| {
+                    task_matches_target(task, target, None)
+                        && parent_session_ref.is_none_or(|parent_session_ref| {
+                            task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                        })
+                })
+                .max_by_key(|task| task.updated_at_ms)
+            {
+                Some(task) => json!({
+                    "ok": true,
+                    "task_state": "terminal",
+                    "task": task.public_json_at(now),
+                }),
+                None => json!({
+                    "ok": false,
+                    "code": "agent_task_not_found",
+                    "target": target,
+                }),
+            },
+            Err(error) => json!({
+                "ok": false, "code": "agent_task_store_unavailable", "message": error,
+            }),
+        }
+    }
+
+    /// Scoped bulk ack: every still-unacknowledged terminal receipt matching
+    /// the caller's workspace / target / `before_ms` scope, in one call instead
+    /// of a `task_ids` page at a time.
+    pub fn task_ack_scoped(
+        &self,
+        workspace_id: Option<&str>,
+        target: Option<&str>,
+        before_ms: Option<u64>,
+        parent_session_ref: Option<&str>,
+    ) -> Value {
+        let tasks = match self.list_terminal_tasks() {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return json!({
+                    "ok": false, "code": "agent_task_store_unavailable", "message": error,
+                });
+            }
+        };
+        let ids = tasks
+            .iter()
+            .filter(|task| {
+                task.is_terminal()
+                    && task.acknowledged_at_ms.is_none()
+                    && task.gate.is_none()
+                    && workspace_id.is_none_or(|workspace_id| {
+                        task.workspace_id.as_deref() == Some(workspace_id)
+                    })
+                    && target.is_none_or(|target| task_matches_target(task, target, None))
+                    && before_ms.is_none_or(|before_ms| task.updated_at_ms <= before_ms)
+                    && parent_session_ref.is_none_or(|parent_session_ref| {
+                        task.parent_session_ref.as_deref() == Some(parent_session_ref)
+                    })
+            })
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return json!({"ok": true, "acked": [], "not_found": []});
+        }
+        let borrowed = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut result = self.task_ack_many(&borrowed, None);
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            result["scoped"] = json!(true);
+        }
+        result
+    }
+
     /// Read-only head check for one dispatch idempotency key.
     ///
     /// True when this call cannot produce a new submission because the runtime
@@ -1808,10 +1913,53 @@ impl PromptRegistry {
 
         // Deterministic escalation facts use the scope filter only
         // (acknowledged rows still count) and are never gated on the
-        // semantic `advisory` opt-in.
+        // semantic `advisory` opt-in. Terminal receipts bound to a workspace or
+        // pane the live snapshot no longer reports are dropped from the lanes:
+        // a destroyed workspace's history must not keep producing
+        // `repair_budget_exhausted` / `unsuccessful_streak` for the current
+        // orchestration. Liveness is only judged when the snapshot lists the
+        // collection at all; an absent list means "unknown", never "closed".
+        let live = self.inner.cache.as_ref().map(|cache| cache.snapshot());
+        let live_workspaces = live
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("workspaces"))
+            .and_then(Value::as_array)
+            .map(|workspaces| {
+                workspaces
+                    .iter()
+                    .filter_map(|workspace| {
+                        workspace
+                            .get("workspace_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| workspace.get("id").and_then(Value::as_str))
+                    })
+                    .collect::<HashSet<&str>>()
+            });
+        let live_panes = live
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("panes"))
+            .and_then(Value::as_array)
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter_map(|pane| pane.get("pane_id").and_then(Value::as_str))
+                    .collect::<HashSet<&str>>()
+            });
+        let bound_to_closed = |task: &&PromptTaskRecord| {
+            task.pane_id
+                .as_deref()
+                .zip(live_panes.as_ref())
+                .is_some_and(|(pane_id, live)| !live.contains(pane_id))
+                || task
+                    .workspace_id
+                    .as_deref()
+                    .zip(live_workspaces.as_ref())
+                    .is_some_and(|(workspace_id, live)| !live.contains(workspace_id))
+        };
         let escalation = task_escalation(
             tasks.iter().filter(|task| {
                 task_matches_scope(task, workspace_id, parent_target, parent_session_ref)
+                    && !bound_to_closed(task)
             }),
             self.now_ms(),
         );
@@ -2700,6 +2848,29 @@ impl PromptRegistry {
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
         store
             .operation_ledgers_by_phase(PROMPT_TASK_OPERATION_KIND, "active")?
+            .into_iter()
+            .map(|record| {
+                let mut task = decode_task_record(&record)?;
+                task.gate = store.open_decision_gate(&task.task_id)?;
+                Ok(task)
+            })
+            .collect()
+    }
+
+    /// Every terminal-phase task ledger, unbounded like `list_active_tasks`:
+    /// a target-scoped status read or a scoped bulk ack must consider every
+    /// receipt in its scope, not only the most recent 512. A receipt beyond
+    /// that window must never be reported as not-found or counted as already
+    /// acknowledged (#1005 review: unscanned receipts are not acked).
+    fn list_terminal_tasks(&self) -> Result<Vec<PromptTaskRecord>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(vec![]);
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        store
+            .operation_ledgers_by_phase(PROMPT_TASK_OPERATION_KIND, "terminal")?
             .into_iter()
             .map(|record| {
                 let mut task = decode_task_record(&record)?;
@@ -4223,6 +4394,17 @@ pub fn task_call_with_parent_session(
                 }
                 return registry.task_status_by_idempotency(key, target, caller_parent_session_ref);
             }
+            if params.get("task_id").is_none()
+                && let Some(target_value) = params.get("target")
+            {
+                let Some(target) = target_value.as_str() else {
+                    return invalid("target must be a string");
+                };
+                if target.is_empty() || target.len() > 256 {
+                    return invalid("target must be a non-empty string up to 256 bytes");
+                }
+                return registry.task_status_by_target(target, caller_parent_session_ref);
+            }
             let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
                 return invalid("task_id is required");
             };
@@ -4332,6 +4514,33 @@ pub fn task_call_with_parent_session(
                 };
                 let borrowed = task_ids.iter().map(String::as_str).collect::<Vec<_>>();
                 return registry.task_ack_many(&borrowed, caller_parent_session_ref);
+            }
+            if params.get("task_id").is_none() {
+                // Scoped bulk ack: at least one selector, no explicit ids.
+                let workspace_id = params.get("workspace_id").and_then(Value::as_str);
+                let target = params.get("target").and_then(Value::as_str);
+                let before_ms = params.get("before_ms").and_then(Value::as_u64);
+                if params.get("workspace_id").is_some() && workspace_id.is_none() {
+                    return invalid("workspace_id must be a string");
+                }
+                if params.get("target").is_some() && target.is_none() {
+                    return invalid("target must be a string");
+                }
+                if params.get("before_ms").is_some() && before_ms.is_none() {
+                    return invalid("before_ms must be an integer");
+                }
+                if workspace_id.is_some()
+                    || target.is_some()
+                    || before_ms.is_some()
+                    || caller_parent_session_ref.is_some()
+                {
+                    return registry.task_ack_scoped(
+                        workspace_id,
+                        target,
+                        before_ms,
+                        caller_parent_session_ref,
+                    );
+                }
             }
             let Some(task_id) = params.get("task_id").and_then(Value::as_str) else {
                 return invalid("task_id is required");
@@ -12228,6 +12437,344 @@ mod tests {
 
         drop(registry);
         remove_escalation_db(&db_path);
+    }
+
+    /// user parent | Given terminal receipts bound to a workspace and pane the
+    /// live snapshot no longer reports | When the inbox is read | Then closed
+    /// lanes produce no escalation signals while a live lane still does.
+    #[test]
+    fn escalation_ignores_receipts_of_closed_workspaces_and_panes() {
+        let (db_path, mut registry) = escalation_registry("closed-lanes");
+        Arc::get_mut(&mut registry.inner).unwrap().cache =
+            Some(Arc::new(EventCache::from_snapshot_for_test(json!({
+                "workspaces": [{"workspace_id": "w2"}],
+                "panes": [{"pane_id": "w2:p1", "workspace_id": "w2"}],
+            }))));
+        // Four receipts on the destroyed w1:w1:p1 lane would exhaust the repair
+        // budget if it were still live.
+        for index in 0..4 {
+            registry
+                .save_task(
+                    &escalation_task(
+                        &format!("dispatch:prompt:closed-{index}"),
+                        "child",
+                        PromptTaskLifecycle::Completed,
+                        1_000_u64 + index as u64,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let inbox = registry.task_inbox(None, None, None, false, false, 10);
+        assert!(
+            inbox["escalation"]["signals"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "closed workspace lane must not escalate: {}",
+            inbox["escalation"]
+        );
+
+        // A live lane still escalates.
+        for index in 0..4 {
+            let mut task = escalation_task(
+                &format!("dispatch:prompt:live-{index}"),
+                "live-child",
+                PromptTaskLifecycle::Completed,
+                1_000_u64 + index as u64,
+            );
+            task.pane_id = Some("w2:p1".to_owned());
+            task.workspace_id = Some("w2".to_owned());
+            registry.save_task(&task, None).unwrap();
+        }
+        let inbox = registry.task_inbox(None, None, None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["kind"], "repair_budget_exhausted");
+        assert_eq!(signals[0]["target"], "live-child");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user orchestrator | Given an unacknowledged terminal task holding a pane
+    /// plus an active task on another | When agent.task.status is queried with
+    /// `target` alone | Then it answers which task holds the pane, or the most
+    /// recent one, without an inbox page.
+    #[test]
+    fn task_status_by_target_reports_active_then_latest_task() {
+        let (db_path, registry) = task_registry("status-by-target");
+        let mut latest = escalation_task(
+            "dispatch:prompt:occupant",
+            "w9:p9",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        latest.pane_id = Some("w9:p9".to_owned());
+        registry.save_task(&latest, None).unwrap();
+        let older = escalation_task(
+            "dispatch:prompt:earlier",
+            "w9:p9",
+            PromptTaskLifecycle::Completed,
+            2_000,
+        );
+        registry.save_task(&older, None).unwrap();
+
+        // Latest task wins over older ones on the same target.
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            None,
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task_state"], "terminal");
+        assert_eq!(status["task"]["task_id"], latest.task_id);
+
+        // An active task on the same pane outranks the terminal one.
+        let mut active = escalation_task(
+            "dispatch:prompt:active",
+            "w9:p9",
+            PromptTaskLifecycle::Running,
+            500,
+        );
+        active.pane_id = Some("w9:p9".to_owned());
+        registry.save_task(&active, None).unwrap();
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            None,
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task_state"], "active");
+        assert_eq!(status["task"]["task_id"], active.task_id);
+
+        // Unknown target is a clean not-found, not a misleading task_id error.
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p99"}),
+            None,
+        );
+        assert_eq!(status["ok"], false);
+        assert_eq!(status["code"], "agent_task_not_found");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user orchestrator | Given a parent-scoped caller and tasks on the same
+    /// target owned by a different parent session | When agent.task.status is
+    /// queried with `target` alone | Then foreign-parent tasks stay invisible
+    /// and only the caller's own task is returned.
+    #[test]
+    fn task_status_by_target_scopes_to_caller_parent_session() {
+        let (db_path, registry) = task_registry("status-by-target-scope");
+        for (task_id, lifecycle, age_ms) in [
+            (
+                "dispatch:prompt:foreign-active",
+                PromptTaskLifecycle::Running,
+                100,
+            ),
+            (
+                "dispatch:prompt:foreign-terminal",
+                PromptTaskLifecycle::Completed,
+                50,
+            ),
+        ] {
+            let mut task = escalation_task(task_id, "w9:p9", lifecycle, age_ms);
+            task.pane_id = Some("w9:p9".to_owned());
+            task.parent_session_ref = Some("session:foreign".to_owned());
+            registry.save_task(&task, None).unwrap();
+        }
+
+        // A parent-scoped caller must not see another session's tasks here.
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            Some("session:caller"),
+        );
+        assert_eq!(status["ok"], false, "{status}");
+        assert_eq!(status["code"], "agent_task_not_found");
+
+        // The caller's own task on the same pane is still returned.
+        let mut own = escalation_task(
+            "dispatch:prompt:own",
+            "w9:p9",
+            PromptTaskLifecycle::Completed,
+            10,
+        );
+        own.pane_id = Some("w9:p9".to_owned());
+        own.parent_session_ref = Some("session:caller".to_owned());
+        registry.save_task(&own, None).unwrap();
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            Some("session:caller"),
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["task_id"], own.task_id);
+
+        // Unscoped callers keep the existing cross-session view.
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            None,
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["task_id"], "dispatch:prompt:foreign-active");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user orchestrator | Given hundreds of unacknowledged terminal receipts
+    /// across two workspaces | When agent.task.ack is called with a
+    /// workspace_id scope | Then only that workspace's receipts are acked in
+    /// one call.
+    #[test]
+    fn task_ack_scoped_acks_terminal_receipts_by_workspace() {
+        let (db_path, registry) = task_registry("ack-scope");
+        for index in 0..3 {
+            registry
+                .save_task(
+                    &escalation_task(
+                        &format!("dispatch:prompt:w1-{index}"),
+                        "child",
+                        PromptTaskLifecycle::Completed,
+                        100,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let mut other = escalation_task(
+            "dispatch:prompt:w2-0",
+            "child",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        other.workspace_id = Some("w2".to_owned());
+        registry.save_task(&other, None).unwrap();
+        let running = escalation_task(
+            "dispatch:prompt:running",
+            "child",
+            PromptTaskLifecycle::Running,
+            100,
+        );
+        registry.save_task(&running, None).unwrap();
+
+        let ack = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"workspace_id": "w1"}),
+            None,
+        );
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert_eq!(ack["acked"].as_array().unwrap().len(), 3);
+        for index in 0..3 {
+            let task_id = format!("dispatch:prompt:w1-{index}");
+            assert!(
+                ack["acked"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id == &task_id),
+                "expected {task_id} in {ack}"
+            );
+        }
+
+        // The other workspace and non-terminal tasks are untouched.
+        assert!(
+            registry.task_ack_scoped(Some("w2"), None, None, None)["acked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "dispatch:prompt:w2-0")
+        );
+        let leftovers = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"workspace_id": "w1"}),
+            None,
+        );
+        assert_eq!(leftovers["acked"].as_array().unwrap().len(), 0);
+
+        // Scoped selectors still reject non-string shapes.
+        let bad = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"target": 7}),
+            None,
+        );
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["code"], "invalid_params");
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user orchestrator | Given a terminal receipt pushed out of the recent
+    /// ledger window by hundreds of newer active tasks | When a scoped ack and
+    /// a target-scoped status read run | Then both still find that receipt —
+    /// an unscanned receipt is never counted as acknowledged or not-found.
+    #[test]
+    fn task_ack_scoped_and_status_reach_receipts_beyond_the_recent_window() {
+        let (db_path, registry) = task_registry("ack-scope-window");
+        let mut old = escalation_task(
+            "dispatch:prompt:w9-old",
+            "child",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        old.workspace_id = Some("w9".to_owned());
+        old.pane_id = Some("w9:p9".to_owned());
+        registry.save_task(&old, None).unwrap();
+        for index in 0..520 {
+            registry
+                .save_task(
+                    &escalation_task(
+                        &format!("dispatch:prompt:active-{index}"),
+                        "child",
+                        PromptTaskLifecycle::Running,
+                        1,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let ack = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_ACK_METHOD,
+            &json!({"workspace_id": "w9"}),
+            None,
+        );
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(
+            ack["acked"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|id| id == "dispatch:prompt:w9-old"),
+            "expected w9-old in {ack}"
+        );
+
+        let status = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_STATUS_METHOD,
+            &json!({"target": "w9:p9"}),
+            None,
+        );
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(status["task"]["task_id"], "dispatch:prompt:w9-old");
+
+        drop(registry);
+        remove_task_db(&db_path);
     }
 
     /// user parent | Given a lane whose newest terminal tasks are failed and

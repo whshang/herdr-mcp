@@ -9,6 +9,20 @@ use std::os::unix::process::CommandExt;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATE_GRACE: Duration = Duration::from_millis(250);
+/// Bounded exponential micro-backoff for child exit polling. Short commands
+/// finish within the first few sub-millisecond steps instead of paying a fixed
+/// 10ms floor; long-running children settle at the `POLL_INTERVAL` cap.
+const POLL_BACKOFF: [Duration; 6] = [
+    Duration::from_micros(250),
+    Duration::from_micros(500),
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(5),
+    POLL_INTERVAL,
+];
+/// A child reaped by its spawning call within this window cannot outlive a
+/// daemon restart, so it is never written to the on-disk orphan registry.
+const REGISTRATION_GRACE: Duration = Duration::from_millis(25);
 
 #[cfg(target_os = "macos")]
 const REGISTRY_ENV: &str = "HERDR_MCP_CHILD_REGISTRY";
@@ -47,15 +61,6 @@ pub(crate) fn run_bounded_output(
     timeout: Duration,
     max_bytes: usize,
 ) -> std::io::Result<Option<BoundedOutput>> {
-    run_bounded_output_inner(command, timeout, max_bytes, true)
-}
-
-fn run_bounded_output_inner(
-    command: &mut Command,
-    timeout: Duration,
-    max_bytes: usize,
-    track: bool,
-) -> std::io::Result<Option<BoundedOutput>> {
     let kind = command
         .get_program()
         .to_string_lossy()
@@ -63,18 +68,65 @@ fn run_bounded_output_inner(
         .next()
         .unwrap_or("child")
         .to_owned();
+    run_bounded_output_inner(
+        command,
+        timeout,
+        max_bytes,
+        Some((REGISTRATION_GRACE, |child: &Child| {
+            register_owned_child(&kind, child)
+        })),
+    )
+}
+
+/// Spawn `command` and collect bounded output. When `registration` is set,
+/// the child is recorded as an owned orphan candidate only if it is still
+/// running after the grace window, so transient commands never pay for the
+/// identity probe or the registry lock and rewrite.
+fn run_bounded_output_inner<R>(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+    registration: Option<(Duration, impl FnOnce(&Child) -> R)>,
+) -> std::io::Result<Option<BoundedOutput>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_process_group(command);
+    let started = Instant::now();
     let mut child = command.spawn()?;
-    let _registration = track.then(|| register_owned_child(&kind, &child));
     let mut stdout = child.stdout.take().expect("piped stdout must be present");
     let mut stderr = child.stderr.take().expect("piped stderr must be present");
     let stdout_reader = thread::spawn(move || read_capped_and_drain(&mut stdout, max_bytes));
     let stderr_reader = thread::spawn(move || read_capped_and_drain(&mut stderr, max_bytes));
-    let status = wait_bounded(&mut child, timeout)?;
+    let wait = match registration {
+        Some((grace, register)) => wait_with_deferred_registration(
+            &SystemClock,
+            &mut child,
+            started,
+            timeout,
+            grace,
+            |child| child.try_wait(),
+            register,
+        ),
+        None => {
+            let mut backoff = PollBackoff::default();
+            poll_until(&SystemClock, started + timeout, &mut backoff, || {
+                child.try_wait()
+            })
+            .map(|status| (status, None))
+        }
+    };
+    let (status, _registration) = match wait {
+        Ok(result) => result,
+        Err(error) => {
+            terminate_and_reap(&mut child);
+            return Err(error);
+        }
+    };
+    if status.is_none() {
+        terminate_and_reap(&mut child);
+    }
     let (stdout, stdout_truncated) = stdout_reader.join().unwrap_or_default();
     let (stderr, stderr_truncated) = stderr_reader.join().unwrap_or_default();
     Ok(status.map(|status| BoundedOutput {
@@ -113,17 +165,93 @@ pub(crate) fn wait_bounded(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if started.elapsed() >= timeout {
+    let deadline = Instant::now() + timeout;
+    let mut backoff = PollBackoff::default();
+    match poll_until(&SystemClock, deadline, &mut backoff, || child.try_wait()) {
+        Ok(Some(status)) => Ok(Some(status)),
+        Ok(None) => {
             terminate_and_reap(child);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+trait PollClock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemClock;
+
+impl PollClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+#[derive(Debug, Default)]
+struct PollBackoff {
+    step: usize,
+}
+
+impl PollBackoff {
+    fn next_delay(&mut self) -> Duration {
+        let delay = POLL_BACKOFF[self.step];
+        self.step = (self.step + 1).min(POLL_BACKOFF.len() - 1);
+        delay
+    }
+}
+
+/// Poll until `poll` yields a value or `deadline` passes. The first poll is
+/// immediate; each later sleep follows `POLL_BACKOFF`, truncated so the loop
+/// never sleeps past the deadline.
+fn poll_until<T>(
+    clock: &impl PollClock,
+    deadline: Instant,
+    backoff: &mut PollBackoff,
+    mut poll: impl FnMut() -> std::io::Result<Option<T>>,
+) -> std::io::Result<Option<T>> {
+    loop {
+        if let Some(value) = poll()? {
+            return Ok(Some(value));
+        }
+        let now = clock.now();
+        if now >= deadline {
             return Ok(None);
         }
-        thread::sleep(POLL_INTERVAL);
+        clock.sleep(backoff.next_delay().min(deadline - now));
     }
+}
+
+/// Wait for `state` to finish within `timeout` of `started`, invoking
+/// `register` once only if it is still running after `grace`. The returned
+/// registration must outlive any termination of the timed-out child.
+fn wait_with_deferred_registration<S, T, R>(
+    clock: &impl PollClock,
+    state: &mut S,
+    started: Instant,
+    timeout: Duration,
+    grace: Duration,
+    mut poll: impl FnMut(&mut S) -> std::io::Result<Option<T>>,
+    register: impl FnOnce(&S) -> R,
+) -> std::io::Result<(Option<T>, Option<R>)> {
+    let deadline = started + timeout;
+    let mut backoff = PollBackoff::default();
+    let grace_deadline = started + grace.min(timeout);
+    if let Some(value) = poll_until(clock, grace_deadline, &mut backoff, || poll(state))? {
+        return Ok((Some(value), None));
+    }
+    if clock.now() >= deadline {
+        return Ok((None, None));
+    }
+    let registration = register(state);
+    let value = poll_until(clock, deadline, &mut backoff, || poll(state))?;
+    Ok((value, Some(registration)))
 }
 
 /// Terminate only the exact process group created for this child, then reap the
@@ -469,10 +597,14 @@ mod registry {
             "-o",
             "comm=",
         ]);
-        let output =
-            run_bounded_output_inner(&mut command, Duration::from_secs(1), 16 * 1024, false)
-                .ok()
-                .flatten()?;
+        let output = run_bounded_output_inner(
+            &mut command,
+            Duration::from_secs(1),
+            16 * 1024,
+            None::<(Duration, fn(&Child))>,
+        )
+        .ok()
+        .flatten()?;
         if !output.status.success() || output.truncated {
             return None;
         }
@@ -756,6 +888,37 @@ print(p.pid, flush=True)
             TEST_REGISTRY_DIR.with(|slot| *slot.borrow_mut() = None);
             fs::remove_dir_all(root).unwrap();
         }
+
+        #[test]
+        fn transient_command_skips_registry_and_long_command_registers() {
+            let root = env::temp_dir().join(format!(
+                "herdr-mcp-child-registry-defer-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            TEST_REGISTRY_DIR.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+            let registry = root.join(REGISTRY_FILE);
+
+            let mut command = Command::new("/usr/bin/true");
+            let output = run_bounded_output(&mut command, Duration::from_secs(5), 1024)
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(!registry.exists(), "transient child touched the registry");
+
+            let mut command = Command::new("/bin/sleep");
+            command.arg("0.3");
+            let output = run_bounded_output(&mut command, Duration::from_secs(5), 1024)
+                .unwrap()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(registry.exists(), "long child was never registered");
+            assert!(load_registry().unwrap().records.is_empty());
+
+            TEST_REGISTRY_DIR.with(|slot| *slot.borrow_mut() = None);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
 
@@ -808,6 +971,179 @@ pub(crate) fn doctor_line() -> String {
     }
 }
 
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    struct FakeClock {
+        now: Cell<Instant>,
+        sleeps: RefCell<Vec<Duration>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Cell::new(Instant::now()),
+                sleeps: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn sleeps(&self) -> Vec<Duration> {
+            self.sleeps.borrow().clone()
+        }
+    }
+
+    impl PollClock for FakeClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.borrow_mut().push(duration);
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
+    fn us(value: u64) -> Duration {
+        Duration::from_micros(value)
+    }
+
+    #[test]
+    fn polling_backs_off_exponentially_and_never_sleeps_past_the_deadline() {
+        let clock = FakeClock::new();
+        let deadline = clock.now() + Duration::from_millis(30);
+        let mut backoff = PollBackoff::default();
+        let result =
+            poll_until(&clock, deadline, &mut backoff, || Ok(None::<()>)).expect("poll result");
+        assert!(result.is_none());
+        assert_eq!(
+            clock.sleeps(),
+            vec![
+                us(250),
+                us(500),
+                us(1_000),
+                us(2_000),
+                us(5_000),
+                us(10_000),
+                us(10_000),
+                us(1_250),
+            ]
+        );
+        assert_eq!(clock.now(), deadline);
+    }
+
+    #[test]
+    fn short_child_finishes_without_a_ten_millisecond_floor_or_registration() {
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let mut polls = 0_u32;
+        let mut registrations = 0_u32;
+        let (status, registration) = wait_with_deferred_registration(
+            &clock,
+            &mut polls,
+            started,
+            Duration::from_secs(5),
+            REGISTRATION_GRACE,
+            |polls| {
+                *polls += 1;
+                Ok((*polls == 3).then_some("exited"))
+            },
+            |_| registrations += 1,
+        )
+        .expect("wait result");
+        assert_eq!(status, Some("exited"));
+        assert!(registration.is_none());
+        assert_eq!(registrations, 0);
+        assert_eq!(clock.now() - started, us(750));
+    }
+
+    #[test]
+    fn long_child_is_registered_once_after_the_grace_window() {
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let registered_at = Cell::new(None);
+        let exit_at = started + Duration::from_millis(60);
+        let (status, registration) = wait_with_deferred_registration(
+            &clock,
+            &mut (),
+            started,
+            Duration::from_secs(5),
+            REGISTRATION_GRACE,
+            |_| Ok((clock.now() >= exit_at).then_some("exited")),
+            |_| {
+                assert!(registered_at.get().is_none(), "registered twice");
+                registered_at.set(Some(clock.now()));
+                "registration"
+            },
+        )
+        .expect("wait result");
+        assert_eq!(status, Some("exited"));
+        assert_eq!(registration, Some("registration"));
+        assert_eq!(registered_at.get(), Some(started + REGISTRATION_GRACE));
+        assert!(clock.sleeps().iter().all(|sleep| *sleep <= POLL_INTERVAL));
+    }
+
+    #[test]
+    fn timeout_inside_the_grace_window_skips_registration() {
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let mut registrations = 0_u32;
+        let (status, registration) = wait_with_deferred_registration(
+            &clock,
+            &mut (),
+            started,
+            Duration::from_millis(5),
+            REGISTRATION_GRACE,
+            |_| Ok(None::<()>),
+            |_| registrations += 1,
+        )
+        .expect("wait result");
+        assert!(status.is_none());
+        assert!(registration.is_none());
+        assert_eq!(registrations, 0);
+        assert_eq!(clock.now(), started + Duration::from_millis(5));
+    }
+
+    #[test]
+    fn timeout_after_registration_keeps_the_registration_for_cleanup() {
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let (status, registration) = wait_with_deferred_registration(
+            &clock,
+            &mut (),
+            started,
+            Duration::from_millis(100),
+            REGISTRATION_GRACE,
+            |_| Ok(None::<()>),
+            |_| "registration",
+        )
+        .expect("wait result");
+        assert!(status.is_none());
+        assert_eq!(registration, Some("registration"));
+        assert_eq!(clock.now(), started + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn poll_error_is_returned_without_registering() {
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let mut registrations = 0_u32;
+        let error = wait_with_deferred_registration(
+            &clock,
+            &mut (),
+            started,
+            Duration::from_secs(1),
+            REGISTRATION_GRACE,
+            |_| Err::<Option<()>, _>(std::io::Error::other("wait failed")),
+            |_| registrations += 1,
+        )
+        .expect_err("poll error must propagate");
+        assert_eq!(error.to_string(), "wait failed");
+        assert_eq!(registrations, 0);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -840,5 +1176,73 @@ mod tests {
         let status = wait_bounded(&mut child, Duration::from_millis(20)).unwrap();
         assert!(status.is_none());
         assert!(unsafe { libc::kill(pid as i32, 0) } != 0);
+    }
+
+    fn run_counting_registrations(
+        script: &str,
+        timeout: Duration,
+        grace: Duration,
+    ) -> (Option<BoundedOutput>, Vec<u32>) {
+        let registered = std::cell::RefCell::new(Vec::new());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let output = run_bounded_output_inner(
+            &mut command,
+            timeout,
+            1024,
+            Some((grace, |child: &Child| {
+                registered.borrow_mut().push(child.id());
+            })),
+        )
+        .unwrap();
+        (output, registered.into_inner())
+    }
+
+    #[test]
+    fn transient_child_exiting_within_grace_is_never_registered() {
+        let (output, registered) = run_counting_registrations(
+            "printf ok",
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let output = output.expect("short child must finish");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok");
+        assert!(registered.is_empty(), "registered={registered:?}");
+    }
+
+    #[test]
+    fn long_child_is_registered_while_running_and_output_is_kept() {
+        let (output, registered) = run_counting_registrations(
+            "sleep 0.3; printf done",
+            Duration::from_secs(10),
+            Duration::from_millis(25),
+        );
+        let output = output.expect("long child must finish before timeout");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done");
+        assert_eq!(registered.len(), 1, "registered={registered:?}");
+    }
+
+    #[test]
+    fn registered_child_that_times_out_is_terminated_with_its_group() {
+        let (output, registered) = run_counting_registrations(
+            "sleep 30 & wait",
+            Duration::from_millis(200),
+            Duration::from_millis(25),
+        );
+        assert!(output.is_none());
+        let [pid] = registered[..] else {
+            panic!("registered={registered:?}");
+        };
+        // The orphaned grandchild is reaped by init asynchronously.
+        let group_gone = (0..100).any(|_| {
+            let gone = unsafe { libc::kill(-(pid as i32), 0) } != 0;
+            if !gone {
+                thread::sleep(Duration::from_millis(10));
+            }
+            gone
+        });
+        assert!(group_gone, "process group {pid} still has members");
     }
 }
