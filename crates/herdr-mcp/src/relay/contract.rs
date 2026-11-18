@@ -196,12 +196,12 @@ mod tests {
     fn current_runtime_exec_contract_hash_is_pinned() {
         let catalog = crate::contract::tool_catalog().expect("embedded current runtime tools");
         let identity = crate::contract::identity().expect("current runtime identity");
-        assert_eq!(identity.epoch, 6);
+        assert_eq!(identity.epoch, 7);
         assert_eq!(compute_contract_hash(&catalog).unwrap(), identity.hash);
         assert!(verify_contract_hash(&identity.hash, &catalog));
         assert_eq!(
             identity.hash,
-            "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e"
+            "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1"
         );
     }
 
@@ -210,12 +210,12 @@ mod tests {
         let catalog =
             crate::contract::previous_tool_catalog().expect("embedded previous runtime tools");
         let identity = crate::contract::previous_identity().expect("previous runtime identity");
-        assert_eq!(identity.epoch, 5);
+        assert_eq!(identity.epoch, 6);
         assert_eq!(compute_contract_hash(&catalog).unwrap(), identity.hash);
         assert!(verify_contract_hash(&identity.hash, &catalog));
         assert_eq!(
             identity.hash,
-            "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
+            "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e"
         );
     }
 }

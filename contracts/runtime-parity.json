@@ -12,8 +12,8 @@
   "openai_discover_extra_versions": [
     "2026-07-28"
   ],
-  "contract_epoch": 6,
-  "contract_hash": "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e",
+  "contract_epoch": 7,
+  "contract_hash": "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1",
   "tool_count": 18,
   "stateless_handshake_sse_methods": [
     "initialize",

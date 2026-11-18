@@ -19,6 +19,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const UTILITY_LABEL: &str = "herdr-mcp:utility";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// Default synchronous read window for a `herdr_exec` completion/timeout
+/// result (the head of the merged output buffer). `max_output_bytes` overrides
+/// it per call, capped at [`EXEC_MAX_OUTPUT_BYTES_CAP`].
+const EXEC_OUTPUT_READ_DEFAULT: usize = 65_536;
+/// Hard cap for a caller-supplied `herdr_exec.max_output_bytes`.
+const EXEC_MAX_OUTPUT_BYTES_CAP: u64 = 4 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -497,6 +503,12 @@ pub fn run_durable(
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
+    let max_output_bytes =
+        match optional_u64(args, "max_output_bytes", 1, EXEC_MAX_OUTPUT_BYTES_CAP) {
+            Ok(value) => usize::try_from(value.unwrap_or(EXEC_OUTPUT_READ_DEFAULT as u64))
+                .unwrap_or(EXEC_OUTPUT_READ_DEFAULT),
+            Err(error) => return error,
+        };
     let Some(workspace) = resolve_workspace(snapshot, workspace_target) else {
         return pre_start_rejection(json!({
             "ok": false,
@@ -618,6 +630,7 @@ pub fn run_durable(
                     (&workspace.id, &effective_root),
                     &command,
                     timeout_ms,
+                    max_output_bytes,
                     &working,
                 )
             } else {
@@ -628,6 +641,7 @@ pub fn run_durable(
                     (&workspace.id, &effective_root),
                     &command,
                     timeout_ms,
+                    max_output_bytes,
                     &working,
                 )
             };
@@ -662,6 +676,7 @@ pub fn run_durable(
         &invocation,
         &command,
         timeout_ms,
+        max_output_bytes,
         &working,
     );
     projects::invalidate_git_status_cache(&effective_root);
@@ -882,6 +897,7 @@ fn run_oneshot_readonly(
     target: (&str, &Path),
     command: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     working: &[Value],
 ) -> Value {
     let (workspace_id, effective_root) = target;
@@ -914,7 +930,7 @@ fn run_oneshot_readonly(
     };
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let read = registry.read(&session_id, "both", 0, 65_536);
+        let read = registry.read(&session_id, "both", 0, max_output_bytes);
         if read.get("phase").and_then(Value::as_str) == Some("completed") {
             let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
             let ok = exit_code.as_i64() == Some(0);
@@ -951,6 +967,7 @@ fn run_oneshot_readonly(
                 "truncated",
                 "compacted",
                 "counts",
+                "bytes_total",
                 "pane_reclaimed",
                 "pane_reclaim_error",
             ] {
@@ -1059,6 +1076,7 @@ fn utility_owned_wait_budget(timeout_ms: u64) -> Duration {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_unix_durable(
     client: &HerdrClient,
     snapshot: &Value,
@@ -1066,6 +1084,7 @@ fn run_unix_durable(
     target: (&str, &Path),
     command: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     working: &[Value],
 ) -> Value {
     let (workspace_id, effective_root) = target;
@@ -1124,7 +1143,7 @@ fn run_unix_durable(
     drop(submission_lock);
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let read = registry.read(session_id, "both", 0, 65_536);
+        let read = registry.read(session_id, "both", 0, max_output_bytes);
         let completed = read.get("phase").and_then(Value::as_str) == Some("completed");
         if completed {
             let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
@@ -1155,6 +1174,9 @@ fn run_unix_durable(
             }
             if let Some(truncated) = read.get("truncated") {
                 result.insert("truncated".to_owned(), truncated.clone());
+            }
+            if let Some(bytes_total) = read.get("bytes_total") {
+                result.insert("bytes_total".to_owned(), bytes_total.clone());
             }
             if let Some(compacted) = read.get("compacted") {
                 result.insert("compacted".to_owned(), compacted.clone());
@@ -1217,6 +1239,7 @@ fn run_native_durable(
     invocation: &ExecInvocation,
     command: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     working: &[Value],
 ) -> Value {
     let (workspace_id, effective_root) = target;
@@ -1265,7 +1288,7 @@ fn run_native_durable(
     let session_id = session_id.to_owned();
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let read = registry.read(&session_id, "both", 0, 65_536);
+        let read = registry.read(&session_id, "both", 0, max_output_bytes);
         if read.get("phase").and_then(Value::as_str) == Some("completed") {
             return native_completed_result(
                 registry,
@@ -1321,7 +1344,14 @@ fn native_completed_result(
         "project_root".to_owned(),
         json!(effective_root.to_string_lossy()),
     );
-    for key in ["progress", "truncated", "compacted", "counts", "signal"] {
+    for key in [
+        "progress",
+        "truncated",
+        "compacted",
+        "counts",
+        "bytes_total",
+        "signal",
+    ] {
         if let Some(value) = read.get(key) {
             result.insert(key.to_owned(), value.clone());
         }
@@ -2355,6 +2385,7 @@ mod tests {
                 (workspace_id, &base),
                 command,
                 15_000,
+                EXEC_OUTPUT_READ_DEFAULT,
                 &[],
             )
         };
@@ -3472,6 +3503,50 @@ mod tests {
         assert_eq!(read["ok"], true);
         assert_eq!(read["phase"], "running");
         assert_eq!(registry.kill(session_id)["killed"], true);
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// `max_output_bytes` caps only the synchronous output window; `bytes_total`
+    /// and `herdr_exec_read` still expose the untruncated buffer.
+    #[cfg(unix)]
+    #[test]
+    fn native_max_output_bytes_caps_the_sync_read_window() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &test_store(),
+            &json!({
+                "workspace": "w1",
+                "command": "printf '0123456789abcdefghijklmnopqrstuvwxyz'",
+                "timeout_ms": 15_000,
+                "max_output_bytes": 10,
+            }),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["output"], "0123456789");
+        assert_eq!(result["bytes_total"], 36);
+        let session_id = result["session_id"].as_str().unwrap();
+        let resumed = registry.read(session_id, "both", 0, 65_536);
+        assert_eq!(resumed["text"], "0123456789abcdefghijklmnopqrstuvwxyz");
+
+        // Bounds: 0 and over-cap values are invalid_params, non-integers too.
+        for args in [
+            json!({"workspace": "w1", "command": "true", "max_output_bytes": 0}),
+            json!({"workspace": "w1", "command": "true", "max_output_bytes": 4_194_305}),
+            json!({"workspace": "w1", "command": "true", "max_output_bytes": "10"}),
+        ] {
+            let refused = run_durable(&client, &snapshot, &registry, &test_store(), &args);
+            assert_eq!(refused["code"], "invalid_params", "{refused}");
+        }
         drop(registry);
         let _ = fs::remove_dir_all(base);
     }

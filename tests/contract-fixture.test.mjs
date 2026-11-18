@@ -27,7 +27,7 @@ test("epoch2 JSON fixture is the language-independent public contract source", a
 
 test("runtime parity fixture pins the shared Node/Rust wire invariants", async () => {
   const parity = JSON.parse(await readFile(new URL("contracts/runtime-parity.json", root), "utf8"));
-  const contract = JSON.parse(await readFile(new URL("contracts/runtime-exec-v6.json", root), "utf8"));
+  const contract = JSON.parse(await readFile(new URL("contracts/runtime-exec-v7.json", root), "utf8"));
   assert.equal(parity.schema_version, 1);
   assert.equal(parity.server_name, "herdr-mcp");
   assert.equal(parity.sdk_wire_protocol, "2025-11-25");

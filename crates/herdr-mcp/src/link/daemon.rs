@@ -36,22 +36,23 @@ use super::transport::{
     TransportConfig,
 };
 
-/// Current runtime execution contract epoch 6, shaped from the frozen epoch-2
-/// catalog by the `contracts/runtime-exec-v6.json` descriptor (`herdr_exec`
-/// epoch-5 metadata plus the widened `herdr_call` params union).
-pub const PUBLIC_CONTRACT_EPOCH: u64 = 6;
+/// Current runtime execution contract epoch 7, shaped from the frozen epoch-2
+/// catalog by the `contracts/runtime-exec-v7.json` descriptor (epoch-6 content
+/// plus `herdr_inspect` filters/view, `herdr_exec` `max_output_bytes`, and
+/// `herdr_fs_read` `reads[]`).
+pub const PUBLIC_CONTRACT_EPOCH: u64 = 7;
 pub const PUBLIC_CONTRACT_HASH: &str =
-    "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e";
-/// Immediately previous runtime execution contract (epoch 5, `herdr_exec`
-/// opt-in idempotency metadata). The current Rust binary never *runs* it —
+    "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1";
+/// Immediately previous runtime execution contract (epoch 6, `herdr_call`
+/// params union). The current Rust binary never *runs* it —
 /// rollback activates the old binary — but Edge/Relay must keep accepting an
-/// epoch-5 workstation hello during the rollout window, and a new Link may
+/// epoch-6 workstation hello during the rollout window, and a new Link may
 /// still probe an Edge that has not yet been redeployed.
-pub const PREVIOUS_PUBLIC_CONTRACT_EPOCH: u64 = 5;
+pub const PREVIOUS_PUBLIC_CONTRACT_EPOCH: u64 = 6;
 pub const PREVIOUS_PUBLIC_CONTRACT_HASH: &str =
-    "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030";
+    "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e";
 /// Frozen epoch-2 catalog identity, the second rollback baseline that Edge and
-/// Relay keep accepting while an epoch-6 rollout is in flight.
+/// Relay keep accepting while an epoch-7 rollout is in flight.
 pub const LEGACY_EPOCH2_CONTRACT_HASH: &str =
     "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8";
 pub const LEGACY_EPOCH1_CONTRACT_HASH: &str =
@@ -837,7 +838,7 @@ mod tests {
             .unwrap()
             .block_on(run_link_daemon(cfg))
             .unwrap_err();
-        assert!(error.contains("requires contract epoch 6"));
+        assert!(error.contains("requires contract epoch 7"));
     }
 
     #[tokio::test]

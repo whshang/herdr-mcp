@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "base_contract": "contracts/epoch2.json",
+  "contract_epoch": 7,
+  "contract_hash": "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1",
+  "tool_count": 18,
+  "shapes": [
+    {
+      "tool": "herdr_exec",
+      "set": {
+        "description": "Run a non-interactive command on the workstation inside a selected project root of the target workspace (explicit project_root, or the workspace's single current project root) and return its bounded result synchronously: a durable native exec session is started, the call waits up to timeout_ms, then returns exit_code, effective_cwd/project_root, output, and execution evidence (execution.started, execution.completed, execution.exit_code, plus failure_origin when the call fails). Ordinary roots use the native session backend, independent of a pane's foreground cwd. When the workspace has multiple project roots and project_root is omitted, the result reports project_root_required together with the candidate roots. Authorization and allowed write roots follow HERDR_MCP_READONLY / HERDR_MCP_WRITE_ROOTS, and a working agent in the project produces an agent_working result unless confirm_busy=true is passed, which sets warnings.working. Command output is returned as the child process produced it; the herdr_fs_read, herdr_fs_list and herdr_fs_grep tools additionally exclude secret-like paths. On timeout the command keeps running as the returned session_id, partial output is returned with ok:false and code:exec_timeout, and the same session continues through herdr_exec_read. macOS user-protected roots (Documents/Desktop/Downloads) use the persistent visible utility pane (label 'herdr-mcp:utility') so execution stays under the TCC-authorized Herdr terminal host. Optional opt-in durability: passing intent together with idempotency_key reserves the request in the durable operations ledger before the command is delivered, so the same key returns the recorded original result with idempotent_replay=true instead of executing again; the same key with a different request reports idempotency_key_conflict and nothing is delivered; a still-pending reservation reports the request as unsettled and no second delivery happens. Results carrying intent or idempotency_key always expose intent, idempotency_persisted, idempotent_replay and safe_retry_mode. A command whose synchronous submission was recorded keeps that record even when execution is still running (phase:running, code:exec_timeout), so replay returns the same session_id and the caller resumes through herdr_exec_read. Calls without intent or idempotency_key behave exactly as the legacy request. max_output_bytes optionally caps the synchronous output/partial_output byte read (default 65536, cap 4194304); bytes_total and next_offset still expose the untruncated size."
+      },
+      "inputSchema_properties": {
+        "intent": {
+          "type": "string",
+          "enum": [
+            "read_only",
+            "idempotent_write",
+            "non_idempotent_write"
+          ],
+          "description": "Optional declared effect of this command: read_only, idempotent_write, or non_idempotent_write. A write intent requires idempotency_key; read_only may omit it, in which case nothing is reserved. Supplying idempotency_key always requires an intent. Checked before execution, so an unsupported combination returns invalid_params without running the command. Results carrying intent expose intent, idempotency_persisted, idempotent_replay and safe_retry_mode. Omitting intent keeps the legacy behavior and performs no durable reservation."
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Optional caller-chosen key (1-256 characters) that binds this request to one durable operation. A supplied key always requires an intent. The first request for a key delivers the command and records its synchronous result; repeating the same key returns that recorded result with idempotent_replay=true and never delivers again. A different request under the same key is refused with idempotency_key_conflict."
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304,
+          "description": "Optional byte cap for the synchronous output/partial_output payload (default 65536, cap 4194304). Larger outputs stay readable through herdr_exec_read; bytes_total and next_offset report the untruncated size."
+        }
+      }
+    },
+    {
+      "tool": "herdr_call",
+      "set": {
+        "description": "Before any agent operation (herdr_prompt or agent.* via herdr_call): call herdr_skill once per session first. Generic passthrough to the herdr socket API, VALIDATED against the live schema (schema reflected from the installed herdr binary, 60s cache). Params are checked before sending: missing required / wrong type / wrong enum -> invalid_params error (no socket call); unknown params -> warnings. For unknown methods use herdr_methods; for agent.* methods (agent.start, agent.prompt, pane.split, …) herdr_skill is mandatory once per session. prefer explicit pane_id/workspace_id over bare names. For agent.prompt prefer herdr_prompt (fire-and-forget + idempotency_key + delivery evidence); do not pass wait on mutations unless you intentionally want submit+wait. Never blind-retry a mutating call after failure — delivery may be uncertain; verify with herdr_inspect / herdr_since first. Status-wait timeouts are failure agent_status_wait_timeout (not herdr_transport). params accepts a JSON object directly (preferred) or a JSON object string for older clients."
+      },
+      "inputSchema_properties": {
+        "params": {
+          "description": "Method arguments as a JSON object (preferred) or a JSON object string; omit for {}",
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tool": "herdr_inspect",
+      "set": {
+        "description": "Check herdr connection and list workspaces (with cwd), tabs, panes, and agents in one call. Typical session start: herdr_inspect → herdr_skill (read before any agent op) → work. Also returns workstation_info: default_cwd hints, server/build, readonly/write_roots, agent_skill pointer (call herdr_skill for latest upstream SKILL.md), and a short exec_environment summary (PATH binaries relevant to local coding). Agents come from the shared SnapshotCache (live events + 30s snapshot fallback) and carry started_at + last_activity_at. If session.snapshot blips (TaskGroup), falls back to workspace.list / pane.list / agent.list and sets warnings[] — do not treat that as a repo blocker; keep using herdr_fs_* / herdr_git / herdr_exec. YOU (web) are the planner/orchestrator. Prefer herdr_fs_* / herdr_exec / herdr_git before any herdr_prompt. Agent lists soft-hide expensive kinds (Claude/OMP/Codex); only allowlisted workers (pi, cline, opencode, anti) and auditors (droid, grok) appear — override with HERDR_MCP_AGENT_ALLOW. herdr_prompt by known name/pane_id is NOT blocked. Prefer explicit pane_id/workspace_id from this view. Optional: workspace filters workspaces/panes/agents/projects to one workspace_id or label; since_cursor (a herdr_since cursor) embeds the since-digest for that cursor in the response's since field; view \"compact\" returns identities and statuses only (default \"full\")."
+      },
+      "inputSchema_properties": {
+        "workspace": {
+          "type": "string",
+          "description": "Optional: restrict the view to this workspace_id or label"
+        },
+        "since_cursor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Optional herdr_since cursor: when given, the response embeds the since-digest for that cursor in its since field"
+        },
+        "view": {
+          "type": "string",
+          "enum": [
+            "full",
+            "compact"
+          ],
+          "default": "full",
+          "description": "Optional view: 'compact' returns workspace/pane/agent/project identities and statuses without the verbose detail sections; omitted or 'full' keeps the full view"
+        }
+      }
+    },
+    {
+      "tool": "herdr_fs_read",
+      "set": {
+        "description": "PREFERRED way to read project source on the workstation. Reads a file from a MANAGED (git) project root (remote-workstation layer — the client cannot reach these files otherwise). Do not use herdr_prompt / omp / agent.read for ordinary file IO. Gates: path must sit inside a git-backed project root from the live snapshot ($HOME / non-git roots refused); secret-ish files (.env*, *.pem, id_rsa*, *.key, .git/config, *secret*/*token*/*credential*) denied; budget defaults to 200 lines / 16KB — raise explicitly (cap 256KB). Diff-sized reads are cheap; whole-source reads are not. Batch mode: pass reads[] of {path, start_line, end_line, max_bytes} — every entry shares the single-file parameter names, the managed-root and secret gates, and its own line/byte budget; at least one of path or reads is required and each entry reports its own ok/result.",
+        "required": []
+      },
+      "required": [],
+      "inputSchema_properties": {
+        "reads": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "description": "Optional batch reads; each entry uses the same path/start_line/end_line/max_bytes parameters and gates as the single-file mode",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Absolute file path inside a managed project root"
+              },
+              "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 262144
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    }
+  ]
+}
