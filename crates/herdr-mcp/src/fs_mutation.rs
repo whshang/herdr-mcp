@@ -188,6 +188,7 @@ pub(crate) fn write_bytes(
             message,
         );
     }
+    projects::invalidate_git_status_cache(&target.root);
     success_with_working(
         json!({
             "ok": true,

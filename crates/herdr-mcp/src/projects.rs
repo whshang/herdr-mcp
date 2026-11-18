@@ -4,15 +4,44 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GIT_STATUS_TIMEOUT: Duration = Duration::from_millis(750);
 const GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
+const GIT_STATUS_CACHE_TTL: Duration = Duration::from_millis(250);
+
+struct GitStatusCacheEntry {
+    expires_at: Instant,
+    value: Option<GitStatus>,
+}
+
+#[derive(Default)]
+struct GitStatusCacheState {
+    entries: HashMap<PathBuf, GitStatusCacheEntry>,
+    in_flight: HashMap<PathBuf, Arc<(Mutex<bool>, Condvar)>>,
+    generation: u64,
+}
+
+static GIT_STATUS_CACHE: OnceLock<Mutex<GitStatusCacheState>> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
     static DERIVE_ROUTING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+static GIT_STATUS_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_git_status_probe_count() {
+    GIT_STATUS_PROBES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn git_status_probe_count() -> usize {
+    GIT_STATUS_PROBES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -265,7 +294,7 @@ fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
 
 fn git_toplevel_tcc_safe(snapshot: &Value, cwd: &Path) -> Option<PathBuf> {
     if should_use_broker_for_toplevel(snapshot, cwd) {
-        return broker_git_status(snapshot, cwd).map(|status| status.root);
+        return cached_git_status(snapshot, cwd).map(|status| status.root);
     }
     git_toplevel(cwd)
 }
@@ -289,7 +318,7 @@ fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStat
             .map(|root| {
                 let root = root.clone();
                 scope.spawn(move || {
-                    let status = git_status(snapshot, &root);
+                    let status = cached_git_status(snapshot, &root);
                     (root, status)
                 })
             })
@@ -302,7 +331,87 @@ fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStat
     })
 }
 
-fn git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+    let key = root.to_path_buf();
+    loop {
+        let cache = GIT_STATUS_CACHE.get_or_init(|| Mutex::new(GitStatusCacheState::default()));
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = state.entries.get(&key)
+            && entry.expires_at > Instant::now()
+        {
+            return entry.value.clone();
+        }
+        if let Some(waiter) = state.in_flight.get(&key).cloned() {
+            drop(state);
+            let mut done = waiter
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*done {
+                done = waiter
+                    .1
+                    .wait(done)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            continue;
+        }
+        let waiter = Arc::new((Mutex::new(false), Condvar::new()));
+        state.in_flight.insert(key.clone(), waiter.clone());
+        let generation = state.generation;
+        drop(state);
+
+        let value = git_status_uncached(snapshot, root);
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation == generation {
+            let expires_at = Instant::now() + GIT_STATUS_CACHE_TTL;
+            state.entries.insert(
+                key.clone(),
+                GitStatusCacheEntry {
+                    expires_at,
+                    value: value.clone(),
+                },
+            );
+            if let Some(status) = &value {
+                state.entries.insert(
+                    status.root.clone(),
+                    GitStatusCacheEntry {
+                        expires_at,
+                        value: Some(status.clone()),
+                    },
+                );
+            }
+        }
+        state.in_flight.remove(&key);
+        *waiter
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        waiter.1.notify_all();
+        return value;
+    }
+}
+
+/// Drop cached status evidence for one repository after a successful write.
+pub fn invalidate_git_status_cache(root: &Path) {
+    let Some(cache) = GIT_STATUS_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.generation = state.generation.wrapping_add(1);
+    state
+        .entries
+        .retain(|key, _| key != root && !key.starts_with(root));
+}
+
+fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+    #[cfg(test)]
+    GIT_STATUS_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if should_use_stable_broker(snapshot, root) {
         return broker_git_status(snapshot, root);
     }
@@ -563,6 +672,93 @@ mod tests {
         let project = routing.projects.get(&nested).unwrap();
         assert_eq!(project.vcs, None);
         assert!(!project.managed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn git_snapshot(root: &Path) -> Value {
+        json!({
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy()
+            }],
+            "agents": []
+        })
+    }
+
+    #[test]
+    fn concurrent_derives_singleflight_one_git_status_probe() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = git_snapshot(&root);
+        invalidate_git_status_cache(&root);
+        reset_git_status_probe_count();
+        let handles = (0..8)
+            .map(|_| {
+                let snapshot = snapshot.clone();
+                std::thread::spawn(move || derive(&snapshot))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(git_status_probe_count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_status_ttl_expiry_refreshes_the_probe() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = git_snapshot(&root);
+        invalidate_git_status_cache(&root);
+        reset_git_status_probe_count();
+        let first = derive(&snapshot);
+        assert!(!first.projects[&root].dirty);
+        std::thread::sleep(GIT_STATUS_CACHE_TTL + Duration::from_millis(40));
+        let second = derive(&snapshot);
+        assert!(!second.projects[&root].dirty);
+        assert_eq!(git_status_probe_count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_invalidation_makes_next_inspect_see_new_git_status() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = git_snapshot(&root);
+        invalidate_git_status_cache(&root);
+        let clean = derive(&snapshot);
+        assert!(!clean.projects[&root].dirty);
+        fs::write(root.join("created-by-exec.txt"), "changed").unwrap();
+        invalidate_git_status_cache(&root);
+        let refreshed = derive(&snapshot);
+        assert!(refreshed.projects[&root].dirty);
+        assert_eq!(refreshed.projects[&root].changed_files, 1);
         fs::remove_dir_all(root).unwrap();
     }
 
