@@ -26,11 +26,11 @@ TCC-protected (`is_protected_user_path`: `~/Documents`, `~/Desktop`,
 file resolves its `gitdir:` under a protected directory. On macOS, virtually
 every managed project root falls into one of these two cases:
 
-| Managed root (qingxian-macbookair, 2026-11-18) | Why protected |
+| Managed root (macOS device A, 2026-11-18) | Why protected |
 | --- | --- |
-| `/Users/qingxian/Documents/herdr-mcp` | under `~/Documents` |
-| `/Users/qingxian/.herdr/worktrees/herdr-mcp/*` | `.git` file → `gitdir:` under `~/Documents/herdr-mcp/.git/worktrees/...` |
-| `/Users/qingxian/Documents` (unmanaged project) | under `~/Documents` |
+| `~/Documents/herdr-mcp` | under `~/Documents` |
+| `~/.herdr/worktrees/herdr-mcp/*` | `.git` file → `gitdir:` under `~/Documents/herdr-mcp/.git/worktrees/...` |
+| `~/Documents` (unmanaged project) | under `~/Documents` |
 
 Consequently `herdr_exec` on a real macOS workstation is `utility_pane` for
 effectively 100% of calls today — the `native` backend is unreachable through
@@ -219,9 +219,9 @@ mcp herdr_exec {workspace, project_root, command:"printf ok", timeout_ms:30000, 
 
 ### 6.2 Raw samples
 
-**Protected path — `backend:"utility_pane"`**, qingxian-macbookair
-(`dev_01M1BDHFE8TJ2PZGQAAG4T1A3V`), workspace `w0Z`,
-root `/Users/qingxian/Documents/herdr-mcp`:
+**Protected path — `backend:"utility_pane"`**, macOS device A
+(`dev_<device-A>`), workspace `<ws-A>`,
+root `~/Documents/herdr-mcp`:
 
 ```
 E2E ms:      [2055, 1526, 2717, 2112, 2294, 1493, 2072, 1439, 1629, 2054]
@@ -229,16 +229,16 @@ internal ms: ~35–56 (pane-side exec window; sample field observed 35–56)
 ```
 
 Same command, linked worktree root
-`/Users/qingxian/.herdr/worktrees/herdr-mcp/design-768-phase2-20261116`
-(workspace `w138`) — *also* `utility_pane` because its `.git` file resolves
+`~/.herdr/worktrees/herdr-mcp/<worktree>`
+(workspace `<ws-B>`) — *also* `utility_pane` because its `.git` file resolves
 `gitdir:` under `~/Documents`:
 
 ```
 E2E ms:      [1502, 1568, 1508, 1546, 1429, 1551, 1568, 1447, 1451, 1495]
 ```
 
-**Unprotected path — `backend:"native"`**, macOS device yitaidiannao
-(`dev_01M1E4VF6VGXAMGD0CN9WE8N7M`), workspace `w44`, root `/Users/whshang`
+**Unprotected path — `backend:"native"`**, macOS device B
+(`dev_<device-B>`), workspace `<ws-C>`, root `~`
 (home root, not a TCC-protected folder):
 
 ```
@@ -250,23 +250,23 @@ internal ms: [60, 70, 70, 61, 71, 61, 61, 89, 71, 61]
 
 - Internal exec cost is comparable across backends (pane ~35–56 ms vs native
   ~60–97 ms on these samples): the per-command backend difference is tens of
-  milliseconds, well under Edge relay latency (~1.5–2.7 s E2E median on the
-  Air, ~3 s median on yitaidiannao, with multi-second tail outliers on the
+  milliseconds, well under Edge relay latency (~1.5–2.7 s E2E median on
+  device A, ~3 s median on device B, with multi-second tail outliers on the
   native path).
 - The utility_pane cost that matters is **not per-command exec time** but the
   durable-pane lifecycle: pane creation (first call to a workspace can take
   several seconds), prompt-sync waits, and pane occupancy — costs that scale
   with concurrency and long sessions, not with individual `printf` calls.
   These were not exercised by the `printf ok` microbenchmark.
-- **Measurement limitation (documented honestly):** on qingxian-macbookair
+- **Measurement limitation (documented honestly):** on device A
   itself, *no* managed root resolves to an unprotected path (§1 table), so
   `backend:"native"` cannot be exercised on that machine through the managed
   surface — `herdr_exec_start` with `root=/tmp` returns
   `outside_managed_roots`. Same-machine dual-path numbers therefore cannot be
   collected remotely today; the native-path samples above come from a second
   enrolled macOS device. A same-machine baseline needs either a managed
-  project rooted outside the protected folders on the Air (owner action: open
-  a Herdr workspace on e.g. `/Users/qingxian/herdr-bench`), or a local
+  project rooted outside the protected folders on device A (owner action:
+  open a Herdr workspace on e.g. `~/herdr-bench`), or a local
   benchmark harness on that machine.
 
 This baseline informs the design's conclusion rather than proving a win: the
@@ -286,8 +286,8 @@ per-command latency, which is Edge-dominated anyway.
   "snapshot": {
     "program": "git",                  // allowlisted program name only
     "argv": ["status", "--porcelain=v1"],  // literal tokens, no shell
-    "cwd": "/Users/qingxian/Documents/herdr-mcp",
-    "project_root": "/Users/qingxian/Documents/herdr-mcp",
+    "cwd": "~/Documents/herdr-mcp",
+    "project_root": "~/Documents/herdr-mcp",
     "managed_roots": ["..."],          // runtime's current set
     "timeout_ms": 30000,
     "max_output_bytes": 4194304
@@ -316,7 +316,7 @@ Error codes mirror the runtime's: `outside_managed_roots`, `program_not_allowed`
 3. Rollback = disable the op server-side (allowlist entry removed) or fall
    back to `utility_pane`; no data migration exists.
 4. Live verification: same-machine `backend:"tcc_broker"` latency samples vs
-   the §6 baseline, on the Air, after an unprotected-root benchmark workspace
+   the §6 baseline, on device A, after an unprotected-root benchmark workspace
    exists for the native column.
 
 ## 9. Open questions
