@@ -15,6 +15,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) const AUTO_UPDATE_LABEL: &str = "dev.herdr-mcp.auto-update";
@@ -24,6 +26,33 @@ const AUTO_UPDATE_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 const SERVICE_UNINSTALL_FENCE: &str = "service-uninstall.fence";
 #[cfg(target_os = "macos")]
 const SERVICE_UNINSTALL_FENCE_BYTES: &[u8] = b"herdr-mcp-service-uninstall-fence-v1\n";
+/// launchctl can wedge in the GUI domain (busy or permission faults). Cap the
+/// wait and bound captured output so the scheduler never deadlocks holding
+/// the update lock (#1049).
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_MAX_OUTPUT: usize = 32 * 1024;
+
+/// Bounded `launchctl` execution: a `None` timeout or spawn error both surface
+/// as `Err` with `label` naming the operation.
+#[cfg(target_os = "macos")]
+fn launchctl_output(
+    args: &[&str],
+    action: &str,
+) -> Result<crate::child_process::BoundedOutput, String> {
+    let mut command = Command::new("launchctl");
+    command.args(args);
+    match crate::child_process::run_bounded_output(
+        &mut command,
+        LAUNCHCTL_TIMEOUT,
+        LAUNCHCTL_MAX_OUTPUT,
+    ) {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => Err(format!("cannot {action}: launchctl timed out")),
+        Err(error) => Err(format!("cannot {action}: {error}")),
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,10 +866,10 @@ fn read_optional_regular(path: &Path) -> Result<Option<Vec<u8>>, String> {
 #[cfg(target_os = "macos")]
 fn launchd_state(label: &str) -> Result<LaunchdState, String> {
     let target = format!("gui/{}/{label}", unsafe { libc::geteuid() });
-    let output = Command::new("launchctl")
-        .args(["print", &target])
-        .output()
-        .map_err(|error| format!("cannot query launchd state for {label}: {error}"))?;
+    let output = launchctl_output(
+        &["print", &target],
+        &format!("query launchd state for {label}"),
+    )?;
     if output.status.success() {
         return Ok(LaunchdState::Loaded);
     }
@@ -860,10 +889,10 @@ fn launchd_state(label: &str) -> Result<LaunchdState, String> {
 #[cfg(target_os = "macos")]
 fn bootstrap(plist_path: &Path) -> Result<(), String> {
     let domain = format!("gui/{}", unsafe { libc::geteuid() });
-    let output = Command::new("launchctl")
-        .args(["bootstrap", &domain, plist_path.to_string_lossy().as_ref()])
-        .output()
-        .map_err(|error| format!("cannot bootstrap auto-update LaunchAgent: {error}"))?;
+    let output = launchctl_output(
+        &["bootstrap", &domain, plist_path.to_string_lossy().as_ref()],
+        "bootstrap auto-update LaunchAgent",
+    )?;
     if output.status.success() {
         Ok(())
     } else {
@@ -877,10 +906,7 @@ fn bootstrap(plist_path: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn bootout(label: &str) -> Result<(), String> {
     let target = format!("gui/{}/{label}", unsafe { libc::geteuid() });
-    let output = Command::new("launchctl")
-        .args(["bootout", &target])
-        .output()
-        .map_err(|error| format!("cannot bootout auto-update LaunchAgent: {error}"))?;
+    let output = launchctl_output(&["bootout", &target], "bootout auto-update LaunchAgent")?;
     if output.status.success() {
         Ok(())
     } else {

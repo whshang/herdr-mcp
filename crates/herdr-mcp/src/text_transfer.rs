@@ -301,7 +301,13 @@ fn write_inner(params: &Value, fence: Option<&CommitFence>) -> Value {
     let Some(fence) = fence else {
         return fenced_route_required();
     };
-    platform::publish(&plan, fence)
+    let result = platform::publish(&plan, fence);
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        // A committed publish may dirty a managed repository containing the
+        // target; bound inspect's cached git-status staleness at the write.
+        crate::projects::invalidate_git_status_cache_for_path(&plan.target);
+    }
+    result
 }
 
 /// Refusal used by every route that would otherwise publish without a fence.

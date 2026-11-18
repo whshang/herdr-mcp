@@ -31,8 +31,8 @@ const CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHAT_POOL_BUDGET: Duration = Duration::from_secs(12);
 /// Background callers (summaries, digests, memory compaction) are not latency
 /// sensitive, so they get a far larger allowance than interactive calls.
-const BACKGROUND_CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
-const BACKGROUND_CHAT_POOL_BUDGET: Duration = Duration::from_secs(120);
+const BACKGROUND_CHAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKGROUND_CHAT_POOL_BUDGET: Duration = Duration::from_secs(30);
 /// Rolling one-hour cap on background chat calls so an automation loop cannot
 /// drain provider quota that interactive callers depend on.
 const BACKGROUND_CHAT_HOURLY_CAP: usize = 120;
@@ -86,6 +86,8 @@ const MAX_CHAT_MESSAGE_BYTES: usize = 64 * 1024;
 const EDGE_PROXY_PROBE_TTL: Duration = Duration::from_secs(60);
 static EDGE_PROXY_AVAILABILITY: Mutex<Option<(Instant, crate::worker::SemanticProxyCapabilities)>> =
     Mutex::new(None);
+static EDGE_PROXY_PROBE_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static SEMANTIC_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 /// Per-route pool health: consecutive retryable failures plus the cooldown
 /// deadline they earned. Streak and deadline live in one struct under one lock
 /// so an out-of-order completion can never shorten a cooldown that a stricter
@@ -1063,11 +1065,24 @@ fn edge_proxy_capabilities_cached() -> crate::worker::SemanticProxyCapabilities 
         return capabilities;
     }
 
-    let capabilities = crate::worker::semantic_proxy_capabilities();
-    if let Ok(mut cache) = EDGE_PROXY_AVAILABILITY.lock() {
-        *cache = Some((Instant::now(), capabilities));
+    if EDGE_PROXY_PROBE_IN_FLIGHT
+        .compare_exchange(0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            let capabilities = crate::worker::semantic_proxy_capabilities();
+            if let Ok(mut cache) = EDGE_PROXY_AVAILABILITY.lock() {
+                *cache = Some((Instant::now(), capabilities));
+            }
+            EDGE_PROXY_PROBE_IN_FLIGHT.store(0, AtomicOrdering::Release);
+        });
     }
-    capabilities
+
+    EDGE_PROXY_AVAILABILITY
+        .lock()
+        .ok()
+        .and_then(|cache| cache.map(|(_, capabilities)| capabilities))
+        .unwrap_or_default()
 }
 
 /// Pool state for one route key: consecutive retryable failures and the
@@ -1184,13 +1199,20 @@ fn clear_route_cooldowns() {
     }
 }
 
-/// Time left on a route's cooldown, for tests that must prove a cooldown was
-/// not shortened by a later failure.
-#[cfg(test)]
+/// Time left on a route's cooldown, for `capability_json` and for tests that
+/// must prove a cooldown was not shortened by a later failure.
 fn route_cooldown_remaining(id: &str) -> Option<Duration> {
     let health = route_health().lock().ok()?;
     let until = health.get(id)?.cooldown_until?;
     until.checked_duration_since(Instant::now())
+}
+
+/// Milliseconds left on a route's active cooldown, for `capability_json`;
+/// a missing or elapsed deadline reports 0.
+fn route_cooldown_remaining_ms(id: &str) -> u64 {
+    route_cooldown_remaining(id)
+        .map(|remaining| remaining.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Timeout allowance for one route pool run: `attempt` caps a single route call,
@@ -1381,12 +1403,21 @@ impl SemanticService {
     fn from_config_with_edge_capabilities(
         edge_capabilities: impl FnOnce() -> crate::worker::SemanticProxyCapabilities,
     ) -> Self {
-        let mut providers = local_semantic_providers();
-        let mut chat_providers = local_semantic_chat_providers();
+        let Some((config_path, config)) = load_semantic_config() else {
+            return Self {
+                providers: Vec::new(),
+                chat_providers: Vec::new(),
+            };
+        };
+        let allow_inline_secret = config_file_allows_secret(&config_path);
+        let mut providers = local_semantic_providers(&config.semantic, allow_inline_secret);
+        let mut chat_providers =
+            local_semantic_chat_providers(&config.semantic, allow_inline_secret);
         let needs_edge_evaluate = providers.is_empty();
         let needs_edge_chat = chat_providers.is_empty();
         let edge = if (needs_edge_evaluate || needs_edge_chat)
-            && crate::worker::semantic_proxy_configured()
+            && config.link_upstream_origin().is_some()
+            && config.edge_device_id.is_some()
         {
             edge_capabilities()
         } else {
@@ -1529,7 +1560,7 @@ impl SemanticService {
         )
     }
 
-    /// Background-tier chat: 60s per route attempt, 120s total, separate
+    /// Background-tier chat: 10s per route attempt, 30s total, separate
     /// cooldown state, and subject to the hourly background call cap.
     // Entry point for background callers (summaries, digests, compaction);
     // the extension surface reaches the same path via `"tier": "background"`.
@@ -1692,7 +1723,7 @@ impl SemanticService {
                 route_detail_json(provider.id(), provider.protocol(), provider.model())
             }).collect::<Vec<_>>(),
             "chat_routes": self.chat_providers.iter().map(|provider| {
-                route_detail_json(provider.id(), provider.protocol(), provider.model())
+                chat_route_detail_json(provider.id(), provider.protocol(), provider.model())
             }).collect::<Vec<_>>(),
             "provider_state": if !configured {
                 "not_configured"
@@ -1737,7 +1768,21 @@ fn route_detail_json(name: &str, protocol: &str, model: &str) -> Value {
         "model": model,
         "pinned": pinned,
         "consecutive_failures": current_route_failure_streak(name),
+        "cooldown_remaining_ms": route_cooldown_remaining_ms(name),
     })
+}
+
+/// Chat routes additionally carry the background-tier pool state: background
+/// callers record failures under the `background:` scope key, which the shared
+/// foreground-only streak would never show.
+fn chat_route_detail_json(name: &str, protocol: &str, model: &str) -> Value {
+    let mut detail = route_detail_json(name, protocol, model);
+    let background_key = format!("{}{}", SemanticTier::Background.cooldown_scope(), name);
+    detail["background_consecutive_failures"] =
+        json!(current_route_failure_streak(&background_key));
+    detail["background_cooldown_remaining_ms"] =
+        json!(route_cooldown_remaining_ms(&background_key));
+    detail
 }
 
 pub fn extension_status_json() -> Value {
@@ -1996,11 +2041,11 @@ fn semantic_request_from_json(payload: &Value) -> Result<SemanticRequest, Semant
     Ok(request)
 }
 
-fn load_semantic_config() -> Option<(PathBuf, crate::config::SemanticConfig)> {
+fn load_semantic_config() -> Option<(PathBuf, crate::config::Config)> {
     let paths = crate::paths::RuntimePaths::discover().ok()?;
     let config =
         crate::config::Config::load_for_instance(&paths.config_file, &paths.instance).ok()?;
-    Some((paths.config_file, config.semantic))
+    Some((paths.config_file, config))
 }
 
 fn config_file_allows_secret(path: &Path) -> bool {
@@ -2209,6 +2254,20 @@ fn estimated_tokens(body: &[u8]) -> u64 {
     (body.len() as u64).div_ceil(4)
 }
 
+fn semantic_http_client() -> Result<Client, SemanticError> {
+    if let Some(client) = SEMANTIC_HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
+        .build()
+        .map_err(|_| SemanticError::new("client_unavailable"))?;
+    let _ = SEMANTIC_HTTP_CLIENT.set(client);
+    SEMANTIC_HTTP_CLIENT
+        .get()
+        .cloned()
+        .ok_or_else(|| SemanticError::new("client_unavailable"))
+}
+
 struct HttpSemanticProvider {
     id: String,
     protocol: SemanticProtocol,
@@ -2216,7 +2275,6 @@ struct HttpSemanticProvider {
     endpoint: Url,
     model: String,
     rate: RouteRateBudget,
-    client: Client,
 }
 
 impl HttpSemanticProvider {
@@ -2257,10 +2315,6 @@ impl HttpSemanticProvider {
             endpoint: semantic_endpoint_url(&url)?,
             model,
             rate: RouteRateBudget::new(max_requests_per_second, max_tokens_per_second),
-            client: Client::builder()
-                .timeout(DECISION_ATTEMPT_TIMEOUT)
-                .build()
-                .map_err(|_| SemanticError::new("client_unavailable"))?,
         })
     }
 
@@ -2354,8 +2408,7 @@ impl SemanticProvider for HttpSemanticProvider {
         request: &SemanticRequest,
         timeout: Duration,
     ) -> Result<SemanticResponse, SemanticError> {
-        let mut builder = self
-            .client
+        let mut builder = semantic_http_client()?
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key);
         if self.protocol == SemanticProtocol::DecisionVercel {
@@ -2407,7 +2460,6 @@ struct OpenAiChatProvider {
     endpoint: Url,
     model: String,
     rate: RouteRateBudget,
-    client: Client,
 }
 
 impl OpenAiChatProvider {
@@ -2440,10 +2492,6 @@ impl OpenAiChatProvider {
             endpoint: semantic_endpoint_url(&url)?,
             model,
             rate: RouteRateBudget::new(max_requests_per_second, max_tokens_per_second),
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .map_err(|_| SemanticError::new("client_unavailable"))?,
         })
     }
 
@@ -2507,8 +2555,7 @@ impl SemanticChatProvider for OpenAiChatProvider {
         let body = serde_json::to_vec(&body).map_err(|_| SemanticError::new("invalid_request"))?;
         // The rate budget is reserved by the route pool before it counts an
         // attempt, not here.
-        let response = self
-            .client
+        let response = semantic_http_client()?
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
@@ -2577,33 +2624,31 @@ fn openai_chat_body(
     body
 }
 
-fn local_semantic_providers() -> Vec<Box<dyn SemanticProvider>> {
-    let Some((config_path, semantic)) = load_semantic_config() else {
-        return Vec::new();
-    };
-    let allow_inline_secret = config_file_allows_secret(&config_path);
+fn local_semantic_providers(
+    semantic: &crate::config::SemanticConfig,
+    allow_inline_secret: bool,
+) -> Vec<Box<dyn SemanticProvider>> {
     semantic
         .routes
-        .into_iter()
+        .iter()
         .filter_map(|route| {
             let id = format!("config-route:{}", route.name);
-            HttpSemanticProvider::from_config(id, route, allow_inline_secret)
+            HttpSemanticProvider::from_config(id, route.clone(), allow_inline_secret)
                 .map(|provider| Box::new(provider) as Box<dyn SemanticProvider>)
         })
         .collect()
 }
 
-fn local_semantic_chat_providers() -> Vec<Box<dyn SemanticChatProvider>> {
-    let Some((config_path, semantic)) = load_semantic_config() else {
-        return Vec::new();
-    };
-    let allow_inline_secret = config_file_allows_secret(&config_path);
+fn local_semantic_chat_providers(
+    semantic: &crate::config::SemanticConfig,
+    allow_inline_secret: bool,
+) -> Vec<Box<dyn SemanticChatProvider>> {
     semantic
         .routes
-        .into_iter()
+        .iter()
         .filter_map(|route| {
             let id = format!("config-route:{}", route.name);
-            OpenAiChatProvider::from_config(id, route, allow_inline_secret)
+            OpenAiChatProvider::from_config(id, route.clone(), allow_inline_secret)
                 .map(|provider| Box::new(provider) as Box<dyn SemanticChatProvider>)
         })
         .collect()
@@ -3483,18 +3528,20 @@ mod tests {
             std::env::set_var("HERDR_SEMANTIC_ROUTES", "[]");
         }
 
-        let providers = local_semantic_providers();
+        let (config_path, config) = load_semantic_config().unwrap();
+        let allow_inline_secret = config_file_allows_secret(&config_path);
+        let providers = local_semantic_providers(&config.semantic, allow_inline_secret);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "config-route:fast_a");
-        let chat_providers = local_semantic_chat_providers();
+        let chat_providers = local_semantic_chat_providers(&config.semantic, allow_inline_secret);
         assert_eq!(chat_providers.len(), 1);
         assert_eq!(chat_providers[0].id(), "config-route:chat_a");
 
         #[cfg(unix)]
         {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(local_semantic_providers().is_empty());
-            assert!(local_semantic_chat_providers().is_empty());
+            assert!(local_semantic_providers(&config.semantic, false).is_empty());
+            assert!(local_semantic_chat_providers(&config.semantic, false).is_empty());
         }
 
         let _ = fs::remove_dir_all(&config_dir);
@@ -3686,13 +3733,13 @@ mod tests {
         assert_eq!(foreground.cooldown_scope, "");
 
         let background = SemanticTier::Background.chat_budget(Duration::from_secs(600));
-        assert_eq!(background.attempt, Duration::from_secs(60));
-        assert_eq!(background.total, Duration::from_secs(120));
+        assert_eq!(background.attempt, Duration::from_secs(10));
+        assert_eq!(background.total, Duration::from_secs(30));
         assert_eq!(background.cooldown_scope, "background:");
 
-        let capped = SemanticTier::Background.chat_budget(Duration::from_secs(30));
-        assert_eq!(capped.attempt, Duration::from_secs(30));
-        assert_eq!(capped.total, Duration::from_secs(30));
+        let capped = SemanticTier::Background.chat_budget(Duration::from_secs(20));
+        assert_eq!(capped.attempt, Duration::from_secs(10));
+        assert_eq!(capped.total, Duration::from_secs(20));
     }
 
     #[test]
@@ -3732,6 +3779,83 @@ mod tests {
         );
         assert!(route_is_cooling_down("background:tier-route"));
         assert!(!route_is_cooling_down("tier-route"));
+
+        clear_route_pool_state();
+    }
+
+    /// user operator | Given a chat route failing only under the background
+    /// tier | When `capability_json` reports that route | Then the
+    /// background-scoped streak and cooldown are visible while the shared
+    /// foreground fields stay zero.
+    #[test]
+    fn chat_route_detail_reports_background_scoped_pool_health() {
+        let _guard = crate::test_env::lock();
+        clear_route_pool_state();
+
+        let background = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200))
+            .scoped(SemanticTier::Background.cooldown_scope());
+        let _ = execute_route_pool(
+            1,
+            background,
+            |_| "tier-route".to_owned(),
+            |_, _| Err::<usize, _>(SemanticError::new("timeout")),
+        );
+
+        let detail = chat_route_detail_json("tier-route", "openai", "model-1");
+        assert_eq!(detail["consecutive_failures"], 0);
+        assert_eq!(detail["background_consecutive_failures"], 1);
+        assert_eq!(detail["cooldown_remaining_ms"], 0);
+        assert!(detail["background_cooldown_remaining_ms"].as_u64().unwrap() > 0);
+
+        // The foreground-scope detail helper stays unaware of the tier split.
+        let plain = route_detail_json("tier-route", "openai", "model-1");
+        assert_eq!(plain["consecutive_failures"], 0);
+
+        clear_route_pool_state();
+    }
+
+    /// user operator | Given a chat route failing only under the background
+    /// tier | When the public `capability_json` surface is read | Then its
+    /// `chat_routes` entries carry the `background_*` pool fields — the
+    /// contract callers must not silently regress to the narrower helper.
+    #[test]
+    fn capability_json_chat_routes_report_background_pool_health() {
+        let _guard = crate::test_env::lock();
+        clear_route_pool_state();
+
+        let service = SemanticService {
+            providers: Vec::new(),
+            chat_providers: vec![Box::new(
+                OpenAiChatProvider::new(
+                    "tier-route".to_owned(),
+                    "key-t".to_owned(),
+                    "http://127.0.0.1:9/unused".to_owned(),
+                    "model-1".to_owned(),
+                )
+                .unwrap(),
+            )],
+        };
+
+        let background = RouteBudget::split(Duration::from_millis(50), Duration::from_millis(200))
+            .scoped(SemanticTier::Background.cooldown_scope());
+        let _ = execute_route_pool(
+            1,
+            background,
+            |_| "tier-route".to_owned(),
+            |_, _| Err::<usize, _>(SemanticError::new("timeout")),
+        );
+
+        let capability = service.capability_json();
+        let detail = capability["chat_routes"]
+            .as_array()
+            .expect("chat_routes is an array")
+            .iter()
+            .find(|route| route["name"] == "tier-route")
+            .expect("capability_json must list the chat route");
+        assert_eq!(detail["consecutive_failures"], 0);
+        assert_eq!(detail["background_consecutive_failures"], 1);
+        assert_eq!(detail["cooldown_remaining_ms"], 0);
+        assert!(detail["background_cooldown_remaining_ms"].as_u64().unwrap() > 0);
 
         clear_route_pool_state();
     }
