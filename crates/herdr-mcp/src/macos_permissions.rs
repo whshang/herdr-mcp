@@ -1122,6 +1122,13 @@ pub fn annotate_service_result(result: &mut Value, config_dir: &Path) {
 }
 
 pub fn map_fs_git_result(mut value: Value) -> Value {
+    // Batch reads carry per-entry results: map each entry so a TCC denial in
+    // `reads[i]` gets the same treatment as a single-file denial.
+    if let Some(reads) = value.get_mut("reads").and_then(Value::as_array_mut) {
+        for entry in reads.iter_mut() {
+            *entry = map_fs_git_result(entry.clone());
+        }
+    }
     if value.get("ok").and_then(Value::as_bool) != Some(false) {
         return value;
     }

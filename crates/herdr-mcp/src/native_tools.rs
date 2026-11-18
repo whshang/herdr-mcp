@@ -69,17 +69,13 @@ pub fn inspect_with_selection(
         compact_inspect_view(&mut view);
     }
     if let (Some(cache), Some(cursor)) = (cache, params.since_cursor) {
-        let digest = cache.digest_since(cursor);
+        // Reuse the herdr_since projection verbatim: it applies the same
+        // agent-visibility and workspace filtering as the standalone tool, so
+        // the embedded digest cannot leak hidden agents or foreign-workspace
+        // events that the plain view filter would have removed.
+        let digest = since(cache, cursor, params.workspace, Ok(None));
         if let Some(object) = view.as_object_mut() {
-            object.insert(
-                "since".to_owned(),
-                json!({
-                    "cursor": digest.cursor,
-                    "events": digest.events,
-                    "agents": digest.agents,
-                    "workspaces": digest.workspaces,
-                }),
-            );
+            object.insert("since".to_owned(), digest);
         }
     }
     view
@@ -88,6 +84,12 @@ pub fn inspect_with_selection(
 /// Keep only the workspace whose `id` or `label` matches, then prune every
 /// collection whose entries belong to another workspace.
 fn filter_view_to_workspace(view: &mut Value, workspace: &str) {
+    // Error envelopes must pass through untouched: injecting empty
+    // workspaces/tabs/panes/agents into an ok:false result would falsify the
+    // failure view.
+    if view.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
     let Some(object) = view.as_object_mut() else {
         return;
     };
@@ -145,13 +147,19 @@ fn filter_view_to_workspace(view: &mut Value, workspace: &str) {
             .collect::<Vec<_>>();
         object.insert("shared_projects".to_owned(), Value::Array(kept));
     }
-    if object
-        .get("focused_workspace_id")
+    // The inspect projection emits `focused_workspace`/`focused_pane` (the
+    // snapshot's focused_*_id fields are renamed on copy). A focus outside the
+    // retained workspaces must be nulled rather than left pointing at a
+    // workspace the caller just filtered out.
+    let focused = object
+        .get("focused_workspace")
         .and_then(Value::as_str)
-        .is_some_and(|id| !ids.contains(id))
-    {
-        object.insert("focused_workspace_id".to_owned(), Value::Null);
+        .or_else(|| object.get("focused_workspace_id").and_then(Value::as_str))
+        .map(str::to_owned);
+    if focused.is_some_and(|id| !ids.contains(&id)) {
         object.insert("focused_workspace".to_owned(), Value::Null);
+        object.insert("focused_workspace_id".to_owned(), Value::Null);
+        object.insert("focused_pane".to_owned(), Value::Null);
     }
 }
 
@@ -1212,6 +1220,20 @@ mod tests {
         assert_eq!(view["shared_projects"].as_array().unwrap().len(), 1);
         // A focused workspace outside the filter is cleared, not silently stale.
         assert_eq!(view["focused_workspace_id"], Value::Null);
+        assert_eq!(view["focused_workspace"], Value::Null);
+        assert_eq!(view["focused_pane"], Value::Null);
+    }
+
+    #[test]
+    fn inspect_workspace_filter_passes_error_envelopes_through_untouched() {
+        let mut error = json!({
+            "ok": false,
+            "code": "herdr_transport",
+            "message": "socket unavailable",
+        });
+        let before = error.clone();
+        filter_view_to_workspace(&mut error, "main");
+        assert_eq!(error, before, "ok:false results are not annotated");
     }
 
     #[test]

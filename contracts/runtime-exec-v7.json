@@ -86,7 +86,6 @@
         "description": "PREFERRED way to read project source on the workstation. Reads a file from a MANAGED (git) project root (remote-workstation layer — the client cannot reach these files otherwise). Do not use herdr_prompt / omp / agent.read for ordinary file IO. Gates: path must sit inside a git-backed project root from the live snapshot ($HOME / non-git roots refused); secret-ish files (.env*, *.pem, id_rsa*, *.key, .git/config, *secret*/*token*/*credential*) denied; budget defaults to 200 lines / 16KB — raise explicitly (cap 256KB). Diff-sized reads are cheap; whole-source reads are not. Batch mode: pass reads[] of {path, start_line, end_line, max_bytes} — every entry shares the single-file parameter names, the managed-root and secret gates, and its own line/byte budget; at least one of path or reads is required and each entry reports its own ok/result.",
         "required": []
       },
-      "required": [],
       "inputSchema_properties": {
         "reads": {
           "type": "array",

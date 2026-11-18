@@ -22,7 +22,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 
+/// Default per-session, per-stream retained output. Sessions started through
+/// `herdr_exec` with a larger `max_output_bytes` request widen their own cap
+/// (bounded by the contract's 4 MiB maximum) via `Buffers::with_cap`.
 const MAX_BUFFER_PER_STREAM: usize = 512 * 1024;
+pub(crate) const MAX_STREAM_BUFFER_PER_STREAM: usize = MAX_BUFFER_PER_STREAM;
 const SESSION_TTL_MS: u64 = 60 * 60_000;
 const KILL_GRACE: Duration = Duration::from_millis(1500);
 const OUTPUT_DRAIN_BUDGET: Duration = Duration::from_millis(500);
@@ -150,13 +154,36 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Buffers {
     chunks: Vec<Chunk>,
     next_seq: u64,
     stdout_bytes: usize,
     stderr_bytes: usize,
     truncated: bool,
+    /// Per-stream retained-byte cap; the default keeps `MAX_BUFFER_PER_STREAM`,
+    /// and exec requests carrying a larger `max_output_bytes` widen it so the
+    /// advertised read window is actually serviceable.
+    cap: usize,
+}
+
+impl Default for Buffers {
+    fn default() -> Self {
+        Self::with_cap(MAX_BUFFER_PER_STREAM)
+    }
+}
+
+impl Buffers {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            chunks: Vec::new(),
+            next_seq: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            truncated: false,
+            cap,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -506,6 +533,7 @@ fn load_session_from_spool_or_record(
         stdout_bytes,
         stderr_bytes,
         truncated,
+        cap: MAX_BUFFER_PER_STREAM,
     };
     let status = SessionStatus {
         closed: true,
@@ -640,10 +668,22 @@ impl ExecRegistry {
     }
 
     pub(crate) fn start_native(&self, cwd: &Path, command: &str) -> Result<Value, String> {
+        self.start_native_with_cap(cwd, command, MAX_BUFFER_PER_STREAM)
+    }
+
+    /// `herdr_exec` entrypoint honoring a caller-requested `max_output_bytes`:
+    /// the session's per-stream retained-output cap is sized to serve the
+    /// advertised read window instead of truncating at the default.
+    pub(crate) fn start_native_with_cap(
+        &self,
+        cwd: &Path,
+        command: &str,
+        stream_cap: usize,
+    ) -> Result<Value, String> {
         if command.is_empty() {
             return Err("command must not be empty".to_owned());
         }
-        self.start_native_process(cwd, command, |id| shell_command(command, id))
+        self.start_native_process(cwd, command, stream_cap, |id| shell_command(command, id))
     }
 
     pub(crate) fn start_native_program(
@@ -652,11 +692,23 @@ impl ExecRegistry {
         program: &str,
         args: &[String],
     ) -> Result<Value, String> {
+        self.start_native_program_with_cap(cwd, program, args, MAX_BUFFER_PER_STREAM)
+    }
+
+    /// Same as [`ExecRegistry::start_native_program`] but with an explicit
+    /// per-stream retained-output cap (see `start_native_with_cap`).
+    pub(crate) fn start_native_program_with_cap(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        stream_cap: usize,
+    ) -> Result<Value, String> {
         if program.is_empty() {
             return Err("program must not be empty".to_owned());
         }
         let rendered = render_exec_argv(program, args);
-        self.start_native_process(cwd, &rendered, |_| {
+        self.start_native_process(cwd, &rendered, stream_cap, |_| {
             let mut process = Command::new(program);
             process.args(args);
             process
@@ -667,6 +719,7 @@ impl ExecRegistry {
         &self,
         cwd: &Path,
         command: &str,
+        stream_cap: usize,
         build_process: F,
     ) -> Result<Value, String>
     where
@@ -701,7 +754,7 @@ impl ExecRegistry {
                 child: Mutex::new(child),
                 output_readers: AtomicUsize::new(output_readers),
             },
-            buffers: Mutex::new(Buffers::default()),
+            buffers: Mutex::new(Buffers::with_cap(stream_cap)),
             status: Mutex::new(SessionStatus::default()),
             evidence_missing: false,
         });
@@ -753,25 +806,31 @@ impl ExecRegistry {
         }))
     }
 
-    /// Start one command in an existing canonical utility pane.
-    pub fn start_in_existing_pane(
+    /// Start one command in an existing canonical utility pane. `herdr_exec`
+    /// requests carrying `max_output_bytes` widen the session's per-stream
+    /// retained-output cap so the advertised read window is serviceable; other
+    /// callers pass `MAX_BUFFER_PER_STREAM`.
+    pub(crate) fn start_in_existing_pane_with_cap(
         &self,
         cwd: &Path,
         command: &str,
         pane_id: &str,
+        stream_cap: usize,
     ) -> Result<Value, PaneStartError> {
-        self.start_in_pane(cwd, command, pane_id, false, "utility_pane")
+        self.start_in_pane(cwd, command, pane_id, false, "utility_pane", stream_cap)
     }
 
     /// Start one command in a task-owned pane that is automatically reclaimed
-    /// when the durable session completes or is killed.
-    pub fn start_in_private_pane(
+    /// when the durable session completes or is killed. Explicit per-stream
+    /// retained-output cap (see `start_in_existing_pane_with_cap`).
+    pub(crate) fn start_in_private_pane_with_cap(
         &self,
         cwd: &Path,
         command: &str,
         pane_id: &str,
+        stream_cap: usize,
     ) -> Result<Value, PaneStartError> {
-        self.start_in_pane(cwd, command, pane_id, true, "private_pane")
+        self.start_in_pane(cwd, command, pane_id, true, "private_pane", stream_cap)
     }
 
     /// Failures are typed by the stage that produced them, because only the
@@ -785,6 +844,7 @@ impl ExecRegistry {
         pane_id: &str,
         close_on_complete: bool,
         backend: &str,
+        stream_cap: usize,
     ) -> Result<Value, PaneStartError> {
         self.prune();
         if command.is_empty() {
@@ -815,7 +875,7 @@ impl ExecRegistry {
                 stderr_offset: Mutex::new(0),
                 close_on_complete,
             },
-            buffers: Mutex::new(Buffers::default()),
+            buffers: Mutex::new(Buffers::with_cap(stream_cap)),
             status: Mutex::new(SessionStatus::default()),
             evidence_missing: false,
         });
@@ -1431,15 +1491,16 @@ fn push_chunk(session: &Arc<Session>, stream: StreamKind, chunk: &[u8]) {
     let Ok(mut buffers) = session.buffers.lock() else {
         return;
     };
+    let cap = buffers.cap;
     let used = match stream {
         StreamKind::Stdout => buffers.stdout_bytes,
         StreamKind::Stderr => buffers.stderr_bytes,
     };
-    if used >= MAX_BUFFER_PER_STREAM {
+    if used >= cap {
         buffers.truncated = true;
         return;
     }
-    let room = MAX_BUFFER_PER_STREAM - used;
+    let room = cap - used;
     let take = chunk.len().min(room);
     let seq = buffers.next_seq;
     buffers.next_seq = buffers.next_seq.saturating_add(1);
@@ -1606,9 +1667,11 @@ fn drain_spool_file(session: &Arc<Session>, path: &Path, stream: StreamKind, off
     let room = session
         .buffers
         .lock()
-        .map(|buffers| match stream {
-            StreamKind::Stdout => MAX_BUFFER_PER_STREAM.saturating_sub(buffers.stdout_bytes),
-            StreamKind::Stderr => MAX_BUFFER_PER_STREAM.saturating_sub(buffers.stderr_bytes),
+        .map(|buffers| {
+            buffers.cap.saturating_sub(match stream {
+                StreamKind::Stdout => buffers.stdout_bytes,
+                StreamKind::Stderr => buffers.stderr_bytes,
+            })
         })
         .unwrap_or(0);
     let available = end.saturating_sub(*offset);
@@ -2548,6 +2611,7 @@ mod tests {
             stdout_bytes: 8,
             stderr_bytes: 2,
             truncated: false,
+            cap: MAX_BUFFER_PER_STREAM,
         };
 
         let (both, both_total) = read_buffer_slice(&buffers, None, 3, 5);
@@ -3459,6 +3523,7 @@ mod tests {
                     stdout_bytes: format!("output-{i}\n").len(),
                     stderr_bytes: 0,
                     truncated: false,
+                    cap: MAX_BUFFER_PER_STREAM,
                 }),
                 status: Mutex::new(SessionStatus {
                     closed: true,
@@ -3512,6 +3577,7 @@ mod tests {
                 stdout_bytes: output.len(),
                 stderr_bytes: 0,
                 truncated: false,
+                cap: MAX_BUFFER_PER_STREAM,
             }),
             status: Mutex::new(SessionStatus {
                 closed: true,
@@ -3834,6 +3900,7 @@ mod tests {
                 stdout_bytes: output.len(),
                 stderr_bytes: 0,
                 truncated: false,
+                cap: MAX_BUFFER_PER_STREAM,
             }),
             status: Mutex::new(SessionStatus {
                 closed: true,

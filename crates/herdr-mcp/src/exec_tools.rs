@@ -94,6 +94,7 @@ pub fn start(
             workspace_id,
             &managed.real,
             &rendered,
+            crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM,
         )
     } else {
         let started = match &invocation {

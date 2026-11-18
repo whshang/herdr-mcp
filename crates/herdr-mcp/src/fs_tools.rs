@@ -48,21 +48,36 @@ pub fn read(snapshot: &Value, args: &Value) -> Value {
     read_one(snapshot, args)
 }
 
-/// Batch mode: `reads[]` of `{path, start_line, end_line, max_bytes}`. Every
-/// entry goes through the same managed-root and secret gates plus its own
-/// line/byte budget; a failed entry reports its own `ok:false` without
-/// aborting the batch. Single-mode keys must not leak in alongside `reads`.
-fn read_batch(snapshot: &Value, args: &Value) -> Value {
+/// Validate the `reads[]` batch envelope and return the entry list. Shared by
+/// the in-process path and the TCC-broker fan-out so both enforce identical
+/// structure before any read executes.
+pub(crate) fn validate_read_batch_args(args: &Value) -> Result<Vec<Value>, Value> {
     for key in ["path", "start_line", "end_line", "max_bytes"] {
         if args.get(key).is_some() {
-            return json!({"ok": false, "code": "invalid_params", "message": format!("{key} is not accepted at the top level of a reads[] batch; put it inside each reads[] entry")});
+            return Err(
+                json!({"ok": false, "code": "invalid_params", "message": format!("{key} is not accepted at the top level of a reads[] batch; put it inside each reads[] entry")}),
+            );
         }
     }
     let entries = match args.get("reads").and_then(Value::as_array) {
         Some(entries) if !entries.is_empty() && entries.len() <= READ_BATCH_MAX_ENTRIES => entries,
         _ => {
-            return json!({"ok": false, "code": "invalid_params", "message": format!("reads must be a non-empty array of at most {READ_BATCH_MAX_ENTRIES} {{path, start_line, end_line, max_bytes}} objects")});
+            return Err(
+                json!({"ok": false, "code": "invalid_params", "message": format!("reads must be a non-empty array of at most {READ_BATCH_MAX_ENTRIES} {{path, start_line, end_line, max_bytes}} objects")}),
+            );
         }
+    };
+    Ok(entries.clone())
+}
+
+/// Batch mode: `reads[]` of `{path, start_line, end_line, max_bytes}`. Every
+/// entry goes through the same managed-root and secret gates plus its own
+/// line/byte budget; a failed entry reports its own `ok:false` without
+/// aborting the batch. Single-mode keys must not leak in alongside `reads`.
+fn read_batch(snapshot: &Value, args: &Value) -> Value {
+    let entries = match validate_read_batch_args(args) {
+        Ok(entries) => entries,
+        Err(error) => return error,
     };
     let results = entries
         .iter()
