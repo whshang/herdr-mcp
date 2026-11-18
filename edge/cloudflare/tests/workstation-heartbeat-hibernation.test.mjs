@@ -147,3 +147,77 @@ test("heartbeat persistence throttle still applies without runtime change", asyn
   await subject.handleHeartbeat(steadyHeartbeat(BASE_RUNTIME), ws);
   assert.equal(storage.mutations.length, 1, "throttled checkpoint must still persist");
 });
+
+const LINK_HEARTBEAT_MS = 30_000;
+
+async function withFakeNow(run) {
+  const realNow = Date.now;
+  const clock = { now: 1_700_000_000_000 };
+  Date.now = () => clock.now;
+  try {
+    return await run(clock);
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+async function registeredSubject() {
+  const session = sessionFromClaims({
+    workstationId: "ws-hibernate",
+    linkVersion: "0.4.0",
+    bootId: "boot1",
+    protocolVersion: "1",
+    connectedAtMs: 1_000,
+    runtimeVersion: BASE_RUNTIME.runtime_version,
+    runtimeGeneration: BASE_RUNTIME.runtime_generation,
+    herdProtocolVersion: BASE_RUNTIME.herdr_protocol,
+  });
+  const storage = new FakeStorage([["session", serializeSession(session)]]);
+  const sent = [];
+  const ws = {
+    deserializeAttachment: () => ({ active: true, registered: true }),
+    send: (frame) => sent.push(JSON.parse(frame)),
+  };
+  const subject = new WorkstationDO(fakeState(storage, [ws]), {});
+  await subject.fetch(new Request("https://do/internal/status"));
+  return { subject, sent, ws };
+}
+
+test("user link stays fed on jittered 30s heartbeats | Given a status reply was just sent | When the next 30s heartbeats arrive a few ms late then early | Then every heartbeat gets a status reply", async () => {
+  assert.ok(
+    EDGE_STATUS_REPLY_INTERVAL_MS < LINK_HEARTBEAT_MS,
+    "status reply interval must leave jitter margin below the Link heartbeat",
+  );
+  await withFakeNow(async (clock) => {
+    const { subject, sent, ws } = await registeredSubject();
+    await subject.handleHeartbeat(steadyHeartbeat(BASE_RUNTIME), ws);
+    sent.length = 0;
+
+    const arrivalOffsets = [LINK_HEARTBEAT_MS + 5, LINK_HEARTBEAT_MS - 4, LINK_HEARTBEAT_MS - 500, LINK_HEARTBEAT_MS];
+    for (const offset of arrivalOffsets) {
+      clock.now += offset;
+      await subject.handleHeartbeat(steadyHeartbeat(BASE_RUNTIME), ws);
+    }
+
+    assert.equal(sent.length, arrivalOffsets.length, "each jittered heartbeat must receive a status reply");
+    assert.ok(sent.every((frame) => frame.kind === "status"));
+  });
+});
+
+test("user sees status replies throttled at the 25s boundary | Given a status reply was just sent | When heartbeats arrive just under and then at the reply interval | Then only the beat at the interval gets a status reply", async () => {
+  assert.equal(EDGE_STATUS_REPLY_INTERVAL_MS, 25_000);
+  await withFakeNow(async (clock) => {
+    const { subject, sent, ws } = await registeredSubject();
+    await subject.handleHeartbeat(steadyHeartbeat(BASE_RUNTIME), ws);
+    sent.length = 0;
+
+    clock.now += EDGE_STATUS_REPLY_INTERVAL_MS - 1;
+    await subject.handleHeartbeat(steadyHeartbeat(BASE_RUNTIME), ws);
+    assert.equal(sent.length, 0, "a beat inside the reply interval stays silent");
+
+    clock.now += 1;
+    await subject.handleHeartbeat(steadyHeartbeat(BASE_RUNTIME), ws);
+    assert.equal(sent.length, 1, "a beat at the reply interval gets a status reply");
+    assert.equal(sent[0]?.kind, "status");
+  });
+});
