@@ -393,4 +393,28 @@ mod tests {
         assert_eq!(fs::read_to_string(&new_file).unwrap(), "next\n");
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn exec_write_invalidates_cache_and_next_inspect_observes_git_status() {
+        let root = repo();
+        let snap = snapshot(&root);
+
+        projects::invalidate_git_status_cache(&root);
+        let clean = projects::derive(&snap);
+        assert!(!clean.projects[&root].dirty);
+
+        let written = write(
+            &snap,
+            &json!({"path": root.join("created-by-write.txt"), "content": "changed\n"}),
+        );
+        assert_eq!(written["ok"], true);
+
+        // No manual invalidate: the write itself must have invalidated the
+        // cache, so the next inspect observes the updated git status.
+        let refreshed = projects::derive(&snap);
+        let project = &refreshed.projects[&root];
+        assert!(project.dirty);
+        assert_eq!(project.changed_files, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
