@@ -19,18 +19,13 @@
  *  - Request credentials / Authorization are never copied into responses.
  *
  * Post framing — matches the exact wire formats proven by production:
- *  - SSE one-event frame `event: message\ndata: <json>\n\n` is the
- *    @modelcontextprotocol/sdk StreamableHTTP framing
- *    (dist/esm/server/webStandardStreamableHttp.js: `event: message\n` +
- *    `data: ${JSON.stringify(message)}\n\n`).
+ *  - SSE one-event frame `event: message\ndata: <json>\n\n` follows the
+ *    MCP Streamable HTTP framing contract.
  *  - SSE responses carry `text/event-stream` + `Cache-Control: no-cache,
- *    no-transform` (SDK + production GET probe header, asserted verbatim in
- *    tests/transport.test.mjs).
- *  - `server/discover` is answered with application/json in production
- *    (src/server.ts handleMcpRequest answers discover with res.status(200)
- *    .json(...) BEFORE the stateless branch, so the SDK transport never
- *    renders it). This module follows that proven source; the task text lists
- *    discover under SSE — see `SSE_POST_METHODS` note.
+ *    no-transform` (asserted verbatim in
+ *    tests/mcp-chatgpt-transport.test.mjs).
+ *  - `server/discover` is answered with application/json by the Edge router
+ *    before the stateless branch, so this transport never renders it as SSE.
  *  - tools/call is JSON for proxy-safe payloads (production
  *    `enableJsonResponse = method === "tools/call"`).
  *  - Notifications (dev.body === null) keep their status (204) with an empty
@@ -47,10 +42,8 @@ export const DEFAULT_PROBE_HEARTBEAT_MS = 15_000;
 /**
  * JSON-RPC methods framed as Streamable-HTTP SSE for ChatGPT/openai-mcp.
  *
- * NOTE on `server/discover`: the task lists it here, but production answers
- * discover with JSON (src/server.ts `res.status(200).json(...)`, before the
- * stateless branch) — proven wire behavior. It therefore deliberately stays
- * out of this set; the Edge router gets JSON for discover.
+ * NOTE on `server/discover`: the Edge router answers it with JSON before the
+ * stateless branch. It therefore deliberately stays out of this set.
  */
 export const SSE_POST_METHODS: ReadonlySet<string> = new Set<string>(["initialize", "tools/list"]);
 
@@ -132,7 +125,7 @@ export function sseFrameEvent(payload: unknown): string {
  *   probe cannot buffer unboundedly.
  * - Heartbeat timer is cleared exactly once on stream cancel() or signal
  *   abort; onCleanup() fires once.
- * - Headers match production (src/server.ts): text/event-stream,
+ * - Headers match the Edge production contract: text/event-stream,
  *   Cache-Control: no-cache, no-transform, Connection: keep-alive,
  *   X-Accel-Buffering: no. No Mcp-Session-Id.
  */

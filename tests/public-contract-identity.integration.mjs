@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { PUBLIC_CONTRACT_EPOCH, PUBLIC_CONTRACT_HASH } from "../dist/link/daemon.js";
 import {
   PUBLIC_CONTRACT_HASH as SELF_UPDATE_HASH,
   PUBLIC_CONTRACT_PROFILE,
@@ -50,8 +49,6 @@ test("runtime execution contract epoch 4 is independent of the public contract e
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030");
 
-  assert.equal(PUBLIC_CONTRACT_EPOCH, 6);
-  assert.equal(PUBLIC_CONTRACT_HASH, "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e");
   assert.equal(EDGE_EPOCH, 3);
   assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
   assert.equal(EPOCH3_CONTRACT.tool_count, 19);
@@ -64,7 +61,7 @@ test("runtime execution contract epoch 4 is independent of the public contract e
 
   // The cutover/domain probe follows the current runtime execution contract.
   assert.equal(DOMAIN_EPOCH, 6);
-  assert.equal(DOMAIN_HASH, PUBLIC_CONTRACT_HASH);
+  assert.match(DOMAIN_HASH, /^sha256:[0-9a-f]{64}$/);
   assert.equal(DOMAIN_TOOL_COUNT, 18);
 });
 

@@ -39,5 +39,5 @@ test("user changes a shared dependency | Given a change with broad dependency re
   assert.equal(classifyChangedFiles(["package-lock.json"]), "full");
   assert.equal(classifyChangedFiles(["Cargo.lock"]), "full");
   assert.equal(classifyChangedFiles(["scripts/release-gate.sh"]), "full");
-  assert.equal(classifyChangedFiles(["extension/background.js", "src/server.ts"]), "full");
+  assert.equal(classifyChangedFiles(["extension/background.js", "package.json"]), "full");
 });

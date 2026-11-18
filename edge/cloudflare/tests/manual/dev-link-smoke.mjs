@@ -10,8 +10,8 @@
  *
  * This speaks the canonical Relay Protocol v1 wire (snake_case, protocol
  * version 1, kinds hello/hello_ack/heartbeat/status/tool_request/tool_result/
- * tool_error/cancel/cancel_ack). It deliberately reimplements nothing of
- * `src/link/**` (owned elsewhere).
+ * tool_error/cancel/cancel_ack). It deliberately reimplements nothing of the
+ * Rust Link implementation in `crates/herdr-mcp/src/link/**`.
  *
  * Run:
  *   cd edge/cloudflare

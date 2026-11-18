@@ -9,7 +9,6 @@ const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
 const lock = JSON.parse(await readFile(join(ROOT, "package-lock.json"), "utf8"));
 
 const EXPECTED_BINS = {
-  "herdr-mcp": "dist/server.js",
   "herdr-cloudflare-token": "bin/herdr-cloudflare-token",
   "herdr-cloudflare-dns-token": "bin/herdr-cloudflare-dns-token",
   "herdr-cloudflare-domain": "bin/herdr-cloudflare-domain",
@@ -35,7 +34,6 @@ test("default Node test entrypoints own their build prerequisite", () => {
 
 test("non-node public CLI files are executable", async () => {
   for (const [name, rel] of Object.entries(EXPECTED_BINS)) {
-    if (rel === "dist/server.js") continue;
     const path = join(ROOT, rel);
     await access(path, constants.X_OK);
     const mode = (await stat(path)).mode;

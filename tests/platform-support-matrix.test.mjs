@@ -30,7 +30,7 @@ test("published support matrix tracks the live protocol compatibility identities
   const epoch1 = read("edge/cloudflare/src/contracts/epoch1.ts");
   const epoch2 = read("edge/cloudflare/src/contracts/epoch2.ts");
   const epoch3 = read("edge/cloudflare/src/contracts/epoch3.ts");  const runtime = read("edge/cloudflare/src/contracts/runtime.ts");
-  const relay = read("src/relay/protocol.ts");
+  const relay = read("edge/cloudflare/src/canonical-imports.ts");
 
   const versions = protocolVersions(handler);
   for (const doc of [en, zh]) {
@@ -72,7 +72,7 @@ test("published support matrix tracks the live protocol compatibility identities
   assert.equal(numberField(epoch2, "tool_count"), 18);
   assert.match(en, /N-1 runtime execution[\s\S]*epoch-4[\s\S]*epoch-2/i);
   assert.match(zh, /N-1 runtime execution[\s\S]*epoch-4[\s\S]*epoch-2/i);
-  assert.match(relay, /protocol_version` is the number `1` on every message/);
+  assert.match(relay, /protocol_version = number 1/);
   assert.match(en, /protocol_version = 1/);
   assert.match(zh, /protocol_version = 1/);
 });

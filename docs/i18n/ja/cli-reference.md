@@ -312,9 +312,9 @@ bin/herdr-self-update
 
 監視付き updater は generation の activation を再利用し、public contract epoch を黙って跨るために使用してはなりません。
 
-## ワークステーションの link
+## ワークステーションの Link
 
-`bin/herdr-link` は、ワークステーションから Edge への送信方向の認証済み WSS 接続を維持します。ワークステーション identity を伝搬し、リクエストを現在の active runtime generation にルーティングします。通常は手動で実行するのではなく、サービスによって管理されます。
+Production Link は Rust runtime が担当し、active installed runtime generation のシステムサービスから管理されます。退役した Node `bin/herdr-link` エントリポイントは出荷されません。
 
 ## 共通の環境変数
 
@@ -327,7 +327,6 @@ bin/herdr-self-update
 | `HERDR_MCP_READONLY` | off | mutation を無効化 |
 | `HERDR_MCP_WRITE_ROOTS` | managed roots | 書き込み可能なプロジェクトを制限 |
 | `HERDR_MCP_AGENT_ALLOW` | all discovered agents | inspect/since での agent 可視性を任意で制限 |
-| `HERDR_MCP_ALL_TOOLS` | off | 旧 Node runtime のみ。Rust runtime は無視 |
 | `HERDR_SKILL_NETWORK` | on | `0` の場合はバンドルされた skill のみを使用 |
 
 ## クイックコマンドマップ

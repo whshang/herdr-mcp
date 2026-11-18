@@ -27,7 +27,6 @@ const EXTENSION_TESTS = new Set([
 
 const EDGE_TESTS = new Set([
   "tests/public-contract-identity.integration.mjs",
-  "tests/relay-edge-compat.integration.mjs",
 ]);
 
 function isDocPath(path) {

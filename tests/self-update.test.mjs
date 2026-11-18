@@ -166,7 +166,7 @@ test("source exclusion predicate matches .git, node_modules, dist, edge/cloudfla
   assert.equal(isPathExcluded("edge/cloudflare/dist/index.js"), true);
   assert.equal(isPathExcluded("docs/architecture.md"), false);
   assert.equal(isPathExcluded("edge/cloudflare/src/index.js"), false);
-  assert.equal(isPathExcluded("src/server.ts"), false);
+  assert.equal(isPathExcluded("src/herdr.ts"), false);
   assert.equal(isPathExcluded("site-dist/index.html"), true);
   assert.deepEqual(SOURCE_EXCLUDED_COMPONENTS, [".git", "node_modules", "dist", "edge/cloudflare/dist", "site-dist"]);
 });

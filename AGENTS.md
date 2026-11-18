@@ -122,10 +122,10 @@ runtime path `~/.config/herdr-mcp/runtime/current/herdr-mcp link run`. On macOS
 the post-G5 production owner is `dev.herdr-mcp.link-prod`; on normal Linux it is
 `herdr-mcp-link.service`, with the managed user-process backend used only when a
 user systemd manager is unavailable. From 1.2 onward, the Node Link and Node
-Server runtime surfaces are retired: `src/server.ts`, `src/link/**`,
-`src/relay/**`, and `bin/herdr-link` are compatibility source retained for the
-PR-b/PR-c removal sequence, and the only retained Node entrypoint in this
-surface is `bin/herdr-extension-host`. Rust continues to recognize and clean up
+Server runtime surfaces and their corresponding Node-only tests are retired:
+`src/server.ts`, `src/link/**`, `src/relay/**`, and `bin/herdr-link` were
+removed in N2 PR-b. The only retained Node entrypoint in this surface is
+`bin/herdr-extension-host`. Rust continues to recognize and clean up
 historical Node production plists and `ServiceRollbackRecord` states, but it
 never uses a Node process as the production owner.
 Do not retarget production Link to a checkout, worktree, `dist/`, or a fixed

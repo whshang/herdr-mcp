@@ -3,16 +3,17 @@
  *
  * OWNERSHIP RULE: Keep every Relay Protocol v1 concept (envelope field names,
  * version strings, encode/decode, protocol-version checks and internal<->wire
- * mapping) inside this file. A separate worker owns `src/relay/**`; that tree
- * MUST NOT be touched. When the workstation side lands, the two sides only
- * need to agree on the envelope shapes and versions exported here.
+ * mapping) inside this file. The Rust runtime owns the workstation-side
+ * implementation in `crates/herdr-mcp/src/relay/**`; this Worker keeps an
+ * isolated wire-identical port. Both sides must agree on the envelope shapes
+ * and versions exported here.
  *
- * This file duplicates the canonical types from src/relay/protocol.ts because
- * the Worker build is isolated from the project root. Encode/decode/validation
- * MUST be wire-identical: protocol_version = number 1, snake_case field names,
- * canonical kind set.
+ * This file duplicates the canonical types from
+ * crates/herdr-mcp/src/relay/protocol.rs because the Worker build is isolated
+ * from the Rust project. Encode/decode/validation MUST be wire-identical:
+ * protocol_version = number 1, snake_case field names, canonical kind set.
  *
- * Canonical kinds (from src/relay/protocol.ts):
+ * Canonical kinds (from crates/herdr-mcp/src/relay/protocol.rs):
  *   hello, hello_ack, heartbeat, status, tool_request, tool_result,
  *   tool_error, cancel, cancel_ack
  *

@@ -243,9 +243,9 @@ export interface JwtAccessTokenVerifier {
  *  - exp: present-but-not-number throws; `exp <= nowSec` rejected.
  *  - nbf: present-but-not-number throws; `nbf > nowSec` rejected.
  *  - client_id claim preferred; sub fallback.
- * `exp`/`nbf` are NOT required, matching src/oauth.ts (jose does not require
- * them). `typ: "at+jwt"` is NOT required (src/oauth.ts signs with it but never
- * enforces it at verify).
+ * `exp`/`nbf` are NOT required, matching the retired Node OAuth
+ * compatibility behavior (jose does not require them). `typ: "at+jwt"` is NOT
+ * required because the former signer added it without enforcing it at verify.
  */
 export function createRs256AccessTokenVerifier(
   identity: OAuthEdgeIdentity,
@@ -279,13 +279,13 @@ export function createRs256AccessTokenVerifier(
       throw new Error("invalid access-token signature");
     }
 
-    // Issuer: exact match (src/oauth.ts passes { issuer } to jose → throws on mismatch).
+    // Issuer: exact match, matching the former Node OAuth verifier.
     if (payload.iss !== identity.issuer) {
       throw new Error("access-token issuer mismatch");
     }
 
-    // Audience: REQUIRED and computed unconditionally, exactly like
-    // src/oauth.ts. Missing `aud` (undefined) or `aud: null` yields
+    // Audience: REQUIRED and computed unconditionally, matching the former
+    // Node OAuth verifier. Missing `aud` (undefined) or `aud: null` yields
     // `audOk === false` → semantic rejection with NO opaque fallback.
     const aud = payload.aud;
     const audOk = Array.isArray(aud)
