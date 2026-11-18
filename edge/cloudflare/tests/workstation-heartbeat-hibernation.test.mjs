@@ -14,7 +14,13 @@ class FakeStorage {
     this.mutations = [];
   }
   async get(key) { return this.map.get(key); }
-  async put(key, value) { this.mutations.push(["put", String(key)]); this.map.set(key, value); }
+  async put(keyOrEntries, value) {
+    const entries = typeof keyOrEntries === "string" ? { [keyOrEntries]: value } : keyOrEntries;
+    for (const [key, entry] of Object.entries(entries)) {
+      this.mutations.push(["put", key]);
+      this.map.set(key, entry);
+    }
+  }
   async delete(key) { this.mutations.push(["delete", String(key)]); this.map.delete(key); }
   async list({ prefix } = {}) {
     return new Map([...this.map].filter(([key]) => !prefix || String(key).startsWith(prefix)));

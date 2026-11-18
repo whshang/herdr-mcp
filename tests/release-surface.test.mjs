@@ -28,7 +28,8 @@ test("default Node test entrypoints own their build prerequisite", () => {
   assert.equal(pkg.scripts?.test, "npm run build && npm run test:built");
   assert.match(pkg.scripts?.["test:built"] ?? "", /node --test/);
   assert.doesNotMatch(pkg.scripts?.["test:built"] ?? "", /npm run build/);
-  assert.equal(pkg.scripts?.["test:edge"], "npm run build && npm run test:edge:built");
+  assert.equal(pkg.scripts?.["test:edge"], "npm run test:edge:built");
+  assert.match(pkg.scripts?.["test:edge:built"] ?? "", /tsc -p edge\/cloudflare\/tsconfig\.json/);
   assert.doesNotMatch(pkg.scripts?.["test:edge:built"] ?? "", /npm run build/);
 });
 
@@ -76,7 +77,6 @@ test("Actions consume the shared gate and keep Cloudflare deployment on the gate
   for (const requiredExtensionContract of [
     "browser-extension-store-listing.test.mjs",
     "continuity-journal.test.mjs",
-    "extension-auth.test.mjs",
     "extension-local-auth.test.mjs",
     "extension-native-host.test.mjs",
     "extension-recovery.test.mjs",
@@ -120,6 +120,19 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   assert.ok(rootTests > start, "runtime must be ready before root transport tests");
   assert.ok(stop > rootTests, "runtime cleanup must run after root transport tests");
   assert.match(gate, /trap cleanup EXIT/, "shared gate must clean the isolated runtime on failure");
+});
+
+test("user gets a Cloudflare production gate that builds the root tree before root regression tests | Given the frozen Edge gate no longer builds the root tree | When the production Edge workflow reaches the root regression gate | Then an explicit root build runs first so dist-importing tests have their artifacts", async () => {
+  const workflow = await readFile(join(ROOT, ".github/workflows/cloudflare-edge.yml"), "utf8");
+  const frozenGate = workflow.indexOf("npm run test:edge");
+  const rootBuild = workflow.indexOf("npm run build");
+  const rootGate = workflow.indexOf("npm run test:built");
+  assert.ok(frozenGate >= 0, "workflow must run the frozen Edge gate");
+  assert.ok(rootGate > frozenGate, "root regression gate must follow the frozen Edge gate");
+  assert.ok(
+    rootBuild > frozenGate && rootBuild < rootGate,
+    "the root build must run after the frozen Edge gate and before the root regression gate",
+  );
 });
 
 test("Rust release binary embeds the immutable GitHub source commit", async () => {
@@ -589,4 +602,37 @@ test("user keeps personal workstation identifiers out of public documentation an
     assert.match(svgContent, /<svg\b/);
     assert.match(svgContent, /prefers-color-scheme:\s*dark/);
   }
+});
+
+function ciNodeGateBranch(script, mode) {
+  const match = script.match(new RegExp(`\\n  ${mode}\\)\\n([\\s\\S]*?)\\n    ;;`));
+  assert.ok(match, `ci-node-gate.sh must define the ${mode} mode`);
+  return match[1];
+}
+
+test("user gets narrow extension and Edge CI without the legacy root build | Given the selective Node gate | When the extension or Edge mode runs | Then only that component's own inputs are built and every listed test exists", async () => {
+  const gate = await readFile(join(ROOT, "scripts/ci-node-gate.sh"), "utf8");
+  const extension = ciNodeGateBranch(gate, "extension");
+  const edge = ciNodeGateBranch(gate, "edge");
+  assert.doesNotMatch(extension, /npm run build\b(?!:)/);
+  assert.doesNotMatch(edge, /npm run build\b(?!:)/);
+  assert.match(edge, /npm run test:edge:built/);
+  for (const rel of extension.match(/tests\/[\w./-]+\.mjs/g) ?? []) {
+    await access(join(ROOT, rel), constants.R_OK);
+  }
+});
+
+test("user gets Rust-only CI that still runs Rust-reading Node and Edge contracts | Given the selective Node gate | When the rust mode runs | Then it builds the root tree before the cross-language Node tests and then runs the Edge suite", async () => {
+  const gate = await readFile(join(ROOT, "scripts/ci-node-gate.sh"), "utf8");
+  const rust = ciNodeGateBranch(gate, "rust");
+  const rootBuild = rust.indexOf("npm run build");
+  const nodeTests = rust.indexOf('node --test "${rust_node_tests[@]}"');
+  assert.ok(rootBuild >= 0, "rust mode must build the root tree for cross-language contracts");
+  assert.ok(
+    rootBuild < nodeTests,
+    "the root build must run before the cross-language Node tests",
+  );
+  assert.match(rust, /select-ci-tests\.mjs --list-rust-node-tests/);
+  assert.match(rust, /node --test "\$\{rust_node_tests\[@\]\}"/);
+  assert.match(rust, /npm run test:edge:built/);
 });
