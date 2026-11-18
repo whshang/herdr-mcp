@@ -33572,6 +33572,7 @@ mod text_transfer_safety_tests {
         stop: Arc<std::sync::atomic::AtomicBool>,
         requests: Arc<std::sync::atomic::AtomicUsize>,
         server: std::thread::JoinHandle<()>,
+        _socket_guard: crate::test_env::TempUnixSocketGuard,
     }
 
     impl FakeCore {
@@ -33632,6 +33633,7 @@ mod text_transfer_safety_tests {
                 stop,
                 requests,
                 server,
+                _socket_guard: crate::test_env::TempUnixSocketGuard::file(".hc"),
             })
         }
 
