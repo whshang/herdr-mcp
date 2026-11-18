@@ -789,6 +789,9 @@ impl ExecRegistry {
         sessions.insert(id.clone(), Arc::clone(&session));
         drop(sessions);
         spawn_monitor(Arc::clone(&session), Arc::downgrade(&self.inner));
+        // The spawned command may mutate the working tree under `cwd` before
+        // any completion event; bound cached git-status staleness from start.
+        crate::projects::invalidate_git_status_cache_for_path(cwd);
         Ok(json!({
             "ok": true,
             "session_id": id,

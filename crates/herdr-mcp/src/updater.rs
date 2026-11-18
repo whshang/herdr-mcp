@@ -2103,9 +2103,24 @@ fn run_service_command(binary: &Path, paths: &RuntimePaths, args: &[&str]) -> Re
     if let Some(name) = paths.instance.name() {
         command.env("HERDR_MCP_INSTANCE", name);
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot execute {}: {error}", binary.display()))?;
+    let output = match crate::child_process::run_bounded_output(
+        &mut command,
+        SERVICE_COMMAND_TIMEOUT,
+        SERVICE_COMMAND_MAX_OUTPUT,
+    ) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            return Err(format!(
+                "{} {} timed out after {:?}",
+                binary.display(),
+                args.join(" "),
+                SERVICE_COMMAND_TIMEOUT
+            ));
+        }
+        Err(error) => {
+            return Err(format!("cannot execute {}: {error}", binary.display()));
+        }
+    };
     if output.status.success() {
         #[cfg(target_os = "macos")]
         if args == ["service", "stop"] {
@@ -2123,18 +2138,34 @@ fn run_service_command(binary: &Path, paths: &RuntimePaths, args: &[&str]) -> Re
 }
 
 #[cfg(target_os = "macos")]
+const SERVICE_STOP_VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const SERVICE_STOP_VERIFY_MAX_OUTPUT: usize = 32 * 1024;
+
+#[cfg(target_os = "macos")]
 fn verify_major_upgrade_service_stopped(paths: &RuntimePaths) -> Result<(), String> {
     // Older source binaries treat every failed launchctl lookup as "not loaded".
     // Independently require an explicit absence before taking or restoring a snapshot.
     let uid = unsafe { libc::getuid() };
     let label = paths.instance.service_label();
     let target = format!("gui/{uid}/{label}");
-    let output = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("cannot verify stopped service {target}: {error}"))?;
+    let mut command = Command::new("/bin/launchctl");
+    command.args(["print", &target]).env("LC_ALL", "C");
+    let output = match crate::child_process::run_bounded_output(
+        &mut command,
+        SERVICE_STOP_VERIFY_TIMEOUT,
+        SERVICE_STOP_VERIFY_MAX_OUTPUT,
+    ) {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            return Err(format!(
+                "cannot verify stopped service {target}: launchctl timed out"
+            ));
+        }
+        Err(error) => {
+            return Err(format!("cannot verify stopped service {target}: {error}"));
+        }
+    };
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success()
         && stderr.lines().any(|line| {
@@ -2943,6 +2974,20 @@ fn verify_staged_file(path: &Path, expected_sha256: &str) -> Result<(), String> 
 const EXEC_BUSY_ATTEMPTS: usize = 10;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const EXEC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
+/// A just-staged candidate binary can wedge on first execution (quarantine,
+/// corrupted download, sandbox). Cap the version probe so the updater never
+/// deadlocks while holding the update lock (#1049).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CANDIDATE_PROBE_MAX_OUTPUT: usize = 32 * 1024;
+/// Service lifecycle calls (`service stop/start/uninstall`) can wedge inside
+/// launchctl or a hung pre-stop hook; bound them so an update never deadlocks
+/// holding the update lock (#1049).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SERVICE_COMMAND_MAX_OUTPUT: usize = 32 * 1024;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn executable_is_busy(error: &std::io::Error) -> bool {
@@ -2988,13 +3033,30 @@ fn probe_candidate_binary(
     expected_contract: &crate::contract::ContractIdentity,
     expected_schema: i64,
 ) -> Result<(), String> {
+    probe_candidate_binary_with_timeout(
+        path,
+        expected,
+        expected_contract,
+        expected_schema,
+        CANDIDATE_PROBE_TIMEOUT,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn probe_candidate_binary_with_timeout(
+    path: &Path,
+    expected: &Version,
+    expected_contract: &crate::contract::ContractIdentity,
+    expected_schema: i64,
+    timeout: Duration,
+) -> Result<(), String> {
     let output = retry_text_file_busy(EXEC_BUSY_ATTEMPTS, EXEC_BUSY_RETRY_DELAY, || {
-        Command::new(path)
-            .arg("version")
-            .stdin(Stdio::null())
-            .output()
+        let mut command = Command::new(path);
+        command.arg("version");
+        crate::child_process::run_bounded_output(&mut command, timeout, CANDIDATE_PROBE_MAX_OUTPUT)
     })
-    .map_err(|error| format!("cannot execute staged update binary: {error}"))?;
+    .map_err(|error| format!("cannot execute staged update binary: {error}"))?
+    .ok_or_else(|| "staged update binary version probe timed out".to_owned())?;
     if !output.status.success() || output.stdout.len() > 16 * 1024 {
         return Err("staged update binary version probe failed".to_owned());
     }
@@ -3588,6 +3650,47 @@ mod tests {
             calls, 10,
             "a stuck executable must fail after bounded retries"
         );
+    }
+
+    /// user updater | Given a staged candidate binary that hangs on its first
+    /// `version` probe | When the updater probes it | Then the bounded runner
+    /// kills the process group and the probe returns a timeout error instead
+    /// of deadlocking while holding the update lock (#1049).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn candidate_probe_times_out_on_a_hung_binary() {
+        let local = crate::contract::identity().unwrap();
+        let version = Version::parse("9.9.9").unwrap();
+        let root = env::temp_dir().join(format!(
+            "herdr-candidate-probe-hang-{}-{}",
+            std::process::id(),
+            now_ms_i64()
+        ));
+        let binary = root.join("candidate-hang");
+        // `exec sleep` keeps the child alive with no output; only the bounded
+        // runner's hard timeout can release the caller.
+        write_test_executable(&binary, "#!/bin/sh\nexec sleep 30\n");
+
+        let started = Instant::now();
+        let error = probe_candidate_binary_with_timeout(
+            &binary,
+            &version,
+            &local,
+            SCHEMA_VERSION,
+            Duration::from_millis(250),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.contains("timed out"),
+            "hung probe must report a timeout: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "hung probe must be released promptly, took {elapsed:?}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -57,7 +57,7 @@ import {
   queuedInsertStatus,
 } from "./queued-insert-core.js";
 
-const H2W_SCRIPT_VERSION = "0.1.253";
+const H2W_SCRIPT_VERSION = "0.1.254";
 const BROWSER_CREATE_CONTENT_TIMEOUT_MS = 43_000;
 // Dispatch has a 22s initial Runtime wait and a 60s exact late-completion
 // fence. Keep listening for the ORIGINAL content reply within that fence;
@@ -822,7 +822,6 @@ function reclaimUnboundConversationState(oldBindings, newBindings) {
     for (const convKey of bindingConversationKeys(key, entry)) live.add(convKey);
   }
   for (const [key, entry] of Object.entries(previous)) {
-    if (Object.prototype.hasOwnProperty.call(next, key)) continue;
     for (const convKey of bindingConversationKeys(key, entry)) {
       if (!live.has(convKey)) forgetConversationNudgeState(convKey);
     }
