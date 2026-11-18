@@ -49,7 +49,8 @@ The project `HANDOFF.md` in a worktree is a **markdown view**, not the whole rel
 - A tick compares the file against the markdown it last rendered, so an untouched file is not rewritten. Editing the file in place (`- [id] text`, `- [id] (status) text`) is folded back into the authoritative state on the next tick.
 - When the state is larger than the character budget, the file shows what fits and states how many items it omitted (`已省略 N 条`). Omitted items stay in the authoritative state; they are not deleted by a later file edit. Read them with `herdr_mcp.work.pickup`, which projects the full state.
 - The live git context (`## 工作区`: branch, changed files, next step) is page-level state, rendered once at the top and never evicted to satisfy the budget.
-- Entry guard: a summarizer rule/mistake longer than 280 characters, or one that names bound work (a PR/issue number, a run, a temporary path), is moved into the task list verbatim. Durable rules are short, repeatable statements — put one-off work in tasks.
+- Entry guard: a summarizer rule/mistake longer than 280 characters, or one that names bound work (a PR/issue number, a run, a temporary path), is moved into the task list verbatim. Durable rules are short, repeatable statements — put one-off work in tasks. A moved rule is never auto-closed merely because it mentions a merged PR.
+- Closed work is archived, not deleted: a done, stale (30 days) or merge-proven task leaves the file and the default pickup projection but keeps its text in the authoritative state (rollback/history). `work.pickup` reports it in `archived_counts` and returns it only with `include_archived=true`; the newest 200 archived tasks are retained. An explicit task update re-opens an archived task.
 
 
 ## Bounded project pickup

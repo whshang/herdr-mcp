@@ -20,6 +20,10 @@ const EVENT_RECENT_MAX_CHARS: usize = 200;
 /// Tasks untouched for longer than this are closed as stale (a task list that
 /// never ages is a task list nobody trusts).
 const STALE_TASK_DAYS: i64 = 30;
+/// Retention bound for archived (closed) tasks: the newest N keep their text in
+/// the authoritative state; older ones are pruned so a long-lived project
+/// cannot grow without limit (#H3b).
+const ARCHIVED_TASKS_MAX: usize = 200;
 const DAY_MS: i64 = 86_400_000;
 /// Trailing structured-memory block: everything after it is machine state,
 /// so the markdown above stays free to render for humans/agents.
@@ -359,11 +363,16 @@ pub(crate) struct RelayTask {
     /// `None` on legacy rows, which count from their first load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_ms: Option<i64>,
+    /// #H3b: closed work is archived instead of deleted. The item stays in the
+    /// authoritative state (history and rollback) but is not rendered to disk
+    /// and only appears in `work.pickup` with `include_archived=true`.
+    /// Unknown to an older runtime, which simply ignores it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archived: bool,
     /// This task was moved out of `preferences`/`mistakes` by the entry guard
     /// (#H3a). Such a text *mentions* bound work (a PR number, a run, a temp
     /// path); it is not proof that this task is that PR, so merged-ref evidence
-    /// must not auto-close it — otherwise the text would vanish from rules,
-    /// tasks and disk in the same tick.
+    /// must not close it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub rule_derived: bool,
 }
@@ -555,17 +564,25 @@ pub(crate) fn fold_file_edits(memory: &mut RelayMemory, file_md: &str, now_ms: i
             .and_then(|task| task.updated_ms)
             .or(Some(now_ms));
         // #H3a review P1: the disk markdown carries no `rule_derived` marker, so
-        // recovering it by id must not reset it — otherwise an unrelated file
-        // edit turns a moved rule back into an ordinary task and the same tick's
-        // merged-ref refresh deletes the text.
+        // recovering it by id must not reset it. A reopened (archived) task also
+        // comes back live while its edit is folded.
         let rule_derived = prior.is_some_and(|task| task.rule_derived);
         folded.push(RelayTask {
             id,
             text,
             status,
             updated_ms,
+            archived: false,
             rule_derived,
         });
+    }
+    // #H3b: archived tasks never appear in the file, so their absence is not a
+    // deletion. Extend first, then dedupe once so a folded copy cannot survive
+    // next to its archived twin (#H3b review P2).
+    for task in previous.into_iter().filter(|task| task.archived) {
+        if !folded.iter().any(|kept| kept.id == task.id) {
+            folded.push(task);
+        }
     }
     dedupe_tasks(&mut folded);
     memory.tasks = folded;
@@ -754,8 +771,10 @@ fn dedupe_tasks(tasks: &mut Vec<RelayTask>) {
                     kept.status = task.status;
                 }
                 kept.updated_ms = kept.updated_ms.max(task.updated_ms);
-                // #H3a review P1: a deduped pair keeps the guard marker.
+                // #H3a review P1: a deduped pair keeps the guard marker, and a
+                // live copy reopens an archived one.
                 kept.rule_derived |= task.rule_derived;
+                kept.archived &= task.archived;
             }
             None => deduped.push(task),
         }
@@ -804,7 +823,7 @@ pub(crate) fn render_handoff_markdown(memory: &RelayMemory) -> String {
         .tasks
         .iter()
         .rev()
-        .filter(|task| task.status != "done")
+        .filter(|task| !task.archived && task.status != "done")
     {
         out.push_str(&format!(
             "\n- [{}] ({}) {}",
@@ -833,7 +852,10 @@ fn render_handoff_markdown_bounded(memory: &RelayMemory) -> String {
     if full.chars().count() <= HANDOFF_MAX_CHARS {
         return full;
     }
+    // #H3b review P1-2: archived tasks never render, so they are not budget
+    // candidates and must not inflate the omitted count.
     let mut view = memory.clone();
+    view.tasks.retain(|task| !task.archived);
     for omitted in 0..10_000usize {
         let rendered = render_handoff_markdown(&view);
         if rendered.chars().count() <= HANDOFF_MAX_CHARS.saturating_sub(160) {
@@ -1024,6 +1046,9 @@ fn apply_task_ops(tasks: &mut Vec<RelayTask>, ops: Vec<TaskOp>, now_ms: i64) {
                         existing.status = status;
                     }
                     existing.updated_ms = Some(now_ms);
+                    // #H3b: an explicit update re-opens archived work instead of
+                    // leaving the item invisible forever.
+                    existing.archived = false;
                     continue;
                 }
                 let Some(text) = text else { continue };
@@ -1044,6 +1069,7 @@ fn apply_task_ops(tasks: &mut Vec<RelayTask>, ops: Vec<TaskOp>, now_ms: i64) {
                     text,
                     status: status.unwrap_or_else(task_status_todo),
                     updated_ms: Some(now_ms),
+                    archived: false,
                     rule_derived: false,
                 });
             }
@@ -1152,6 +1178,7 @@ fn reclassify_bound_items(memory: &mut RelayMemory, now_ms: i64) {
             text,
             status: "todo".to_owned(),
             updated_ms: Some(now_ms),
+            archived: false,
             rule_derived: true,
         });
     }
@@ -1216,10 +1243,9 @@ fn enforce_budget(memory: &mut RelayMemory) {
             memory.sources.remove(0);
             continue;
         }
-        if memory.tasks.iter().any(|task| task.status == "done") {
-            memory.tasks.retain(|task| task.status != "done");
-            continue;
-        }
+        // Archived tasks and done tasks render nothing, so deleting them cannot
+        // shorten the disk; archive capacity is owned by `prune_archived_tasks`
+        // and the authoritative history must stay complete (#H3b review P1-1).
         return;
     }
 }
@@ -1332,14 +1358,53 @@ fn refresh_tasks(memory: &mut RelayMemory, merged: Option<&MergedRefs>, now_ms: 
     for task in &mut memory.tasks {
         task.updated_ms.get_or_insert(now_ms);
     }
-    memory.tasks.retain(|task| {
-        task.status != "done"
-            && now_ms.saturating_sub(task.updated_ms.unwrap_or(now_ms)) <= STALE_TASK_DAYS * DAY_MS
+    for task in &mut memory.tasks {
+        if task.archived {
+            continue;
+        }
+        let finished = task.status == "done"
             // A task moved out of a rule only *mentions* the PR/run it talks
             // about; merged-ref evidence closes real work, not a distilled
-            // note, so it must not delete the text (#H3a review P1).
-            && (task.rule_derived
-                || !merged.is_some_and(|merged| merged.matched_by(&task.text)))
+            // note (#H3a review P1).
+            || (!task.rule_derived && merged.is_some_and(|merged| merged.matched_by(&task.text)));
+        let stale =
+            now_ms.saturating_sub(task.updated_ms.unwrap_or(now_ms)) > STALE_TASK_DAYS * DAY_MS;
+        if finished {
+            task.archived = true;
+            task.status = "done".to_owned();
+        } else if stale {
+            task.archived = true;
+        }
+    }
+    prune_archived_tasks(memory);
+}
+
+/// Retention bound for archived tasks: keep the newest `ARCHIVED_TASKS_MAX`,
+/// drop the oldest beyond it. Live tasks are never touched.
+fn prune_archived_tasks(memory: &mut RelayMemory) {
+    let archived = memory.tasks.iter().filter(|task| task.archived).count();
+    let excess = archived.saturating_sub(ARCHIVED_TASKS_MAX);
+    if excess == 0 {
+        return;
+    }
+    let mut oldest: Vec<(i64, usize)> = memory
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.archived)
+        .map(|(index, task)| (task.updated_ms.unwrap_or(0), index))
+        .collect();
+    oldest.sort_unstable();
+    let drop: std::collections::HashSet<usize> = oldest
+        .into_iter()
+        .take(excess)
+        .map(|(_, index)| index)
+        .collect();
+    let mut index = 0;
+    memory.tasks.retain(|_| {
+        let keep = !drop.contains(&index);
+        index += 1;
+        keep
     });
 }
 
@@ -1352,8 +1417,12 @@ struct MergedRefCache {
 
 impl MergedRefCache {
     fn for_memory(&mut self, memory: &RelayMemory, worktree: &Path) -> Option<&MergedRefs> {
-        // Nothing to close: skip git entirely.
-        if !memory.tasks.iter().any(|task| task.status != "done") {
+        // Nothing to close: skip git entirely. Archived work is already closed.
+        if !memory
+            .tasks
+            .iter()
+            .any(|task| !task.archived && task.status != "done")
+        {
             return None;
         }
         let key = worktree.to_string_lossy().into_owned();
@@ -2615,6 +2684,7 @@ mod audit_fix_tests {
             text: "old task".into(),
             status: "blocked".into(),
             updated_ms: None,
+            archived: false,
             rule_derived: false,
         });
         memory.tasks.push(RelayTask {
@@ -2622,6 +2692,7 @@ mod audit_fix_tests {
             text: "new task".into(),
             status: "todo".into(),
             updated_ms: None,
+            archived: false,
             rule_derived: false,
         });
         memory.tasks.push(RelayTask {
@@ -2629,6 +2700,7 @@ mod audit_fix_tests {
             text: "finished task".into(),
             status: "done".into(),
             updated_ms: None,
+            archived: false,
             rule_derived: false,
         });
         memory.goals.push(RelayItem {
@@ -2667,6 +2739,7 @@ mod audit_fix_tests {
             text: "write add()".into(),
             status: "doing".into(),
             updated_ms: None,
+            archived: false,
             rule_derived: false,
         });
         let edited = render_handoff(&memory)
@@ -3819,6 +3892,7 @@ mod tests {
                 text: "Always run the full test…".to_owned(),
                 status: "doing".to_owned(),
                 updated_ms: Some(3),
+                archived: false,
                 rule_derived: false,
             },
             RelayTask {
@@ -3826,6 +3900,7 @@ mod tests {
                 text: "Always run the full test.".to_owned(),
                 status: "doing".to_owned(),
                 updated_ms: Some(9),
+                archived: false,
                 rule_derived: false,
             },
         ];
@@ -3880,7 +3955,12 @@ mod tests {
         assert_eq!(memory.tasks[0].id, "t3");
         assert_eq!(memory.tasks[0].status, "done");
         refresh_tasks(&mut memory, None, 8);
-        assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
+        assert!(
+            memory.tasks.iter().all(|task| task.archived),
+            "{:?}",
+            memory.tasks
+        );
+        assert_eq!(memory.tasks.len(), 1);
     }
 
     /// relay memory dedupe | Given a prefix-related but not clipped pair of
@@ -4130,6 +4210,7 @@ mod tests {
             text: text.to_owned(),
             status: status.to_owned(),
             updated_ms: updated,
+            archived: false,
             rule_derived: false,
         };
         let mut memory = RelayMemory {
@@ -4148,10 +4229,24 @@ mod tests {
             ..RelayMemory::default()
         };
         refresh_tasks(&mut memory, Some(&merged_refs(&root)), now);
-        let ids: Vec<&str> = memory.tasks.iter().map(|task| task.id.as_str()).collect();
+        // #H3b: closed work is archived (kept in state), never silently dropped.
+        let ids: Vec<&str> = memory
+            .tasks
+            .iter()
+            .filter(|task| !task.archived)
+            .map(|task| task.id.as_str())
+            .collect();
         assert_eq!(ids, ["t4"]);
-        // Closed work is not rendered either.
-        let rendered = render_handoff(&memory);
+        let archived: Vec<&str> = memory
+            .tasks
+            .iter()
+            .filter(|task| task.archived)
+            .map(|task| task.id.as_str())
+            .collect();
+        assert_eq!(archived, ["t1", "t2", "t3", "t5"]);
+        // Closed work is not rendered either (the JSON block keeps it for
+        // rollback, so only the markdown part is checked).
+        let rendered = handoff_markdown(&render_handoff(&memory)).to_owned();
         for closed in ["t1", "t2", "t3", "t5"] {
             assert!(!rendered.contains(closed), "task {closed} still rendered");
         }
@@ -4171,7 +4266,7 @@ mod tests {
             Some(&refs),
             now + (STALE_TASK_DAYS + 1) * DAY_MS,
         );
-        assert!(legacy.tasks.is_empty());
+        assert!(legacy.tasks.iter().all(|task| task.archived));
 
         // No open task closes nothing: git is not consulted at all.
         let mut closed_only = RelayMemory {
@@ -4181,7 +4276,7 @@ mod tests {
         let mut cache = MergedRefCache::default();
         assert!(cache.for_memory(&closed_only, &root).is_none());
         refresh_tasks(&mut closed_only, None, now);
-        assert!(closed_only.tasks.is_empty());
+        assert!(closed_only.tasks.iter().all(|task| task.archived));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4219,6 +4314,7 @@ mod tests {
             text: text.to_owned(),
             status: "doing".to_owned(),
             updated_ms: Some(now),
+            archived: false,
             rule_derived: false,
         };
         let mut memory = RelayMemory {
@@ -4232,8 +4328,14 @@ mod tests {
             ..RelayMemory::default()
         };
         refresh_tasks(&mut memory, Some(&refs), now);
-        let ids: Vec<&str> = memory.tasks.iter().map(|task| task.id.as_str()).collect();
+        let ids: Vec<&str> = memory
+            .tasks
+            .iter()
+            .filter(|task| !task.archived)
+            .map(|task| task.id.as_str())
+            .collect();
         assert_eq!(ids, ["t1", "t5"]);
+        assert_eq!(memory.tasks.len(), 5, "closed tasks stay archived");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4285,6 +4387,7 @@ mod tests {
                 text: "30 天没动过的旧任务".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: Some(stale),
+                archived: false,
                 rule_derived: false,
             }],
             ..RelayMemory::default()
@@ -4310,7 +4413,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let memory = parsed_memory(&state.handoff_md).unwrap();
-        assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
+        assert!(
+            memory.tasks.iter().all(|task| task.archived),
+            "closed work stays archived in state: {:?}",
+            memory.tasks
+        );
         let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
         assert!(!on_disk.contains("[t1]"), "{on_disk}");
         assert!(disk_matches_state(&on_disk, &state), "{on_disk}");
@@ -4360,7 +4467,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let memory = parsed_memory(&state.handoff_md).unwrap();
-        assert!(memory.tasks.is_empty(), "{:?}", memory.tasks);
+        assert!(
+            memory.tasks.iter().all(|task| task.archived),
+            "closed work stays archived in state: {:?}",
+            memory.tasks
+        );
         let on_disk = fs::read_to_string(root.join("HANDOFF.md")).unwrap();
         assert!(!on_disk.contains("PR #42"), "{on_disk}");
         assert!(disk_matches_state(&on_disk, &state), "{on_disk}");
@@ -4548,6 +4659,7 @@ mod tests {
                 text: "wire work.pickup".to_owned(),
                 status: "doing".to_owned(),
                 updated_ms: None,
+                archived: false,
                 rule_derived: false,
             }],
             current_state: "mid-implementation".to_owned(),
@@ -4684,6 +4796,7 @@ mod tests {
                 text: "done work ".to_owned() + &"y".repeat(40),
                 status: "done".to_owned(),
                 updated_ms: None,
+                archived: false,
                 rule_derived: false,
             })
             .collect();
@@ -4692,6 +4805,7 @@ mod tests {
             text: format!("still open task keeps its text {}", "z".repeat(80)),
             status: "todo".to_owned(),
             updated_ms: None,
+            archived: false,
             rule_derived: false,
         });
         memory.workspace = Some(GitContext {
@@ -4708,8 +4822,18 @@ mod tests {
         // Droppable state is gone and the open task survives whole.
         assert!(memory.recent.is_empty());
         assert!(memory.sources.len() <= 5);
-        assert!(memory.tasks.iter().all(|task| task.status != "done"));
-        assert_eq!(memory.tasks.len(), 1);
+        // #H3b: budget enforcement no longer deletes tasks at all — closed and
+        // archived work is owned by `refresh_tasks`/`prune_archived_tasks`.
+        assert_eq!(memory.tasks.len(), 31);
+        assert_eq!(
+            memory
+                .tasks
+                .iter()
+                .filter(|task| task.status == "done")
+                .count(),
+            30
+        );
+        assert!(!stored.contains("[t0] "), "done work never renders");
         assert!(stored.contains(&"z".repeat(80)));
         // #H3a: the git context is page-level evidence and is never evicted.
         assert!(memory.workspace.is_some());
@@ -4868,20 +4992,25 @@ mod tests {
             text: "finish PR #986".to_owned(),
             status: "todo".to_owned(),
             updated_ms: Some(2_000),
+            archived: false,
             rule_derived: false,
         });
         refresh_tasks(&mut memory, Some(&merged), 2_000);
-        assert!(
-            !memory.tasks.iter().any(|task| task.id == "t9"),
-            "merged-ref closure still applies to real tasks"
-        );
-        assert_eq!(memory.tasks.len(), 2);
+        // #H3b: merged-ref closure still applies to real work — it archives the
+        // task instead of deleting its text.
+        let closed = memory
+            .tasks
+            .iter()
+            .find(|task| task.id == "t9")
+            .expect("closed task keeps its text");
+        assert!(closed.archived, "merged-ref closure archives real work");
+        assert!(closed.status == "done");
+        assert_eq!(memory.tasks.iter().filter(|t| !t.archived).count(), 2);
     }
 
     /// relay memory entry guard | Given a moved rule rendered to disk | When an
     /// unrelated hand edit is folded back | Then the recovered task keeps
-    /// `rule_derived`, so the same tick's merged-ref refresh still keeps the
-    /// text instead of deleting it.
+    /// `rule_derived`, so the same tick's merged-ref refresh still keeps it live.
     #[test]
     fn hand_edit_fold_preserves_rule_derived_through_the_same_tick_refresh() {
         let mut memory = RelayMemory::default();
@@ -4916,31 +5045,25 @@ mod tests {
             .iter()
             .find(|task| task.id == moved_id)
             .expect("moved rule survives the fold");
-        assert!(
-            recovered.rule_derived,
-            "the fold must recover rule_derived by id: {recovered:?}"
-        );
+        assert!(recovered.rule_derived, "{recovered:?}");
 
-        // Same tick: merged evidence for PR #986 must not delete the text.
         let merged = MergedRefs {
             prs: vec![986],
             branches: Vec::new(),
         };
         refresh_tasks(&mut folded, Some(&merged), 2_000);
-        assert!(
-            folded
-                .tasks
-                .iter()
-                .any(|task| task.text.contains("PR #986 rollout style")),
-            "moved rule text survived the refresh: {:?}",
-            folded.tasks
-        );
+        let live = folded
+            .tasks
+            .iter()
+            .find(|task| task.id == moved_id)
+            .expect("still present");
+        assert!(!live.archived, "moved rule stays live: {live:?}");
         assert!(folded.tasks.iter().any(|task| task.id == "t777"));
     }
 
     /// relay memory dedupe | Given two copies of one text where only one is a
     /// moved rule | When duplicates collapse | Then the survivor keeps the
-    /// guard marker.
+    /// guard marker and the more open lifecycle state.
     #[test]
     fn dedupe_of_task_copies_keeps_the_rule_derived_marker() {
         let mut tasks = vec![
@@ -4949,6 +5072,7 @@ mod tests {
                 text: "do not repeat the PR #986 rollout style".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: Some(1),
+                archived: true,
                 rule_derived: true,
             },
             RelayTask {
@@ -4956,12 +5080,200 @@ mod tests {
                 text: "Do not repeat the PR #986 rollout style".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: Some(2),
+                archived: false,
                 rule_derived: false,
             },
         ];
         dedupe_tasks(&mut tasks);
         assert_eq!(tasks.len(), 1, "{tasks:?}");
         assert!(tasks[0].rule_derived, "{tasks:?}");
+        assert!(!tasks[0].archived, "a live copy reopens: {tasks:?}");
+    }
+
+    /// relay memory budget | Given archived history plus an over-budget document
+    /// | When the budget is enforced | Then archived tasks are never deleted
+    /// (they render nothing, so removing them cannot shorten the disk) and the
+    /// authoritative history stays complete.
+    #[test]
+    fn enforce_budget_never_deletes_archived_tasks() {
+        let mut memory = memory_with_sections();
+        memory.preferences = (0..300)
+            .map(|index| RelayItem {
+                id: format!("p{index}"),
+                text: format!("rule {index}: {}", "keep this whole rule. ".repeat(12)),
+            })
+            .collect();
+        memory.tasks = (0..5)
+            .map(|index| RelayTask {
+                id: format!("a{index}"),
+                text: format!("archived history {index}"),
+                status: "done".to_owned(),
+                updated_ms: Some(index as i64),
+                archived: true,
+                rule_derived: false,
+            })
+            .collect();
+        memory.tasks.push(RelayTask {
+            id: "live".to_owned(),
+            text: "still open".to_owned(),
+            status: "todo".to_owned(),
+            updated_ms: Some(9),
+            archived: false,
+            rule_derived: false,
+        });
+        assert!(render_handoff_markdown(&memory).chars().count() > HANDOFF_MAX_CHARS);
+
+        enforce_budget(&mut memory);
+
+        assert_eq!(
+            memory.tasks.iter().filter(|task| task.archived).count(),
+            5,
+            "budget enforcement must not delete archived history: {:?}",
+            memory.tasks
+        );
+        assert!(memory.tasks.iter().any(|task| task.id == "live"));
+        assert_eq!(memory.preferences.len(), 300, "rule text is never cut");
+    }
+
+    /// relay memory archive | Given archived tasks that never render | When the
+    /// bounded disk view elides visible items | Then the omitted count covers
+    /// only visible items and archived history is never counted or popped.
+    #[test]
+    fn bounded_handoff_omits_only_visible_items() {
+        let mut memory = RelayMemory {
+            tasks: (0..3)
+                .map(|index| RelayTask {
+                    id: format!("a{index}"),
+                    text: "archived history".to_owned(),
+                    status: "done".to_owned(),
+                    updated_ms: Some(index as i64),
+                    archived: true,
+                    rule_derived: false,
+                })
+                .collect(),
+            ..RelayMemory::default()
+        };
+        let live: Vec<RelayTask> = (0..80)
+            .map(|index| RelayTask {
+                id: format!("t{index}"),
+                text: format!("visible task {index} {}", "z".repeat(200)),
+                status: "todo".to_owned(),
+                updated_ms: Some(100 + index as i64),
+                archived: false,
+                rule_derived: false,
+            })
+            .collect();
+        memory.tasks.extend(live);
+
+        let disk = render_handoff_markdown_bounded(&memory);
+        assert!(disk.chars().count() <= HANDOFF_MAX_CHARS, "{disk}");
+        assert!(!disk.contains("[a0]"), "{disk}");
+        let visible_rendered = disk.lines().filter(|line| line.starts_with("- [t")).count();
+        let omitted: usize = disk
+            .split("已省略 ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no omission marker: {disk}"));
+        assert_eq!(
+            omitted,
+            80 - visible_rendered,
+            "omitted must count only the visible items the budget dropped"
+        );
+    }
+
+    /// relay memory archive | Given closed work (done / stale / merged) | When
+    /// the tick refreshes tasks | Then the text stays in the authoritative state
+    /// as archived history, leaves the rendered document, and only the newest
+    /// ARCHIVED_TASKS_MAX are retained.
+    #[test]
+    fn closed_work_is_archived_in_state_but_never_rendered() {
+        let root = temp_dir("h3b-archive");
+        fs::create_dir(root.join(".git")).unwrap();
+        let now = 1_000 * DAY_MS;
+        let task = |id: &str, status: &str, updated: i64| RelayTask {
+            id: id.to_owned(),
+            text: format!("work {id}"),
+            status: status.to_owned(),
+            updated_ms: Some(updated),
+            archived: false,
+            rule_derived: false,
+        };
+        let mut memory = RelayMemory {
+            tasks: vec![
+                task("t1", "done", now),
+                task("t2", "todo", now - (STALE_TASK_DAYS + 1) * DAY_MS),
+                task("t3", "todo", now),
+            ],
+            ..RelayMemory::default()
+        };
+        refresh_tasks(&mut memory, None, now);
+        let live: Vec<&str> = memory
+            .tasks
+            .iter()
+            .filter(|task| !task.archived)
+            .map(|task| task.id.as_str())
+            .collect();
+        assert_eq!(live, ["t3"]);
+        assert_eq!(memory.tasks.len(), 3, "closed work is kept, not deleted");
+        let stored = render_handoff(&memory);
+        assert!(
+            parsed_memory(&stored).unwrap().tasks.len() == 3,
+            "rollback keeps all"
+        );
+        let disk = handoff_markdown(&stored);
+        assert!(!disk.contains("[t1]"), "{disk}");
+        assert!(!disk.contains("[t2]"), "{disk}");
+        assert!(disk.contains("[t3]"), "{disk}");
+
+        // Retention bound: the oldest archived entries are pruned.
+        let mut crowded = RelayMemory {
+            tasks: (0..ARCHIVED_TASKS_MAX + 5)
+                .map(|index| RelayTask {
+                    id: format!("a{index}"),
+                    text: format!("archived {index}"),
+                    status: "done".to_owned(),
+                    updated_ms: Some(index as i64),
+                    archived: true,
+                    rule_derived: false,
+                })
+                .collect(),
+            ..RelayMemory::default()
+        };
+        prune_archived_tasks(&mut crowded);
+        assert_eq!(crowded.tasks.len(), ARCHIVED_TASKS_MAX);
+        assert!(
+            !crowded.tasks.iter().any(|task| task.id == "a0"),
+            "the oldest archived entry is the one pruned"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// relay memory archive | Given an archived task | When the summarizer
+    /// explicitly updates it | Then it comes back live instead of staying
+    /// invisible forever.
+    #[test]
+    fn explicit_update_reopens_an_archived_task() {
+        let mut memory = RelayMemory {
+            tasks: vec![RelayTask {
+                id: "t1".to_owned(),
+                text: "archived work".to_owned(),
+                status: "done".to_owned(),
+                updated_ms: Some(1),
+                archived: true,
+                rule_derived: false,
+            }],
+            ..RelayMemory::default()
+        };
+        let ops: HandoffOps = serde_json::from_value(serde_json::json!({
+            "tasks": [{"op": "update", "id": "t1", "text": "archived work", "status": "todo"}]
+        }))
+        .unwrap();
+        apply_memory_ops(&mut memory, ops, 5);
+        assert_eq!(memory.tasks.len(), 1);
+        assert!(!memory.tasks[0].archived, "{:?}", memory.tasks);
+        assert_eq!(memory.tasks[0].status, "todo");
+        assert!(render_handoff_markdown(&memory).contains("[t1]"));
     }
 
     /// relay memory entry guard | Given ops whose rule text is exactly at the
@@ -4976,6 +5288,7 @@ mod tests {
                 text: "existing".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: None,
+                archived: false,
                 rule_derived: false,
             }],
             ..RelayMemory::default()
@@ -5092,6 +5405,7 @@ mod tests {
                 text: "compactor task".to_owned(),
                 status: "todo".to_owned(),
                 updated_ms: None,
+                archived: false,
                 rule_derived: false,
             });
             RenderedHandoff {
@@ -5189,6 +5503,7 @@ mod tests {
                     text: format!("PR #{} relay task {}", 1000 + index, "y".repeat(64)),
                     status: "todo".to_owned(),
                     updated_ms: None,
+                    archived: false,
                     rule_derived: false,
                 })
                 .collect(),
@@ -5270,6 +5585,7 @@ mod tests {
                     text: format!("relay task {} {}", index, "z".repeat(64)),
                     status: "todo".to_owned(),
                     updated_ms: None,
+                    archived: false,
                     rule_derived: false,
                 })
                 .collect(),
@@ -5382,6 +5698,7 @@ mod tests {
                     text: "open".into(),
                     status: "doing".into(),
                     updated_ms: None,
+                    archived: false,
                     rule_derived: false,
                 },
                 RelayTask {
@@ -5389,6 +5706,7 @@ mod tests {
                     text: "old".into(),
                     status: "done".into(),
                     updated_ms: None,
+                    archived: false,
                     rule_derived: false,
                 },
             ],
