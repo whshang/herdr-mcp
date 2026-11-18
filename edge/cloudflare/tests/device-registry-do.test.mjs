@@ -10,11 +10,24 @@ class FakeStorage {
   constructor() {
     this.map = new Map();
     this.writeCount = 0;
+    this.deviceReads = 0;
   }
-  async get(key) { return this.map.get(key); }
+  async get(key) {
+    if (String(key).startsWith("device:")) this.deviceReads += 1;
+    return this.map.get(key);
+  }
   async put(key, value) { this.writeCount += 1; this.map.set(key, structuredClone(value)); }
-  async delete(key) { this.writeCount += 1; return this.map.delete(key); }
+  async delete(keyOrKeys) {
+    this.writeCount += 1;
+    if (Array.isArray(keyOrKeys)) {
+      let deleted = 0;
+      for (const key of keyOrKeys) if (this.map.delete(key)) deleted += 1;
+      return deleted;
+    }
+    return this.map.delete(keyOrKeys);
+  }
   async list({ prefix } = {}) {
+    if (prefix === "device:") this.deviceReads += 1;
     return new Map([...this.map].filter(([key]) => !prefix || key.startsWith(prefix)));
   }
   async transaction(fn) { return fn(this); }
@@ -73,6 +86,48 @@ test("device registry writes durable identity records and reads them without obs
   assert.equal(list.status, 200);
   assert.deepEqual((await list.json()).devices.map((device) => device.device_id), [DEVICE_A]);
   assert.equal(storage.writeCount, beforeRead);
+});
+
+test("user device directory reads hit durable storage once then serve from memory | Given enrolled devices on the singleton registry | When list, get, and name lookups repeat across requests | Then only one device-prefix list reaches storage and mutations stay visible", async () => {
+  const { storage, registry } = makeRegistry();
+  const ensure = await registry.fetch(new Request("https://registry.internal/internal/devices/legacy/ensure", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "macbook-main" }),
+  }));
+  assert.equal(ensure.status, 200);
+  const legacyId = (await ensure.json()).device.device_id;
+
+  const put = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_B}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record(DEVICE_B)),
+  }));
+  assert.equal(put.status, 200);
+  // The PUT hydrated the directory cache once; later writes only update it.
+  assert.equal(storage.deviceReads, 1, "one hydration read during enrollment");
+
+  for (let i = 0; i < 3; i += 1) {
+    const list = await registry.fetch(new Request("https://registry.internal/internal/devices"));
+    assert.equal(list.status, 200);
+    assert.equal((await list.json()).devices.length, 2);
+    const get = await registry.fetch(new Request(`https://registry.internal/internal/devices/${DEVICE_B}`));
+    assert.equal(get.status, 200);
+    assert.equal((await get.json()).device.name, "build-linux");
+  }
+  assert.equal(storage.deviceReads, 1, "cached directory reads must not re-scan durable storage");
+
+  // Mutations project into the cached view: the rename is visible with zero
+  // additional device-record reads.
+  const rename = await registry.fetch(new Request("https://registry.internal/internal/devices/rename", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workstation_id: "prod-real-runtime", name: "renamed-box" }),
+  }));
+  assert.equal(rename.status, 200);
+  const stored = await registry.fetch(new Request(`https://registry.internal/internal/devices/${legacyId}`));
+  assert.equal((await stored.json()).device.name, "renamed-box");
+  assert.equal(storage.deviceReads, 1, "post-mutation reads stay in memory");
 });
 
 test("device registry preserves legacy workstation mapping and sorts by immutable device id", async () => {

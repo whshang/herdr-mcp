@@ -12,6 +12,8 @@ const MAX_PRINCIPAL = 4096;
 const MAX_STRING = 4096;
 const MAX_SCOPE_ITEMS = 64;
 const MAX_TAKEOVER_REASON = 512;
+/** Durable Object Storage caps a single array delete at 128 keys. */
+const DO_STORAGE_DELETE_MAX_KEYS = 128;
 const MAX_WEBCHAT_REASSIGN_HISTORY = 32;
 const DEFAULT_LEASE_TTL_MS = 5 * 60_000;
 const MIN_LEASE_TTL_MS = 30_000;
@@ -768,10 +770,13 @@ async function pruneIdempotencyUsage(tx: DurableObjectTransaction, nowMs: number
     earliest_control_routine_principal_expiry_ms: null,
     earliest_control_critical_principal_expiry_ms: null,
   };
+  // Collect expired keys first and remove them with Durable Object Storage's
+  // native batch delete (<= 128 keys per call) instead of one round trip each.
+  const expiredKeys: string[] = [];
   for (const [key, value] of stored) {
     const record = normalizeIdempotency(value);
     if (!record || record.expires_at_ms <= nowMs) {
-      await tx.delete(key);
+      expiredKeys.push(key);
       continue;
     }
     usage.total += 1;
@@ -793,6 +798,9 @@ async function pruneIdempotencyUsage(tx: DurableObjectTransaction, nowMs: number
         }
       }
     }
+  }
+  for (let i = 0; i < expiredKeys.length; i += DO_STORAGE_DELETE_MAX_KEYS) {
+    await tx.delete(expiredKeys.slice(i, i + DO_STORAGE_DELETE_MAX_KEYS));
   }
   return usage;
 }

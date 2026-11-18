@@ -28,6 +28,8 @@ const CREDENTIAL_PREFIX = "credential:";
 const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000;
 const MIN_PAIRING_TTL_MS = 60 * 1000;
 const MAX_PAIRING_TTL_MS = 10 * 60 * 1000;
+/** Durable Object Storage caps a single array delete at 128 keys. */
+const DO_STORAGE_DELETE_MAX_KEYS = 128;
 /** Fifth wrong code permanently locks the pairing session. */
 const MAX_PAIRING_ATTEMPTS = 5;
 const enc = new TextEncoder();
@@ -119,7 +121,70 @@ function parseDeviceRecord(value: unknown): DeviceRecord | null {
 }
 
 export class DeviceRegistryDO {
+  /**
+   * Strongly consistent in-memory view of the `device:` records this singleton
+   * DO exclusively owns. It is hydrated lazily by one `storage.list` and kept
+   * exact by applying every committed mutation to the map. Because the DO is
+   * the only writer and runs single-threaded, the map can never diverge from
+   * durable state; a rolled-back transaction cannot be diffed cheaply, so it
+   * drops the cache (`null`) and the next read rehydrates.
+   *
+   * Keys are storage-key suffixes after `device:`. Every mutation path writes
+   * `DEVICE_PREFIX + record.device_id`, so suffix and `device_id` coincide for
+   * all real records; keying by suffix also preserves `getDevice` semantics
+   * for a stored record whose `device_id` field disagrees with its key.
+   */
+  private devicesCache: Map<string, DeviceRecord> | null = null;
+  /**
+   * Bumped at every committed `device:` mutation (and on rollback). A read
+   * that hydrates while a mutation commits detects the change and retries, so
+   * the cached snapshot can never permanently miss a committed record.
+   */
+  private deviceWriteEpoch = 0;
+
   constructor(private readonly state: DurableObjectState, private readonly env: Env) {}
+
+  private noteDevicesChanged(records: Iterable<DeviceRecord>): void {
+    this.deviceWriteEpoch += 1;
+    if (this.devicesCache === null) return;
+    for (const record of records) this.devicesCache.set(record.device_id, record);
+  }
+
+  private noteDevicesRollback(): void {
+    this.deviceWriteEpoch += 1;
+    this.devicesCache = null;
+  }
+
+  private async cachedDevices(): Promise<Map<string, DeviceRecord>> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (this.devicesCache !== null) return this.devicesCache;
+      const epoch = this.deviceWriteEpoch;
+      const stored = await this.state.storage.list<DeviceRecord>({ prefix: DEVICE_PREFIX });
+      if (this.devicesCache !== null) return this.devicesCache;
+      if (this.deviceWriteEpoch !== epoch) continue;
+      const cache = new Map<string, DeviceRecord>();
+      for (const [key, value] of stored) {
+        const parsed = parseDeviceRecord(value);
+        if (parsed) cache.set(key.slice(DEVICE_PREFIX.length), parsed);
+      }
+      this.devicesCache = cache;
+      return cache;
+    }
+    // Repeated interleaved commits are vanishingly rare; serve this response
+    // from a fresh uncached snapshot (still a linearizable read) and let the
+    // next request retry caching.
+    const stored = await this.state.storage.list<DeviceRecord>({ prefix: DEVICE_PREFIX });
+    const snapshot = new Map<string, DeviceRecord>();
+    for (const [key, value] of stored) {
+      const parsed = parseDeviceRecord(value);
+      if (parsed) snapshot.set(key.slice(DEVICE_PREFIX.length), parsed);
+    }
+    return snapshot;
+  }
+
+  private async cachedDevice(deviceId: string): Promise<DeviceRecord | null> {
+    return (await this.cachedDevices()).get(deviceId) ?? null;
+  }
 
   private async projectExecutionFence(device: DeviceRecord): Promise<boolean> {
     if (!this.env.WORKSTATION_DO) return false;
@@ -183,19 +248,13 @@ export class DeviceRegistryDO {
   }
 
   private async listDevices(): Promise<Response> {
-    const stored = await this.state.storage.list<DeviceRecord>({ prefix: DEVICE_PREFIX });
-    const devices: DeviceRecord[] = [];
-    for (const value of stored.values()) {
-      const parsed = parseDeviceRecord(value);
-      if (parsed) devices.push(parsed);
-    }
+    const devices = [...(await this.cachedDevices()).values()];
     devices.sort((a, b) => a.device_id.localeCompare(b.device_id));
     return json({ ok: true, devices });
   }
 
   private async getDevice(deviceId: string): Promise<Response> {
-    const value = await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId);
-    const parsed = parseDeviceRecord(value);
+    const parsed = await this.cachedDevice(deviceId);
     return parsed ? json({ ok: true, device: parsed }) : json({ ok: false, code: "device_not_found" }, 404);
   }
 
@@ -217,7 +276,7 @@ export class DeviceRegistryDO {
     if (parsed.authorization === "revoked") {
       return json({ ok: false, code: "revoke_via_put_forbidden" }, 409);
     }
-    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    const existing = await this.cachedDevice(deviceId);
     if (existing && existing.authorization === "revoked") {
       return json({ ok: false, code: "device_revoked" }, 409);
     }
@@ -245,6 +304,7 @@ export class DeviceRegistryDO {
     }
 
     await this.state.storage.put(DEVICE_PREFIX + deviceId, next);
+    this.noteDevicesChanged([next]);
 
     // Routable writes always refresh the local fence after the registry write.
     // This makes a widening transition retry-convergent: if the first attempt
@@ -277,8 +337,7 @@ export class DeviceRegistryDO {
       : null;
     if (workerContext === null) return json({ ok: false, code: "bad_request" }, 400);
     if (body.require_empty_fleet === true) {
-      const existing = await this.state.storage.list<DeviceRecord>({ prefix: DEVICE_PREFIX, limit: 1 });
-      if (existing.size > 0) return json({ ok: false, code: "first_fleet_not_empty" }, 409);
+      if ((await this.cachedDevices()).size > 0) return json({ ok: false, code: "first_fleet_not_empty" }, 409);
     }
     const recoverDeviceId = body.recover_device_id === undefined
       ? null
@@ -290,7 +349,7 @@ export class DeviceRegistryDO {
     }
     if (recoverDeviceId !== null) {
       if (body.require_empty_fleet === true) return json({ ok: false, code: "recovery_pairing_conflict" }, 409);
-      const target = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + recoverDeviceId));
+      const target = await this.cachedDevice(recoverDeviceId);
       if (!target) return json({ ok: false, code: "device_not_found" }, 404);
       if (target.authorization === "revoked") return json({ ok: false, code: "device_revoked" }, 409);
       if (target.authorization !== "active") return json({ ok: false, code: "device_suspended" }, 409);
@@ -320,7 +379,10 @@ export class DeviceRegistryDO {
     // record, never both.
     const stored = await this.state.storage.transaction(async (tx) => {
       const prior = await tx.list({ prefix: PAIRING_PREFIX });
-      for (const key of prior.keys()) await tx.delete(key);
+      const priorKeys = [...prior.keys()];
+      for (let i = 0; i < priorKeys.length; i += DO_STORAGE_DELETE_MAX_KEYS) {
+        await tx.delete(priorKeys.slice(i, i + DO_STORAGE_DELETE_MAX_KEYS));
+      }
       const key = await pairingStorageKey(pairingId);
       await tx.put(key, record);
       return key;
@@ -357,6 +419,7 @@ export class DeviceRegistryDO {
 
     // The DO transaction is the authoritative serialization point: concurrent
     // consumes interleave only here, so exactly one ever sees the live record.
+    const mutated: DeviceRecord[] = [];
     const result = await this.state.storage.transaction(async (tx) => {
       const record = await tx.get<PairingRecord>(storageKey);
       if (!record) return { ok: false as const, code: "pairing_rejected" as const };
@@ -402,6 +465,7 @@ export class DeviceRegistryDO {
         await tx.delete(storageKey);
         if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
         await tx.put(DEVICE_PREFIX + existing.device_id, updated);
+        mutated.push(updated);
         await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
         await tx.put(canonicalIndexKey, existing.device_id);
         // Keep any legacy workstation index as a compatibility tombstone. It
@@ -434,10 +498,15 @@ export class DeviceRegistryDO {
       };
       await tx.delete(storageKey);
       await tx.put(DEVICE_PREFIX + deviceId, device);
+      mutated.push(device);
       await tx.put(WORKSTATION_PREFIX + deviceId, deviceId);
       await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
       return { ok: true as const, device_id: deviceId, credential_id: credentialId, device_secret: deviceSecret, recovered_existing: false as const };
+    }).catch((err) => {
+      this.noteDevicesRollback();
+      throw err;
     });
+    if (result.ok) this.noteDevicesChanged(mutated);
 
     if (!result.ok) return json(result, result.code === "pairing_rejected" ? 401 : 409);
     return json({
@@ -462,7 +531,7 @@ export class DeviceRegistryDO {
     }
     const deviceId = await this.state.storage.get<string>(WORKSTATION_PREFIX + body.workstation_id);
     if (!deviceId) return json({ ok: false, code: "device_not_found" }, 401);
-    const device = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    const device = await this.cachedDevice(deviceId);
     if (!device) return json({ ok: false, code: "registry_corrupt" }, 409);
     if (device.authorization === "revoked") return json({ ok: false, code: "device_revoked" }, 403);
     if (device.authorization === "suspended") return json({ ok: false, code: "device_suspended" }, 403);
@@ -498,6 +567,7 @@ export class DeviceRegistryDO {
     }
     const verifier = body.credential_verifier_sha256;
     const now = Date.now();
+    const mutated: DeviceRecord[] = [];
     const result = await this.state.storage.transaction(async (tx) => {
       const existing = parseDeviceRecord(await tx.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
       if (!existing) return { ok: false as const, code: "device_not_found" as const };
@@ -526,11 +596,16 @@ export class DeviceRegistryDO {
       if (existing.credential_id) await tx.delete(CREDENTIAL_PREFIX + existing.credential_id);
       await tx.put(CREDENTIAL_PREFIX + credentialId, credential);
       await tx.put(DEVICE_PREFIX + existing.device_id, updated);
+      mutated.push(updated);
       await tx.put(canonicalIndexKey, existing.device_id);
       return { ok: true as const, device_id: existing.device_id, credential_id: credentialId, updated_at_ms: now };
+    }).catch((err) => {
+      this.noteDevicesRollback();
+      throw err;
     });
     if (result.ok) {
-      const updated = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+      this.noteDevicesChanged(mutated);
+      const updated = await this.cachedDevice(deviceId);
       if (updated) await this.projectExecutionFence(updated);
     }
     return result.ok ? json(result) : json(result, result.code === "device_not_found" ? 404 : 409);
@@ -551,7 +626,7 @@ export class DeviceRegistryDO {
 
     const deviceId = await this.state.storage.get<string>(WORKSTATION_PREFIX + body.workstation_id);
     if (!deviceId) return json({ ok: false, code: "device_not_found" }, 404);
-    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + deviceId));
+    const existing = await this.cachedDevice(deviceId);
     if (!existing) return json({ ok: false, code: "registry_corrupt" }, 409);
     if (existing.authorization === "revoked") {
       return json({ ok: false, code: "device_revoked" }, 409);
@@ -569,6 +644,7 @@ export class DeviceRegistryDO {
       updated_at_ms: Date.now(),
     };
     await this.state.storage.put(DEVICE_PREFIX + deviceId, renamed);
+    this.noteDevicesChanged([renamed]);
     await this.projectExecutionFence(renamed);
     return json({ ok: true, device_id: renamed.device_id, name: renamed.name, updated_at_ms: renamed.updated_at_ms, wrote_registry: true });
   }
@@ -576,7 +652,7 @@ export class DeviceRegistryDO {
   private async revokeDevice(deviceId: string): Promise<Response> {
     const canonical = normalizeDeviceId(deviceId);
     if (!canonical) return json({ ok: false, code: "invalid_device_id" }, 400);
-    const existing = parseDeviceRecord(await this.state.storage.get<DeviceRecord>(DEVICE_PREFIX + canonical));
+    const existing = await this.cachedDevice(canonical);
     if (!existing) return json({ ok: false, code: "device_not_found" }, 404);
 
     const now = Date.now();
@@ -605,6 +681,7 @@ export class DeviceRegistryDO {
     let wroteRegistry = false;
     if (!alreadyRevoked) {
       await this.state.storage.put(DEVICE_PREFIX + canonical, revoked);
+      this.noteDevicesChanged([revoked]);
       wroteRegistry = true;
     }
 
@@ -653,6 +730,7 @@ export class DeviceRegistryDO {
     const name = requestedName.length > 0 && requestedName.length <= 128 ? requestedName : workstationId;
     const now = Date.now();
 
+    const mutated: DeviceRecord[] = [];
     const result = await this.state.storage.transaction(async (tx) => {
       const indexKey = WORKSTATION_PREFIX + workstationId;
       const existingId = await tx.get<string>(indexKey);
@@ -676,9 +754,14 @@ export class DeviceRegistryDO {
         revoked_at_ms: null,
       };
       await tx.put(DEVICE_PREFIX + deviceId, device);
+      mutated.push(device);
       await tx.put(indexKey, deviceId);
       return { ok: true as const, created: true, device };
+    }).catch((err) => {
+      this.noteDevicesRollback();
+      throw err;
     });
+    if (result.ok) this.noteDevicesChanged(mutated);
 
     return result.ok ? json(result) : json(result, 409);
   }
