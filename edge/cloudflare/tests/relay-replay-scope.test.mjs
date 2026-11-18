@@ -43,7 +43,10 @@ class FakeStorage {
     this.alarm = null;
   }
   async get(key) { return this.map.get(key); }
-  async put(key, value) { this.map.set(key, value); }
+  async put(keyOrEntries, value) {
+    const entries = typeof keyOrEntries === "string" ? { [keyOrEntries]: value } : keyOrEntries;
+    for (const [key, entry] of Object.entries(entries)) this.map.set(key, entry);
+  }
   async delete(key) { this.map.delete(key); }
   async list({ prefix } = {}) {
     return new Map([...this.map].filter(([key]) => !prefix || String(key).startsWith(prefix)));

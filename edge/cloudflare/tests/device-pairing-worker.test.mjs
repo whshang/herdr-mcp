@@ -18,7 +18,15 @@ class FakeStorage {
   }
   async get(key) { return this.map.get(key); }
   async put(key, value) { this.writeCount += 1; this.map.set(key, structuredClone(value)); }
-  async delete(key) { this.writeCount += 1; return this.map.delete(key); }
+  async delete(keyOrKeys) {
+    this.writeCount += 1;
+    if (Array.isArray(keyOrKeys)) {
+      let deleted = 0;
+      for (const key of keyOrKeys) if (this.map.delete(key)) deleted += 1;
+      return deleted;
+    }
+    return this.map.delete(keyOrKeys);
+  }
   async list({ prefix } = {}) {
     return new Map([...this.map].filter(([key]) => !prefix || key.startsWith(prefix)));
   }
@@ -144,6 +152,15 @@ function makeEnv(extra = {}) {
       ...extra,
     },
   };
+}
+
+async function registryDevicePut(h, record) {
+  const res = await h.registry.fetch(new Request(`https://registry.internal/internal/devices/${record.device_id}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(record),
+  }));
+  assert.equal(res.status, 200);
 }
 
 async function pair(env, name) {
@@ -2660,7 +2677,7 @@ test("user cannot widen Page Assist or grant to non-active targets | Given an ow
   h.env.DEFAULT_WORKSTATION_ID = owner.workstation_id;
   const suspended = await pair(h.env, "suspended-target");
   const suspendedRecord = h.storage.map.get(`device:${suspended.device_id}`);
-  h.storage.map.set(`device:${suspended.device_id}`, { ...suspendedRecord, authorization: "suspended" });
+  await registryDevicePut(h, { ...suspendedRecord, authorization: "suspended" });
 
   const wildcardPageAssist = await worker.fetch(postAsWorkstation(
     "/connectors/page-assist",
@@ -2784,7 +2801,7 @@ test("user owner may revoke grants on suspended or revoked same-fleet targets | 
   assert.equal(allowActive.status, 200, "allow on an ACTIVE target succeeds");
 
   const record = h.storage.map.get(`device:${target.device_id}`);
-  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "suspended" });
+  await registryDevicePut(h, { ...record, authorization: "suspended" });
   const allowSuspended = await ownerWebChatGrant(h.env, { ...grant, allowed: true }, owner.workstation_id, owner.device_secret);
   assert.equal(allowSuspended.status, 403, "allow on a suspended target always fails");
   assert.equal((await allowSuspended.json()).code, "connector_target_device_suspended");
@@ -2795,7 +2812,7 @@ test("user owner may revoke grants on suspended or revoked same-fleet targets | 
     "the stored device-wide grant is deleted");
 
   // Reactivation must not resurrect the stale grant.
-  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "active" });
+  await registryDevicePut(h, { ...record, authorization: "active" });
   const stored = await oauth.fetch(new Request("https://oauth.internal/internal/oauth/grant/get", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -2807,11 +2824,8 @@ test("user owner may revoke grants on suspended or revoked same-fleet targets | 
     "reenabling the device does not restore the revoked grant");
 
   // A revoked target may also be denied, but never granted.
-  h.storage.map.set(`device:${target.device_id}`, {
-    ...record,
-    authorization: "revoked",
-    revoked_at_ms: (record.updated_at_ms ?? 0) + 1,
-  });
+  const revoke = await h.registry.fetch(new Request(`https://registry.internal/internal/devices/${target.device_id}/revoke`, { method: "POST" }));
+  assert.equal(revoke.status, 200);
   const allowRevoked = await ownerWebChatGrant(h.env, { ...grant, allowed: true }, owner.workstation_id, owner.device_secret);
   assert.equal(allowRevoked.status, 403, "allow on a revoked target always fails");
   assert.equal((await allowRevoked.json()).code, "connector_target_device_revoked");
@@ -2819,7 +2833,12 @@ test("user owner may revoke grants on suspended or revoked same-fleet targets | 
   assert.equal(denyRevoked.status, 200, "a credential owner may deny a revoked same-fleet target");
 
   // Reactivate so the remaining checks run against an ACTIVE target again.
-  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "active" });
+  // Revocation is intentionally irreversible through the DO API, so the
+  // harness repairs the record out-of-band and swaps in a fresh DO instance
+  // (cold cache) — the same way a hibernated DO rehydrates in production.
+  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "active", revoked_at_ms: null });
+  h.registry = new DeviceRegistryDO({ storage: h.storage }, { LINK_SHARED_SECRET: "legacy-secret", WORKSTATION_DO: h.env.WORKSTATION_DO });
+  h.env.DEVICE_REGISTRY_DO = namespace(h.registry);
   // An absent target is never blindly denied: no write happens for unknown devices.
   const endpointGrant = await ownerWebChatGrant(h.env, {
     connector_id: connector.connector_id,
@@ -2878,7 +2897,7 @@ test("user legacy owner with a registry device id still cannot widen device scop
   assert.equal(endpoint.status, 200, "endpoint-scope grants keep their current legacy contract");
 
   const record = h.storage.map.get(`device:${target.device_id}`);
-  h.storage.map.set(`device:${target.device_id}`, { ...record, authorization: "suspended" });
+  await registryDevicePut(h, { ...record, authorization: "suspended" });
   const deny = await ownerWebChatGrant(h.env, { ...wide, allowed: false }, "prod-real-runtime", "legacy-secret");
   assert.equal(deny.status, 403,
     "suspended-target deny is a device-scope write and stays credential-only");

@@ -17,7 +17,7 @@
     "build:site": "node scripts/build-site.mjs",
     "test": "npm run build && npm run test:built",
     "test:built": "node --test \"tests/*.test.mjs\" && node tests/manual/background_bind_test.mjs",
-    "test:edge": "npm run build && npm run test:edge:built",
+    "test:edge": "npm run test:edge:built",
     "test:edge:built": "tsc -p edge/cloudflare/tsconfig.json && node --test \"edge/cloudflare/tests/*.test.mjs\" tests/public-contract-identity.integration.mjs",
     "cloudflare:token": "bin/herdr-cloudflare-token",
     "cloudflare:dns-token": "bin/herdr-cloudflare-dns-token",

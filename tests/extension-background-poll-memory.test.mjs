@@ -256,6 +256,33 @@ test("user unbinding a conversation releases its nudge memory | Given nudge stat
   assert.equal(state.lastJudgedAssistantFp.size, 0);
 });
 
+test("user switching a Project active target releases old nudge memory immediately | Given old and new conversation nudge state under one Project binding storage key | When active_conv_key changes to the new conversation | Then old conversation state is cleared while new conversation state remains", () => {
+  const { state, storageChange } = memoryHarness();
+  const project = "https://chatgpt.com/g/g-p-abc";
+  const oldActive = "https://chatgpt.com/g/g-p-abc/c/old";
+  const newActive = "https://chatgpt.com/g/g-p-abc/c/new";
+  for (const convKey of [oldActive, newActive]) {
+    state.lastIdleNudgeAt.set(convKey, 1);
+    state.lastJudgedAssistantFp.set(convKey, `${convKey}-fp`);
+    state.lastIdleNudgeResult.set(convKey, { reason: "same_assistant" });
+    state.lastTurnEndedPayload.set(convKey, { convKey });
+  }
+  const storeKey = `${project}::w1`;
+  const oldValue = {
+    [storeKey]: { convKey: project, active_conv_key: oldActive },
+  };
+  const newValue = {
+    [storeKey]: { convKey: project, active_conv_key: newActive },
+  };
+
+  storageChange({ herdrWakeBindings: { oldValue, newValue } });
+
+  for (const map of [state.lastIdleNudgeAt, state.lastJudgedAssistantFp, state.lastIdleNudgeResult, state.lastTurnEndedPayload]) {
+    assert.equal(map.has(oldActive), false, "old active conversation state must be forgotten");
+    assert.equal(map.has(newActive), true, "new active conversation state must remain");
+  }
+});
+
 test("user visiting many conversations keeps nudge memory bounded | Given the per-conversation nudge cap | When more conversations than the cap record judge results and an early one is touched again | Then the map never exceeds the cap and keeps the most recently written conversations", () => {
   const { api, state } = memoryHarness();
   api.rememberConversationNudgeState(state.lastIdleNudgeResult, "https://chatgpt.com/c/keep", { reason: "unbound" });
