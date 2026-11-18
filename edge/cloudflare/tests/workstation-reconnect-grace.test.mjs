@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import { WorkstationDO } from "../dist/workstation-do.js";
 import { EPOCH2_CONTRACT } from "../dist/contracts/epoch2.js";
 
+const RETIRED_EPOCH1_IDENTITY = {
+  contract_epoch: 1,
+  contract_hash: "sha256:3f23083ae31b977dad21b1ec9d6919c49e1067a27f7b7eea7bdd021b54770c0d",
+};
+
 class FakeStorage {
   constructor(events) {
     this.events = events;
@@ -104,6 +109,47 @@ test("recently disconnected workstation waits and wakes immediately when a valid
   const elapsed = Date.now() - started;
   assert.ok(elapsed >= 10 && elapsed < 80, `validated link should wake grace promptly, elapsed=${elapsed}`);
   assert.deepEqual(events, [], "reconnect grace must remain process-local with zero DO writes/alarms");
+});
+
+test("retired epoch1 hello is refused by the real Durable Object hello path | Given an epoch1 runtime identity | When it sends hello to the production WorkstationDO | Then the ack reports contract_mismatch and the socket is closed", async () => {
+  const { subject } = makeSubject();
+  await init(subject);
+  const sent = [];
+  const closed = [];
+  let attachment = null;
+  const ws = {
+    serializeAttachment: (value) => { attachment = value; },
+    deserializeAttachment: () => attachment ?? {},
+    send: (frame) => sent.push(JSON.parse(frame)),
+    close: (code, reason) => closed.push([code, reason]),
+  };
+
+  await subject.handleHello({
+    protocol_version: 1,
+    kind: "hello",
+    workstation_id: "prod-real-runtime",
+    link_version: "0.4.6",
+    boot_id: "boot-epoch1",
+    connected_at_ms: Date.now(),
+    runtime: {
+      runtime_version: "0.4.6",
+      runtime_generation: "rust-epoch1",
+      contract_epoch: RETIRED_EPOCH1_IDENTITY.contract_epoch,
+      contract_hash: RETIRED_EPOCH1_IDENTITY.contract_hash,
+    },
+    capabilities: [],
+  }, ws);
+
+  assert.equal(sent.length, 1, "an epoch1 hello must receive exactly one ack");
+  assert.equal(sent[0].kind, "hello_ack");
+  assert.equal(sent[0].ok, false);
+  assert.equal(sent[0].code, "contract_mismatch");
+  assert.match(sent[0].message, /epoch 6/, "{sent}");
+  assert.equal(sent[0].workstation_id, "prod-real-runtime");
+  assert.deepEqual(closed, [[1008, "contract mismatch"]]);
+
+  const status = await (await subject.fetch(new Request("https://do/internal/status"))).json();
+  assert.equal(status.status, "offline", "a rejected hello must never mark the workstation online");
 });
 
 test("validated hello records disconnect recovery duration and count in durable status", async () => {
