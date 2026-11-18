@@ -515,8 +515,9 @@ fn candidate_router(state: AppState) -> Router {
 /// refusal; this layer covers the transports and routes that never reach a
 /// public tool: direct HTTP, the trusted Unix IPC surface, browser
 /// control/actuation publication, `GET /health`, and every SSE stream at
-/// connection time. The read is one small config file this process already
-/// owns, applied to the same resolver `tools/call` uses for admission.
+/// connection time. The check resolves the config file this process already
+/// owns through the same resolver `tools/call` uses for admission, re-parsing
+/// only when the file's metadata stamp changed (#1038).
 async fn admitted_backend_gate(
     State(state): State<AppState>,
     request: Request,
@@ -1898,49 +1899,75 @@ async fn post_extension_continuity_turn(State(state): State<AppState>, body: Byt
     let _provider = payload.get("provider").and_then(Value::as_str);
     let _account = payload.get("account").and_then(Value::as_str);
     let _project = payload.get("project").and_then(Value::as_str);
-    let appended = match state.state_store.lock() {
-        Ok(mut store) => match store.append_continuity_turn(ContinuityTurnInput {
-            continuity_id,
-            conversation_id,
-            workspace_id,
-            project_id,
-            title,
-            message_id,
-            role,
-            text,
-            fingerprint,
-            observed_at,
-        }) {
-            Ok(inserted) => store
-                .continuity_for_conversation(conversation_id)
-                .and_then(|owner| {
-                    owner
-                        .map(|owner| (inserted, owner))
-                        .ok_or_else(|| "continuity_owner_missing_after_append".to_owned())
-                }),
-            Err(error) => Err(error),
-        },
-        Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
-    };
-    match appended {
-        Ok((inserted, owner)) => json_response(
-            StatusCode::OK,
-            &json!({
-                "ok": true,
-                "continuity_id": owner,
-                "inserted": inserted,
-                "canonicalized": owner != continuity_id,
-            }),
-        ),
-        Err(error) => json_response(
-            if error == "continuity_binding_ambiguous" {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
+    let continuity_id = continuity_id.to_owned();
+    let conversation_id = conversation_id.to_owned();
+    let message_id = message_id.to_owned();
+    let role = role.to_owned();
+    let text = text.to_owned();
+    let workspace_id = workspace_id.map(str::to_owned);
+    let project_id = project_id.map(str::to_owned);
+    let title = title.map(str::to_owned);
+    let fingerprint = fingerprint.map(str::to_owned);
+    let state_store = state.state_store.clone();
+    // #1038: the store is a std Mutex over SQLite (busy_timeout 5 s); keep
+    // the wait and the write off the async workers like the other store routes.
+    tokio::task::spawn_blocking(move || {
+        let appended = match state_store.lock() {
+            Ok(mut store) => match store.append_continuity_turn(ContinuityTurnInput {
+                continuity_id: &continuity_id,
+                conversation_id: &conversation_id,
+                workspace_id: workspace_id.as_deref(),
+                project_id: project_id.as_deref(),
+                title: title.as_deref(),
+                message_id: &message_id,
+                role: &role,
+                text: &text,
+                fingerprint: fingerprint.as_deref(),
+                observed_at,
+            }) {
+                Ok(inserted) => store
+                    .continuity_for_conversation(&conversation_id)
+                    .and_then(|owner| {
+                        owner
+                            .map(|owner| (inserted, owner))
+                            .ok_or_else(|| "continuity_owner_missing_after_append".to_owned())
+                    }),
+                Err(error) => Err(error),
             },
-            &json!({"ok": false, "error": error}),
-        ),
-    }
+            Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
+        };
+        match appended {
+            Ok((inserted, owner)) => {
+                let canonicalized = owner != continuity_id;
+                json_response(
+                    StatusCode::OK,
+                    &json!({
+                        "ok": true,
+                        "continuity_id": owner,
+                        "inserted": inserted,
+                        "canonicalized": canonicalized,
+                    }),
+                )
+            }
+            Err(error) => json_response(
+                if error == "continuity_binding_ambiguous" {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                &json!({"ok": false, "error": error}),
+            ),
+        }
+    })
+    .await
+    .unwrap_or_else(continuity_task_failed)
+}
+
+fn continuity_task_failed(error: tokio::task::JoinError) -> Response {
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({"ok": false, "error": "continuity_store_task_failed", "message": error.to_string()}),
+    )
 }
 
 async fn post_extension_continuity_resolve(State(state): State<AppState>, body: Bytes) -> Response {
@@ -1983,55 +2010,63 @@ async fn post_extension_continuity_resolve(State(state): State<AppState>, body: 
             &json!({"ok": false, "error": "continuity_field_too_large"}),
         );
     }
-    let resolved = match state.state_store.lock() {
-        Ok(store) => {
-            let continuity_id = if let Some(continuity_id) = requested_continuity_id {
-                Some(continuity_id.to_owned())
-            } else if let Some(conversation_id) = conversation_id {
-                match store.continuity_for_conversation(conversation_id) {
-                    Ok(value) => value,
-                    Err(error) if error == "continuity_binding_ambiguous" => {
-                        return json_response(
-                            StatusCode::CONFLICT,
-                            &json!({"ok": false, "error": "continuity_ambiguous"}),
-                        );
+    let requested_continuity_id = requested_continuity_id.map(str::to_owned);
+    let conversation_id = conversation_id.map(str::to_owned);
+    let state_store = state.state_store.clone();
+    // #1038: same blocking isolation as the continuity turn route.
+    tokio::task::spawn_blocking(move || {
+        let resolved = match state_store.lock() {
+            Ok(store) => {
+                let continuity_id = if let Some(continuity_id) = requested_continuity_id {
+                    Some(continuity_id)
+                } else if let Some(conversation_id) = conversation_id.as_deref() {
+                    match store.continuity_for_conversation(conversation_id) {
+                        Ok(value) => value,
+                        Err(error) if error == "continuity_binding_ambiguous" => {
+                            return json_response(
+                                StatusCode::CONFLICT,
+                                &json!({"ok": false, "error": "continuity_ambiguous"}),
+                            );
+                        }
+                        Err(error) => {
+                            return json_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                &json!({"ok": false, "error": error}),
+                            );
+                        }
                     }
-                    Err(error) => {
-                        return json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"ok": false, "error": error}),
-                        );
-                    }
+                } else {
+                    None
+                };
+                match continuity_id {
+                    Some(continuity_id) => store.continuity_resume(&continuity_id, 1),
+                    None => Ok(None),
                 }
-            } else {
-                None
-            };
-            match continuity_id {
-                Some(continuity_id) => store.continuity_resume(&continuity_id, 1),
-                None => Ok(None),
             }
+            Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
+        };
+        match resolved {
+            Ok(Some(record)) => json_response(
+                StatusCode::OK,
+                &json!({
+                    "ok": true,
+                    "continuity_id": record.continuity_id,
+                    "status": record.status,
+                    "updated_at": record.updated_at
+                }),
+            ),
+            Ok(None) => json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"ok": false, "error": "continuity_not_found"}),
+            ),
+            Err(error) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"ok": false, "error": error}),
+            ),
         }
-        Err(_) => Err("continuity_store_lock_poisoned".to_owned()),
-    };
-    match resolved {
-        Ok(Some(record)) => json_response(
-            StatusCode::OK,
-            &json!({
-                "ok": true,
-                "continuity_id": record.continuity_id,
-                "status": record.status,
-                "updated_at": record.updated_at
-            }),
-        ),
-        Ok(None) => json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"ok": false, "error": "continuity_not_found"}),
-        ),
-        Err(error) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"ok": false, "error": error}),
-        ),
-    }
+    })
+    .await
+    .unwrap_or_else(continuity_task_failed)
 }
 
 async fn shutdown_signal() {
@@ -2497,8 +2532,8 @@ fn push_events_response(
             // a queued browser command. Re-check admission after every wake,
             // before reading the digest, the pane view or the command queue, so
             // a drifted runtime publishes neither actuation nor pane state. This
-            // is one small config-file read per wake/heartbeat (at most one per
-            // 15 s while idle), the same read the request entrypoint performs.
+            // is the same check the request entrypoint performs: a metadata
+            // stamp per wake/heartbeat, re-parsing only after a config change.
             if let Err(message) = crate::runtime_adapter::verify_admitted_backend_config(
                 &state.admitted,
                 &state.admitted_config,
@@ -6625,6 +6660,72 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1038: a continuity request waiting on a busy state store must not
+    /// stall the async runtime. On a current-thread runtime, a blocking lock
+    /// inside the handler would freeze every other task until it returned.
+    #[tokio::test]
+    async fn continuity_routes_wait_for_a_busy_store_without_stalling_the_runtime() {
+        let root = test_root("continuity-busy-store");
+        let mut extension_state = test_state(&root.join("extension"));
+        extension_state.trusted_extension_ipc = true;
+        let store = extension_state.state_store.clone();
+        let app = candidate_router(extension_state);
+        let post = |uri: &str, body: Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let turn = json!({
+            "continuity_id": "hc:busy",
+            "conversation_id": "conv-busy",
+            "message_id": "msg-busy",
+            "role": "user",
+            "text": "continue while the store is busy",
+            "observed_at": 1400
+        });
+
+        for (uri, body, expected) in [
+            ("/extension/continuity/turn", turn, StatusCode::OK),
+            (
+                "/extension/continuity/resolve",
+                json!({"conversation_id": "conv-busy"}),
+                StatusCode::OK,
+            ),
+        ] {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder_store = store.clone();
+            let holder = std::thread::spawn(move || {
+                let _guard = holder_store.lock().unwrap();
+                held_tx.send(()).unwrap();
+                // Bounded so a regression fails the assertion below instead
+                // of hanging the suite.
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+            held_rx.recv().unwrap();
+
+            let request = tokio::spawn(app.clone().oneshot(post(uri, body)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !request.is_finished(),
+                "{uri} finished while the store lock was held"
+            );
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+
+            let response = request.await.unwrap().unwrap();
+            assert_eq!(response.status(), expected, "{uri}");
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["ok"], true, "{uri}: {payload}");
+            assert_eq!(payload["continuity_id"], "hc:busy", "{uri}: {payload}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
