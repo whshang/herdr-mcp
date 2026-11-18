@@ -122,6 +122,19 @@ test("Rust release verification consumes the shared gate with bounded runtime cl
   assert.match(gate, /trap cleanup EXIT/, "shared gate must clean the isolated runtime on failure");
 });
 
+test("user gets a Cloudflare production gate that builds the root tree before root regression tests | Given the frozen Edge gate no longer builds the root tree | When the production Edge workflow reaches the root regression gate | Then an explicit root build runs first so dist-importing tests have their artifacts", async () => {
+  const workflow = await readFile(join(ROOT, ".github/workflows/cloudflare-edge.yml"), "utf8");
+  const frozenGate = workflow.indexOf("npm run test:edge");
+  const rootBuild = workflow.indexOf("npm run build");
+  const rootGate = workflow.indexOf("npm run test:built");
+  assert.ok(frozenGate >= 0, "workflow must run the frozen Edge gate");
+  assert.ok(rootGate > frozenGate, "root regression gate must follow the frozen Edge gate");
+  assert.ok(
+    rootBuild > frozenGate && rootBuild < rootGate,
+    "the root build must run after the frozen Edge gate and before the root regression gate",
+  );
+});
+
 test("Rust release binary embeds the immutable GitHub source commit", async () => {
   const release = await readFile(join(ROOT, ".github/workflows/rust-release.yml"), "utf8");
   assert.match(release, /HERDR_MCP_BUILD_COMMIT:\s*\$\{\{ github\.sha \}\}/);
