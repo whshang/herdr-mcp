@@ -1,5 +1,5 @@
 import { EPOCH3_CONTRACT } from "./epoch3.js";
-import { EPOCH8_CONTRACT } from "./epoch8.js";
+import { EPOCH9_CONTRACT } from "./epoch9.js";
 
 /**
  * Conservative fallback ChatGPT-visible device-aware public contract.
@@ -35,5 +35,5 @@ import { EPOCH8_CONTRACT } from "./epoch8.js";
 export const PUBLIC_CONTRACT = EPOCH3_CONTRACT;
 
 export function resolvePublicContract(edgeEnv?: string) {
-  return edgeEnv === "dev" || edgeEnv === "prod" ? EPOCH8_CONTRACT : PUBLIC_CONTRACT;
+  return edgeEnv === "dev" || edgeEnv === "prod" ? EPOCH9_CONTRACT : PUBLIC_CONTRACT;
 }

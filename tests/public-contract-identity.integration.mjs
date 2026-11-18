@@ -28,7 +28,7 @@ const contractFixture = JSON.parse(
   await readFile(new URL("../contracts/epoch2.json", import.meta.url), "utf8"),
 );
 
-test("user keeps runtime execution separate from public epochs | Given independent public and runtime contracts | When current identities are read | Then epoch 6 runtime remains distinct from public epochs", () => {
+test("user keeps runtime execution separate from public epochs | Given independent public and runtime contracts | When current identities are read | Then epoch 7 runtime remains distinct from public epochs", () => {
   const frozenHash = contractFixture.contract_hash;
   const frozenEpoch = contractFixture.contract_epoch;
   const frozenCount = contractFixture.tool_count;
@@ -40,10 +40,10 @@ test("user keeps runtime execution separate from public epochs | Given independe
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name === "herdr_skill"), true);
   assert.equal(EPOCH2_CONTRACT.tools.some((tool) => tool.name.startsWith("herdr_mcp.")), false);
 
-  // Edge and Rust advertise the same current epoch-6 runtime identity.
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 6);
+  // Edge and Rust advertise the same current epoch-7 runtime identity.
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_epoch, 7);
   assert.equal(RUNTIME_EXECUTION_CONTRACT.tool_count, 18);
-  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e");
+  assert.equal(RUNTIME_EXECUTION_CONTRACT.contract_hash, "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1");
 
   assert.equal(EDGE_EPOCH, 3);
   assert.equal(EDGE_HASH, EPOCH3_CONTRACT.contract_hash);
@@ -56,7 +56,7 @@ test("user keeps runtime execution separate from public epochs | Given independe
   assert.equal(PUBLIC_CONTRACT_PROFILE, "epoch2");
 
   // The cutover/domain probe follows the current runtime execution contract.
-  assert.equal(DOMAIN_EPOCH, 6);
+  assert.equal(DOMAIN_EPOCH, 7);
   assert.match(DOMAIN_HASH, /^sha256:[0-9a-f]{64}$/);
   assert.equal(DOMAIN_TOOL_COUNT, 18);
 });
