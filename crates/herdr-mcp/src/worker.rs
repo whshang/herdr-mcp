@@ -3684,22 +3684,6 @@ fn write_config_atomic(paths: &RuntimePaths, config: &Config) -> Result<(), Stri
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-pub(crate) fn semantic_proxy_configured() -> bool {
-    let Ok(paths) = RuntimePaths::discover() else {
-        return false;
-    };
-    let Ok(config) = Config::load_for_instance(&paths.config_file, &paths.instance) else {
-        return false;
-    };
-    config.link_upstream_origin().is_some() && config.edge_device_id.is_some()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub(crate) fn semantic_proxy_configured() -> bool {
-    false
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SemanticProxyCapabilities {
     pub evaluate: bool,
@@ -3708,15 +3692,15 @@ pub(crate) struct SemanticProxyCapabilities {
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn semantic_proxy_capabilities() -> SemanticProxyCapabilities {
-    if !semantic_proxy_configured() {
-        return SemanticProxyCapabilities::default();
-    }
     let Ok(paths) = RuntimePaths::discover() else {
         return SemanticProxyCapabilities::default();
     };
     let Ok(config) = Config::load_for_instance(&paths.config_file, &paths.instance) else {
         return SemanticProxyCapabilities::default();
     };
+    if config.link_upstream_origin().is_none() || config.edge_device_id.is_none() {
+        return SemanticProxyCapabilities::default();
+    }
     let Ok(identity) = resolve_enrolled_device_identity(&paths, &config) else {
         return SemanticProxyCapabilities::default();
     };
