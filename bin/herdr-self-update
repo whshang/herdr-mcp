@@ -10,6 +10,12 @@
 // contract epoch, and never restarts the production link daemon (the live manager
 // handles activation; cross-epoch migration is a separate supervised operation).
 //
+// Retirement guard (#1024): this is the legacy Node (`dist/server.js`) updater.
+// Since N2 PR-b removed the Node Server, the production service is owned by the
+// Rust runtime and upgraded with `herdr-mcp update`. check/plan/apply/worker
+// fail closed before any plist write or child spawn unless the server plist is
+// positively Node-owned and the repository still has `dist/server.js`.
+//
 // Secret safety: the MCP bearer token is read from the server plist and injected
 // into the candidate process environment / HTTP Authorization headers only. It is
 // never written to job JSON, logs, plans, errors, or command strings, and child
@@ -32,6 +38,8 @@ export const REQUIRED_TOOL_COUNT = 18;
 export const CANDIDATE_LABEL = "candidate";
 // Directories in the working tree excluded from the release snapshot copy.
 export const SOURCE_EXCLUDED_COMPONENTS = [".git", "node_modules", "dist", "edge/cloudflare/dist", "site-dist"];
+export const SERVER_SERVICE_LABEL = "dev.herdr-mcp.server";
+export const RUST_NATIVE_UPDATE_COMMAND = "herdr-mcp update";
 const MIN_CANDIDATE_PORT = 8773;
 const MAX_CANDIDATE_PORT = 8799;
 // Success gates aligned with .github/workflows/ci.yml (build/root/edge/site/extension).
@@ -92,7 +100,9 @@ export function resolvePaths(env = process.env) {
   const repoPath = envGet(env, "HERDR_REPO_PATH") || join(home, "Documents", "herdr-mcp");
   const runtimeGenCli = envGet(env, "HERDR_RUNTIME_GENERATION_CLI") || join(repoPath, "bin", "herdr-runtime-generation");
   const runtimeGenCliAbsolute = isAbsolute(runtimeGenCli) ? runtimeGenCli : join(repoPath, runtimeGenCli);
+  const rustCurrentBinary = join(base, "runtime", "current", "herdr-mcp");
   return {
+    rustCurrentBinary,
     home, base, selfUpdateDir, jobsDir, logsDir, releasesDir, lockPath, summaryStatusPath,
     controlPath, statusPath, serverPlist, linkPlist, repoPath,
     runtimeGenCli: runtimeGenCliAbsolute,
@@ -389,6 +399,74 @@ export async function readPlist(path) {
   return JSON.parse(r.stdout);
 }
 
+async function readPlistForGuard(path) {
+  const raw = await readFile(path, "utf8");
+  if (raw.trimStart().startsWith("{")) return JSON.parse(raw);
+  return readPlist(path);
+}
+
+/**
+ * Classify the server launchd plist the way the Rust service manager does
+ * (ServiceKind::Rust / Node / Other), but fail-closed: any Rust marker wins,
+ * and only a positively Node-shaped `node .../dist/server.js` job is "node".
+ */
+export function classifyServerPlist(plist, paths = {}) {
+  if (!plist || typeof plist !== "object") return "other";
+  const args = Array.isArray(plist.ProgramArguments) ? plist.ProgramArguments.map(String) : [];
+  const env = plist.EnvironmentVariables && typeof plist.EnvironmentVariables === "object" ? plist.EnvironmentVariables : {};
+  const program = args[0] || "";
+  const rustOwned = (typeof env.HERDR_MCP_SERVICE_IMPL === "string" && env.HERDR_MCP_SERVICE_IMPL.trim() !== "")
+    || basename(program) === "herdr-mcp"
+    || (paths.rustCurrentBinary && program === paths.rustCurrentBinary)
+    || program.includes("/runtime/current/")
+    || program.includes("/runtime/generations/");
+  if (rustOwned) return "rust";
+  const nodeOwned = plist.Label === SERVER_SERVICE_LABEL
+    && basename(program) === "node"
+    && typeof args[1] === "string" && args[1].endsWith("/dist/server.js")
+    && typeof env.HERDR_MCP_TOKEN === "string" && env.HERDR_MCP_TOKEN !== "";
+  return nodeOwned ? "node" : "other";
+}
+
+function retiredRefusal(code, serviceKind, paths, reason) {
+  return {
+    ok: false,
+    code,
+    service_kind: serviceKind,
+    server_plist: paths.serverPlist,
+    reason,
+    use: RUST_NATIVE_UPDATE_COMMAND,
+    message: `herdr-self-update is the retired Node (dist/server.js) updater and refused to run: ${reason}. `
+      + `Upgrade the Rust runtime with \`${RUST_NATIVE_UPDATE_COMMAND}\` instead. No plist was modified and no process was spawned.`,
+    plist_modified: false,
+    spawned: false,
+  };
+}
+
+/**
+ * Entry-point pre-check (read-only). Returns { ok: true } only when the server
+ * plist is a legacy Node job and the repository still ships dist/server.js.
+ */
+export async function assessLegacySelfUpdateTarget(paths) {
+  let plist;
+  try {
+    plist = await readPlistForGuard(paths.serverPlist);
+  } catch {
+    return retiredRefusal("self_update_target_unverified", "unknown", paths, "server plist is missing or unreadable, so legacy Node ownership cannot be proven");
+  }
+  const kind = classifyServerPlist(plist, paths);
+  if (kind === "rust") {
+    return retiredRefusal("self_update_rust_runtime_owned", kind, paths, "the server service is owned by the Rust runtime");
+  }
+  if (kind !== "node") {
+    return retiredRefusal("self_update_target_unverified", kind, paths, "the server plist is not a legacy Node dist/server.js job");
+  }
+  if (!existsSync(join(paths.repoPath, "dist", "server.js"))) {
+    return retiredRefusal("self_update_node_entry_missing", kind, paths, "dist/server.js is missing (the Node server was retired)");
+  }
+  return { ok: true, code: "legacy_node_target", service_kind: kind };
+}
+
 export async function writePlist(path, obj) {
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}.json`;
   await writeFile(tmp, JSON.stringify(obj));
@@ -455,6 +533,9 @@ export function usage() {
   plan   --source working-tree|remote [--ref main]
   apply  --source working-tree|remote [--ref main] [--dry-run]
   worker --job <id>          (internal; detached update transaction)
+
+RETIRED for the Rust runtime: check/plan/apply/worker refuse to run unless the
+server plist is a legacy Node dist/server.js job. Use \`herdr-mcp update\`.
 
 Mirrors the manual zero-downtime path by reusing runtime-control-prod.json /
 runtime-status-prod.json + herdr-runtime-generation. Never touches Edge/DNS/Worker/
@@ -757,6 +838,17 @@ async function cmdWorker(args, env) {
     await log(`[worker] fatal lock not owned (job=${jobId}); aborting`);
     throw new Error("worker: self-update lock not owned by this job/pid");
   }
+  // Re-run the retirement guard: service ownership may have changed since apply.
+  // Refusal is terminal without rollback steps because nothing was mutated.
+  const guard = await assessLegacySelfUpdateTarget(paths);
+  if (!guard.ok) {
+    await log(`[worker] refused: ${guard.code}`);
+    await setState(jobPath, job, { stage: "failed", outcome: "refused", error_message: guard.message });
+    await releaseLock(paths, jobId);
+    process.stdout.write(JSON.stringify({ ...guard, command: "worker", job_id: jobId }) + "\n");
+    process.exitCode = 2;
+    return;
+  }
   // Candidate child is held locally only; the job persists numeric pids.
   let candidate = null;
   try {
@@ -781,6 +873,9 @@ async function cmdWorker(args, env) {
     // --- success gates (build/root/edge/site/extension), CI-aligned ---
     await setStage(jobPath, job, "building_testing", log);
     await runGates(job.release, log);
+    if (!existsSync(join(job.release, "dist", "server.js"))) {
+      throw new Error(`release has no dist/server.js; refusing legacy self-update (use ${RUST_NATIVE_UPDATE_COMMAND})`);
+    }
 
     // --- record original active generation BEFORE mutating anything ---
     await setStage(jobPath, job, "recording_original", log);
@@ -796,6 +891,10 @@ async function cmdWorker(args, env) {
     // --- read server config (token isolated from persisted state) ---
     await setStage(jobPath, job, "reading_config", log);
     const serverPlist = await readPlist(job.server_plist);
+    const serverKind = classifyServerPlist(serverPlist, paths);
+    if (serverKind !== "node") {
+      throw new Error(`server plist is ${serverKind}-owned; refusing legacy self-update (use ${RUST_NATIVE_UPDATE_COMMAND})`);
+    }
     const { token, env: serverEnv } = splitServerEnv(serverPlist);
     if (!token) throw new Error("server plist has no HERDR_MCP_TOKEN");
     if (serverEnv.HERDR_MCP_CONTRACT_PROFILE !== PUBLIC_CONTRACT_PROFILE) {
@@ -1392,8 +1491,19 @@ export function _setExecFileWrap(fn) {
 
 // --- dispatch / main ----------------------------------------------------------
 
+// worker re-runs the guard itself after taking lock ownership.
+const GUARDED_COMMANDS = new Set(["check", "plan", "apply"]);
+
 export async function dispatch(args, env = process.env) {
   if (args.help) { process.stdout.write(usage()); return; }
+  if (GUARDED_COMMANDS.has(args.command)) {
+    const guard = await assessLegacySelfUpdateTarget(resolvePaths(env));
+    if (!guard.ok) {
+      process.stdout.write(JSON.stringify({ ...guard, command: args.command }) + "\n");
+      process.exitCode = 2;
+      return;
+    }
+  }
   if (args.command === "status") await cmdStatus(args, env);
   else if (args.command === "check") await cmdCheck(args, env);
   else if (args.command === "plan") await cmdPlan(args, env);
