@@ -256,7 +256,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
         }),
         json!({
             "method": AGENT_TASK_STATUS_METHOD,
-            "description": "Durable lifecycle and derived liveness (active or stalled). Stalled is non-terminal; no automatic redispatch.",
+            "description": "Durable lifecycle and derived liveness (active or stalled). Stalled is non-terminal; no automatic redispatch. With `target` alone, answers which task currently occupies that pane (or its most recent task summary) — no inbox page needed. With `task_id`, or `idempotency_key` + `target`, looks up one exact task.",
             "source": "herdr_mcp_local",
             "access": "read_only",
             "params": {
@@ -340,6 +340,21 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         "maxItems": 32,
                         "uniqueItems": true,
                         "description": "Optional batch alternative to task_id; out-of-scope or unknown ids are reported as not_found."
+                    },
+                    "workspace_id": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "description": "Scoped bulk ack: acknowledge every still-unacknowledged terminal receipt in this workspace. Requires no task_id/task_ids; may be combined with target and before_ms."
+                    },
+                    "target": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "description": "Scoped bulk ack: acknowledge still-unacknowledged terminal receipts whose target or pane matches."
+                    },
+                    "before_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Scoped bulk ack: only receipts whose updated_at_ms is at or before this unix-millisecond cutoff."
                     },
                 },
                 "required": [],
