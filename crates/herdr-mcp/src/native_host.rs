@@ -1440,6 +1440,7 @@ mod tests {
     #[tokio::test]
     async fn request_proxy_uses_tokenless_unix_ipc_and_strips_authorization() {
         let path = socket_path("request");
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         fs::remove_file(&path).ok();
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
@@ -1491,6 +1492,7 @@ mod tests {
     #[tokio::test]
     async fn request_batch_proxy_preserves_order_and_rejects_oversize() {
         let path = socket_path("request-batch");
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         fs::remove_file(&path).ok();
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {
@@ -1629,6 +1631,7 @@ mod tests {
         const SECRET: &str = "super-secret-token-xyz";
         let root = temp_dir("connect");
         let socket = socket_path("connect-log");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let server = spawn_state_server(&socket);
         let log = NativeHostLog::in_config_dir(&root);
         let config = test_config(socket.clone(), false);
@@ -1734,6 +1737,7 @@ mod tests {
         let unusable = root.join("not-a-directory");
         fs::write(&unusable, b"not a directory").unwrap();
         let socket = socket_path("log-failure");
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let server = spawn_state_server(&socket);
         let log = NativeHostLog::in_config_dir(&unusable);
         let config = test_config(socket.clone(), false);
@@ -1853,6 +1857,7 @@ mod tests {
     #[tokio::test]
     async fn stream_proxy_frames_sse_bytes_without_buffering_the_stream() {
         let path = socket_path("stream");
+        let _sock_guard_path = crate::test_env::TempUnixSocketGuard::file(&path);
         fs::remove_file(&path).ok();
         let listener = UnixListener::bind(&path).unwrap();
         let server = thread::spawn(move || {

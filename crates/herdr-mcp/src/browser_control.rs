@@ -601,6 +601,7 @@ mod tests {
     #[test]
     fn agent_prompt_uses_existing_prompt_reliability_and_replays() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             for expected in ["agent.get", "agent.prompt"] {
@@ -686,6 +687,7 @@ mod tests {
     #[test]
     fn terminal_input_runs_on_the_fenced_terminal_pane() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -728,6 +730,7 @@ mod tests {
     #[test]
     fn interrupt_sends_ctrl_c_to_the_fenced_agent_pane() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
