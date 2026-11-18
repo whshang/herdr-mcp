@@ -959,6 +959,39 @@ mod tests {
     }
 
     #[test]
+    fn write_invalidation_leaves_sibling_root_with_shared_name_prefix() {
+        let parent = temp_dir();
+        let repo = parent.join("repo");
+        let sibling = parent.join("repo-backup");
+        for root in [&repo, &sibling] {
+            fs::create_dir_all(root).unwrap();
+            assert!(
+                Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            invalidate_git_status_cache(root);
+        }
+        derive(&git_snapshot(&repo));
+        derive(&git_snapshot(&sibling));
+        assert!(git_status_cache_has(&sibling));
+        // Path::starts_with compares whole components, so invalidating a path
+        // under `repo` must not evict `repo-backup`'s entry.
+        let touched = repo.join("created-by-write.txt");
+        fs::write(&touched, "changed").unwrap();
+        invalidate_git_status_cache_for_path(&touched);
+        assert!(!git_status_cache_has(&repo));
+        assert!(
+            git_status_cache_has(&sibling),
+            "a sibling root sharing a name prefix keeps its cache entry"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn expired_entries_are_evicted_on_the_next_probe() {
         let root_a = temp_dir();
         let root_b = temp_dir();
