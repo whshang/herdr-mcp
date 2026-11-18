@@ -265,14 +265,13 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(any(target_os = "macos", test))]
-const SNAPSHOT_PROBE_INTERVAL_MS: u64 = 10_000;
+const SNAPSHOT_PROBE_INTERVAL_MS: u64 = 12_000;
 
 #[cfg(any(target_os = "macos", test))]
 fn snapshot_probe_due(health_state: &str, last_probe_at_ms: Option<u64>, now: u64) -> bool {
     health_state != "healthy"
-        || last_probe_at_ms.map_or(true, |last| {
-            now.saturating_sub(last) >= SNAPSHOT_PROBE_INTERVAL_MS
-        })
+        || last_probe_at_ms
+            .is_none_or(|last| now.saturating_sub(last) >= SNAPSHOT_PROBE_INTERVAL_MS)
 }
 
 #[cfg(target_os = "macos")]
@@ -1548,7 +1547,7 @@ mod tests {
     fn snapshot_probe_is_periodic_and_immediate_for_unhealthy_recovery() {
         assert!(snapshot_probe_due("unknown", Some(9_999), 10_000));
         assert!(snapshot_probe_due("healthy", None, 0));
-        assert!(!snapshot_probe_due("healthy", Some(1_000), 10_999));
-        assert!(snapshot_probe_due("healthy", Some(1_000), 11_000));
+        assert!(!snapshot_probe_due("healthy", Some(1_000), 12_999));
+        assert!(snapshot_probe_due("healthy", Some(1_000), 13_000));
     }
 }
