@@ -162,9 +162,13 @@ fn selection_drift_uses_admitted_backend_and_socket() {
     };
 
     let tui_path = root.join("t.sock");
+    let _sock_guard_tui_path = crate::test_env::TempUnixSocketGuard::file(&tui_path);
     let a_path = root.join("a.sock");
+    let _sock_guard_a_path = crate::test_env::TempUnixSocketGuard::file(&a_path);
     let b_path = root.join("b.sock");
+    let _sock_guard_b_path = crate::test_env::TempUnixSocketGuard::file(&b_path);
     let no_status_path = root.join("n.sock");
+    let _sock_guard_no_status_path = crate::test_env::TempUnixSocketGuard::file(&no_status_path);
     let tui = MockSocket::start(&tui_path, false, false);
     let a = MockSocket::start(&a_path, true, true);
     let b = MockSocket::start(&b_path, true, true);

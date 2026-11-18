@@ -259,6 +259,7 @@ mod tests {
     #[test]
     fn sends_newline_json_and_parses_result() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -284,6 +285,7 @@ mod tests {
     #[test]
     fn maps_daemon_error_envelope() {
         let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
