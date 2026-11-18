@@ -250,7 +250,7 @@ function observationHarness({
   const observe = new Function(
     "registeredBrowserSessionRef", "registeredBrowserGeneration", "registeredConvKey",
     "acceptedDispatchAssignments", "sendBg", "ADAPTER", "fetchChatGptConversationSnapshot",
-    "chatGptDomTurnSequence", "isTurnInProgress", "Date", "setInterval", "document", "window", "recovered",
+    "chatGptDomTurnSequence", "isTurnInProgress", "Date", "mountHiddenIdleInterval", "document", "window", "recovered",
     `${settlementSource}\nconst maybeRefreshBrowserPendingDispatchAssignment = () => {};\n${wakeSource.slice(routeStart, routeEnd)}\nrestoreBrowserResultAssignment(recovered); startConversationRouteWatch(); return observeBrowserResultSettlement;`,
   )("br_worker", 7, route, assignments, async (payload) => {
     sent.push(payload);
