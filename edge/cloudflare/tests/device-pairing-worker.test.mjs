@@ -540,25 +540,25 @@ test("health and info expose the same explicit first-party public contract ident
     assert.equal(health.contractHash, info.publicContract.hash);
     // Rolling-rollback fence: /health must stay parseable by a Link built
     // before the current epoch, so it publishes the frozen epoch-2 catalog view
-    // first and the rollback-compatible runtime identity (epoch 3) in the field
-    // that an older Link reads first. Whether this Edge accepts the current
-    // epoch is proven only by the authenticated hello_ack; /info reports the
-    // current + previous identities for humans and probes.
+    // first and the rollback-compatible runtime identity in the field that an
+    // older Link reads first. Whether this Edge accepts the current epoch is
+    // proven only by the authenticated hello_ack; /info reports the current +
+    // previous identities for humans and probes.
     assert.equal(health.runtimeContractEpoch, 2);
     assert.equal(
       health.runtimeContractHash,
       "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8",
     );
-    assert.equal(health.currentRuntimeContractEpoch, 4);
+    assert.equal(health.currentRuntimeContractEpoch, 5);
     assert.equal(
       health.currentRuntimeContractHash,
-      "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
+      "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
     );
-    assert.equal(info.runtimeContract.epoch, 5);
-    assert.equal(info.previousRuntimeContract.epoch, 4);
+    assert.equal(info.runtimeContract.epoch, 6);
+    assert.equal(info.previousRuntimeContract.epoch, 5);
     assert.equal(
       info.previousRuntimeContract.hash,
-      "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
+      "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
     );
   }
 });
