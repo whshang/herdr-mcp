@@ -2235,6 +2235,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session(&id);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -2287,6 +2288,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session(&id);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -2365,6 +2367,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session_with_close(&id, false);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let registry = registry();
         registry
             .inner
@@ -2917,6 +2920,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session(&id);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -2985,6 +2989,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session(&id);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let weak = Arc::downgrade(&session);
         spawn_monitor(Arc::clone(&session), Weak::new());
 
@@ -3012,6 +3017,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session(&id);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -3079,6 +3085,7 @@ mod tests {
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         );
         let (session, socket) = pane_session(&id);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let close_count = Arc::new(AtomicUsize::new(0));
