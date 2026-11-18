@@ -165,6 +165,14 @@ struct SessionStatus {
     exit_code: Option<i32>,
     signal: Option<String>,
     ended_at_ms: Option<u64>,
+    /// True only after BOTH durable pieces of close evidence committed: the
+    /// SQLite `exec_sessions` row and the `.spool` output artifact. The
+    /// resident-session cap never evicts a closed session while this is
+    /// false, because eviction would strand `running=false` with no readable
+    /// output. Sessions recovered from a durable row alone (spool missing or
+    /// corrupt) keep this false forever; their output is genuinely lost, not
+    /// merely unloaded.
+    evidence_persisted: bool,
     /// `Some(true)`/`Some(false)` once a close-on-complete pane's reclaim was
     /// attempted; `None` when no reclaim was attempted (still open or not
     /// pane-owned).
@@ -208,6 +216,11 @@ struct Session {
     backend: SessionBackend,
     buffers: Mutex<Buffers>,
     status: Mutex<SessionStatus>,
+    /// Set when a durable `exec_sessions` row is loaded but its `.spool`
+    /// output artifact is absent or corrupt. Such a session must never be
+    /// reported as `completed` with empty output: reads refuse with
+    /// `session_evidence_incomplete` instead.
+    evidence_missing: bool,
 }
 
 #[derive(Debug)]
@@ -455,6 +468,7 @@ fn load_session_from_spool_or_record(
     let mut stdout_bytes = 0;
     let mut stderr_bytes = 0;
     let mut truncated = false;
+    let mut evidence_loaded = false;
 
     if let Ok(bytes) = fs::read(&spool_path)
         && let Ok(artifact) = serde_json::from_slice::<SavedCompletionEvidence>(&bytes)
@@ -482,6 +496,7 @@ fn load_session_from_spool_or_record(
             });
         }
         truncated = artifact.truncated;
+        evidence_loaded = true;
     }
 
     let next_seq = chunks.last().map_or(0, |c| c.seq.saturating_add(1));
@@ -497,6 +512,9 @@ fn load_session_from_spool_or_record(
         exit_code: record.exit_code,
         signal: record.signal.clone(),
         ended_at_ms: record.ended_at_ms,
+        // A row-only recovery has no durable output anywhere; it must not be
+        // reported as a completed session with empty output.
+        evidence_persisted: evidence_loaded,
         pane_reclaimed: None,
         pane_reclaim_error: None,
     };
@@ -509,6 +527,7 @@ fn load_session_from_spool_or_record(
         backend: SessionBackend::Completed,
         buffers: Mutex::new(buffers),
         status: Mutex::new(status),
+        evidence_missing: !evidence_loaded,
     })
 }
 
@@ -591,7 +610,13 @@ impl ExecRegistry {
         let mut initial_sessions = HashMap::new();
         for record in &closed_records {
             let session = load_session_from_spool_or_record(&state_dir, record);
-            initial_sessions.insert(record.session_id.clone(), session);
+            // A row-only recovery (`.spool` missing/corrupt) stays out of the
+            // resident map: `session()` rebuilds it on demand, so a spool that
+            // commits late is picked up instead of being shadowed by a stale
+            // empty projection.
+            if !session.evidence_missing {
+                initial_sessions.insert(record.session_id.clone(), session);
+            }
         }
 
         Ok(Self {
@@ -678,6 +703,7 @@ impl ExecRegistry {
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
+            evidence_missing: false,
         });
         if let Some(stdout) = stdout {
             spawn_reader(Arc::clone(&session), StreamKind::Stdout, stdout);
@@ -791,6 +817,7 @@ impl ExecRegistry {
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
+            evidence_missing: false,
         });
         let launch_line = format!(
             "{} {}",
@@ -918,6 +945,21 @@ impl ExecRegistry {
             return json!({"ok": false, "code": "invalid_params", "message": "stream must be stdout, stderr, or both"});
         };
         refresh_session_status(&session, Some(&self.inner));
+        {
+            // A durable `closed` row without its `.spool` artifact is missing
+            // output evidence, not an empty completion: refuse rather than
+            // report `ok` with an empty buffer.
+            let status = session.status.lock();
+            if session.evidence_missing && status.map(|s| s.closed).unwrap_or(true) {
+                return json!({
+                    "ok": false,
+                    "reason": "session_evidence_incomplete",
+                    "session_id": id,
+                    "recovered": true,
+                    "message": "the durable exec session row exists but its output spool never committed or is unreadable; captured output is unavailable",
+                });
+            }
+        }
         let (bytes, bytes_total, truncated) = {
             let Ok(buffers) = session.buffers.lock() else {
                 return json!({"ok": false, "reason": "session_state_unavailable"});
@@ -1202,7 +1244,13 @@ impl ExecRegistry {
             .and_then(|store| store.get_closed_exec_session(id).ok())
             .flatten()?;
         let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
-        if let Ok(mut sessions) = self.inner.sessions.lock() {
+        // A row whose `.spool` has not committed yet is an in-flight close, a
+        // crashed write, or lost output. Do not cache the empty projection:
+        // the next read must re-check for the artifact rather than serving a
+        // stale empty result after it lands.
+        if !session.evidence_missing
+            && let Ok(mut sessions) = self.inner.sessions.lock()
+        {
             sessions.insert(id.to_owned(), Arc::clone(&session));
         }
         Some(session)
@@ -1250,7 +1298,11 @@ fn prune_loaded_closed_sessions(sessions: &mut HashMap<String, Arc<Session>>, ma
         .iter()
         .filter_map(|(id, session)| {
             let status = session_status(session);
-            status.closed.then(|| {
+            // Only a closed session whose durable evidence fully committed is
+            // eligible for the resident cap: evicting an unpersisted session
+            // would drop the only remaining copy of its output while
+            // `running=false` is already visible to callers.
+            (status.closed && status.evidence_persisted).then(|| {
                 (
                     status.ended_at_ms.unwrap_or(session.started_at_ms),
                     session.started_at_ms,
@@ -1304,6 +1356,9 @@ fn session_view(session: &Arc<Session>) -> Value {
     });
     if is_recovered && let Some(obj) = view.as_object_mut() {
         obj.insert("recovered".to_owned(), json!(true));
+        if session.evidence_missing {
+            obj.insert("evidence_incomplete".to_owned(), json!(true));
+        }
     }
     view
 }
@@ -1315,6 +1370,9 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             exit_code: None,
             signal: None,
             ended_at_ms: Some(now_ms()),
+            // Poisoned status: keep the session resident rather than risking
+            // eviction of evidence we cannot inspect.
+            evidence_persisted: false,
             pane_reclaimed: None,
             pane_reclaim_error: None,
         },
@@ -1323,6 +1381,7 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             exit_code: status.exit_code,
             signal: status.signal.clone(),
             ended_at_ms: status.ended_at_ms,
+            evidence_persisted: status.evidence_persisted,
             pane_reclaimed: status.pane_reclaimed,
             pane_reclaim_error: status.pane_reclaim_error.clone(),
         },
@@ -1997,11 +2056,26 @@ fn persist_closed_evidence(
     // Runs outside `session.status`: callers mark the transition inside the
     // lock, then persist here so the close path never holds a session mutex
     // across SQLite or spool I/O.
-    if settle_closed_evidence(inner, session, ended_at, exit_code, signal).is_err() {
+    //
+    // Order matters for crash windows. The `.spool` artifact is committed
+    // FIRST and the SQLite settle SECOND: a crash between the two leaves a
+    // `running` row whose restart recovery settles it as
+    // `closed_before_restart` — the spool survives as orphaned evidence and no
+    // reader can observe a `closed` row whose output is missing. The old
+    // settle-then-spool order could leave exactly that state.
+    let spool_result = persist_session_spool(&inner.state_dir, session);
+    if spool_result.is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
-    if persist_session_spool(&inner.state_dir, session).is_err() {
+    let settle_result = settle_closed_evidence(inner, session, ended_at, exit_code, signal);
+    if settle_result.is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    if spool_result.is_ok()
+        && settle_result.is_ok()
+        && let Ok(mut status) = session.status.lock()
+    {
+        status.evidence_persisted = true;
     }
 }
 
@@ -2026,6 +2100,10 @@ fn complete_session(
         status.exit_code = exit_code;
         status.signal = signal.map(str::to_owned);
         status.ended_at_ms = Some(ended_at);
+        // A registry-less close (unit tests, kill fallback) has no durable
+        // evidence obligation; treat it as already persisted so the resident
+        // cap can evict it normally.
+        status.evidence_persisted = registry.is_none();
         ended_at
     };
     if let Some(registry) = registry {
@@ -2354,6 +2432,7 @@ mod tests {
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
+            evidence_missing: false,
         });
         (session, socket)
     }
@@ -2392,6 +2471,26 @@ mod tests {
             !socket.exists(),
             "utility completion must not call pane.close"
         );
+    }
+    /// `read` reports `running=false` as soon as the status transition
+    /// commits; the spool and SQLite settle finish afterwards on the same
+    /// thread that triggered the close (possibly the monitor). Restart tests
+    /// must wait for BOTH durable pieces before dropping the registry, or the
+    /// restart may observe the row without its spool artifact.
+    fn wait_for_durable_evidence(path: &Path, id: &str) {
+        for _ in 0..500 {
+            let spool_ready = exec_spool_path(path, id).exists();
+            let row_ready = StateStore::open_in_dir(path, "state.db")
+                .and_then(|store| store.get_closed_exec_session(id))
+                .ok()
+                .flatten()
+                .is_some();
+            if spool_ready && row_ready {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("durable close evidence for {id} did not land");
     }
 
     #[cfg(unix)]
@@ -2784,6 +2883,7 @@ mod tests {
             },
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
+            evidence_missing: false,
         });
         if let Some(stdout) = stdout {
             spawn_reader(Arc::clone(&session), StreamKind::Stdout, stdout);
@@ -3245,6 +3345,8 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
 
+        wait_for_durable_evidence(&path, &id);
+
         drop(registry);
 
         let restarted = ExecRegistry::new(path.clone()).unwrap();
@@ -3363,8 +3465,10 @@ mod tests {
                     exit_code: Some(0),
                     signal: None,
                     ended_at_ms: Some(now + 10),
+                    evidence_persisted: true,
                     ..SessionStatus::default()
                 }),
+                evidence_missing: false,
             };
             write_session_spool(&path, &spool_session).unwrap();
         }
@@ -3414,8 +3518,10 @@ mod tests {
                 exit_code: Some(0),
                 signal: None,
                 ended_at_ms: Some(ended_at_ms),
+                evidence_persisted: true,
                 ..SessionStatus::default()
             }),
+            evidence_missing: false,
         })
     }
 
@@ -3487,6 +3593,7 @@ mod tests {
                 backend: SessionBackend::Completed,
                 buffers: Mutex::new(Buffers::default()),
                 status: Mutex::new(SessionStatus::default()),
+                evidence_missing: false,
             }),
         );
 
@@ -3619,6 +3726,8 @@ mod tests {
         let original_total = initial_view["bytes_total"].as_u64().unwrap() as usize;
         assert!(original_total > RECOVERY_SPOOL_CAP);
 
+        wait_for_durable_evidence(&path, &id);
+
         drop(registry);
 
         let restarted = ExecRegistry::new(path.clone()).unwrap();
@@ -3703,5 +3812,183 @@ mod tests {
             assert!(landed, "missing spool for {id}");
         }
         assert_eq!(registry.diagnostics()["persistence_failures"], 0);
+    }
+
+    /// Construct a session in the closed-but-unpersisted intermediate state a
+    /// caller can observe between the status transition and the durable commit.
+    fn unpersisted_closed_session(id: &str, output: &str) -> Arc<Session> {
+        Arc::new(Session {
+            id: id.to_owned(),
+            cwd: PathBuf::new(),
+            command: String::new(),
+            started_at_ms: now_ms(),
+            pid: None,
+            backend: SessionBackend::Completed,
+            buffers: Mutex::new(Buffers {
+                chunks: vec![Chunk {
+                    seq: 0,
+                    stream: StreamKind::Stdout,
+                    data: output.as_bytes().to_vec(),
+                }],
+                next_seq: 1,
+                stdout_bytes: output.len(),
+                stderr_bytes: 0,
+                truncated: false,
+            }),
+            status: Mutex::new(SessionStatus {
+                closed: true,
+                exit_code: Some(0),
+                signal: None,
+                ended_at_ms: Some(now_ms()),
+                // Deliberately false: the durable row/spool are still
+                // in-flight, so the resident cap must not evict this entry.
+                evidence_persisted: false,
+                ..SessionStatus::default()
+            }),
+            evidence_missing: false,
+        })
+    }
+
+    #[test]
+    fn unpersisted_closed_session_survives_resident_cap_eviction() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-unpersisted-cap-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+
+        // One closed session whose durable evidence is still in-flight, plus
+        // enough fully persisted closures that it would be the first eviction.
+        let in_flight = unpersisted_closed_session("es_in_flight", "in-flight-output\n");
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("es_in_flight".to_owned(), Arc::clone(&in_flight));
+        for i in 0..RECOVERY_MAX_ENTRIES + 4 {
+            let session_id = format!("es_done_{i:03}");
+            let session = loaded_completed_session(
+                &session_id,
+                now + i as u64,
+                now + i as u64,
+                &format!("output-{i}\n"),
+            );
+            registry
+                .inner
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(session_id, session);
+        }
+
+        registry.prune();
+
+        // The oldest persisted closures are evicted; the unpersisted session is
+        // kept because its memory buffers are the only remaining output copy.
+        assert!(
+            !registry
+                .list_views()
+                .iter()
+                .any(|view| view["session_id"] == "es_done_000")
+        );
+        let view = registry.read("es_in_flight", "stdout", 0, 64);
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["running"], false);
+        assert_eq!(view["text"], "in-flight-output\n");
+
+        // Once the spool commits, a recovery read must not leave a stale empty
+        // projection behind: reading after `write_session_spool` sees output.
+        drop(in_flight);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn settled_row_without_spool_reports_incomplete_evidence() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-row-no-spool-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A `closed` durable row with no `.spool` — the crash window between
+        // settle and spool rename, or a permanently failed spool write.
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+        store
+            .record_exec_running("es_row_only", 42_000, None, now)
+            .unwrap();
+        store
+            .settle_exec_session(
+                "es_row_only",
+                "closed",
+                Some(now + 10),
+                Some(3),
+                None,
+                now + SESSION_TTL_MS,
+            )
+            .unwrap();
+        drop(store);
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let view = registry.read("es_row_only", "both", 0, 64);
+        assert_eq!(view["ok"], false);
+        assert_eq!(view["reason"], "session_evidence_incomplete");
+        assert_eq!(view["recovered"], true);
+
+        // A second read must not observe a cached empty projection.
+        let again = registry.read("es_row_only", "both", 0, 64);
+        assert_eq!(again["ok"], false);
+        assert_eq!(again["reason"], "session_evidence_incomplete");
+
+        // Boot-time load of the same row-only state must refuse identically.
+        drop(registry);
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+        let booted = restarted.read("es_row_only", "both", 0, 64);
+        assert_eq!(booted["ok"], false);
+        assert_eq!(booted["reason"], "session_evidence_incomplete");
+
+        // A spool that commits late is picked up by the next read.
+        let session = unpersisted_closed_session("es_row_only", "late-output\n");
+        write_session_spool(&path, &session).unwrap();
+        let late = restarted.read("es_row_only", "stdout", 0, 64);
+        assert_eq!(late["ok"], true);
+        assert_eq!(late["phase"], "completed");
+        assert_eq!(late["text"], "late-output\n");
+        assert_eq!(late["exit_code"], 3);
+
+        drop(restarted);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn spool_written_before_settle_survives_crash_window() {
+        // Crash between `persist_session_spool` and `settle_closed_evidence`:
+        // the row stays `running`, the spool exists. Restart recovery settles
+        // it as closed_before_restart — an honest recovery refusal, never a
+        // completed session with empty output.
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-spool-first-crash-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+        store
+            .record_exec_running("es_crash_mid", 99_000, None, now)
+            .unwrap();
+        let session = unpersisted_closed_session("es_crash_mid", "mid-crash-output\n");
+        write_session_spool(&path, &session).unwrap();
+        drop(store);
+
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+        let view = restarted.read("es_crash_mid", "both", 0, 64);
+        assert_eq!(view["ok"], false);
+        assert_eq!(view["reason"], "session_recovered_after_restart");
+        assert_eq!(view["recovery_state"], "closed_before_restart");
+
+        drop(restarted);
+        let _ = fs::remove_dir_all(&path);
     }
 }
