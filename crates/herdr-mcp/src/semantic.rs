@@ -86,6 +86,8 @@ const MAX_CHAT_MESSAGE_BYTES: usize = 64 * 1024;
 const EDGE_PROXY_PROBE_TTL: Duration = Duration::from_secs(60);
 static EDGE_PROXY_AVAILABILITY: Mutex<Option<(Instant, crate::worker::SemanticProxyCapabilities)>> =
     Mutex::new(None);
+static EDGE_PROXY_PROBE_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static SEMANTIC_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 /// Per-route pool health: consecutive retryable failures plus the cooldown
 /// deadline they earned. Streak and deadline live in one struct under one lock
 /// so an out-of-order completion can never shorten a cooldown that a stricter
@@ -1063,11 +1065,24 @@ fn edge_proxy_capabilities_cached() -> crate::worker::SemanticProxyCapabilities 
         return capabilities;
     }
 
-    let capabilities = crate::worker::semantic_proxy_capabilities();
-    if let Ok(mut cache) = EDGE_PROXY_AVAILABILITY.lock() {
-        *cache = Some((Instant::now(), capabilities));
+    if EDGE_PROXY_PROBE_IN_FLIGHT
+        .compare_exchange(0, 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            let capabilities = crate::worker::semantic_proxy_capabilities();
+            if let Ok(mut cache) = EDGE_PROXY_AVAILABILITY.lock() {
+                *cache = Some((Instant::now(), capabilities));
+            }
+            EDGE_PROXY_PROBE_IN_FLIGHT.store(0, AtomicOrdering::Release);
+        });
     }
-    capabilities
+
+    EDGE_PROXY_AVAILABILITY
+        .lock()
+        .ok()
+        .and_then(|cache| cache.map(|(_, capabilities)| capabilities))
+        .unwrap_or_default()
 }
 
 /// Pool state for one route key: consecutive retryable failures and the
@@ -1388,12 +1403,21 @@ impl SemanticService {
     fn from_config_with_edge_capabilities(
         edge_capabilities: impl FnOnce() -> crate::worker::SemanticProxyCapabilities,
     ) -> Self {
-        let mut providers = local_semantic_providers();
-        let mut chat_providers = local_semantic_chat_providers();
+        let Some((config_path, config)) = load_semantic_config() else {
+            return Self {
+                providers: Vec::new(),
+                chat_providers: Vec::new(),
+            };
+        };
+        let allow_inline_secret = config_file_allows_secret(&config_path);
+        let mut providers = local_semantic_providers(&config.semantic, allow_inline_secret);
+        let mut chat_providers =
+            local_semantic_chat_providers(&config.semantic, allow_inline_secret);
         let needs_edge_evaluate = providers.is_empty();
         let needs_edge_chat = chat_providers.is_empty();
         let edge = if (needs_edge_evaluate || needs_edge_chat)
-            && crate::worker::semantic_proxy_configured()
+            && config.link_upstream_origin().is_some()
+            && config.edge_device_id.is_some()
         {
             edge_capabilities()
         } else {
@@ -2017,11 +2041,11 @@ fn semantic_request_from_json(payload: &Value) -> Result<SemanticRequest, Semant
     Ok(request)
 }
 
-fn load_semantic_config() -> Option<(PathBuf, crate::config::SemanticConfig)> {
+fn load_semantic_config() -> Option<(PathBuf, crate::config::Config)> {
     let paths = crate::paths::RuntimePaths::discover().ok()?;
     let config =
         crate::config::Config::load_for_instance(&paths.config_file, &paths.instance).ok()?;
-    Some((paths.config_file, config.semantic))
+    Some((paths.config_file, config))
 }
 
 fn config_file_allows_secret(path: &Path) -> bool {
@@ -2230,6 +2254,20 @@ fn estimated_tokens(body: &[u8]) -> u64 {
     (body.len() as u64).div_ceil(4)
 }
 
+fn semantic_http_client() -> Result<Client, SemanticError> {
+    if let Some(client) = SEMANTIC_HTTP_CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
+        .build()
+        .map_err(|_| SemanticError::new("client_unavailable"))?;
+    let _ = SEMANTIC_HTTP_CLIENT.set(client);
+    SEMANTIC_HTTP_CLIENT
+        .get()
+        .cloned()
+        .ok_or_else(|| SemanticError::new("client_unavailable"))
+}
+
 struct HttpSemanticProvider {
     id: String,
     protocol: SemanticProtocol,
@@ -2237,7 +2275,6 @@ struct HttpSemanticProvider {
     endpoint: Url,
     model: String,
     rate: RouteRateBudget,
-    client: Client,
 }
 
 impl HttpSemanticProvider {
@@ -2278,10 +2315,6 @@ impl HttpSemanticProvider {
             endpoint: semantic_endpoint_url(&url)?,
             model,
             rate: RouteRateBudget::new(max_requests_per_second, max_tokens_per_second),
-            client: Client::builder()
-                .timeout(DECISION_ATTEMPT_TIMEOUT)
-                .build()
-                .map_err(|_| SemanticError::new("client_unavailable"))?,
         })
     }
 
@@ -2375,8 +2408,7 @@ impl SemanticProvider for HttpSemanticProvider {
         request: &SemanticRequest,
         timeout: Duration,
     ) -> Result<SemanticResponse, SemanticError> {
-        let mut builder = self
-            .client
+        let mut builder = semantic_http_client()?
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key);
         if self.protocol == SemanticProtocol::DecisionVercel {
@@ -2428,7 +2460,6 @@ struct OpenAiChatProvider {
     endpoint: Url,
     model: String,
     rate: RouteRateBudget,
-    client: Client,
 }
 
 impl OpenAiChatProvider {
@@ -2461,10 +2492,6 @@ impl OpenAiChatProvider {
             endpoint: semantic_endpoint_url(&url)?,
             model,
             rate: RouteRateBudget::new(max_requests_per_second, max_tokens_per_second),
-            client: Client::builder()
-                .timeout(Duration::from_secs(60))
-                .build()
-                .map_err(|_| SemanticError::new("client_unavailable"))?,
         })
     }
 
@@ -2528,8 +2555,7 @@ impl SemanticChatProvider for OpenAiChatProvider {
         let body = serde_json::to_vec(&body).map_err(|_| SemanticError::new("invalid_request"))?;
         // The rate budget is reserved by the route pool before it counts an
         // attempt, not here.
-        let response = self
-            .client
+        let response = semantic_http_client()?
             .post(self.endpoint.clone())
             .bearer_auth(&self.api_key)
             .header("content-type", "application/json")
@@ -2598,33 +2624,31 @@ fn openai_chat_body(
     body
 }
 
-fn local_semantic_providers() -> Vec<Box<dyn SemanticProvider>> {
-    let Some((config_path, semantic)) = load_semantic_config() else {
-        return Vec::new();
-    };
-    let allow_inline_secret = config_file_allows_secret(&config_path);
+fn local_semantic_providers(
+    semantic: &crate::config::SemanticConfig,
+    allow_inline_secret: bool,
+) -> Vec<Box<dyn SemanticProvider>> {
     semantic
         .routes
-        .into_iter()
+        .iter()
         .filter_map(|route| {
             let id = format!("config-route:{}", route.name);
-            HttpSemanticProvider::from_config(id, route, allow_inline_secret)
+            HttpSemanticProvider::from_config(id, route.clone(), allow_inline_secret)
                 .map(|provider| Box::new(provider) as Box<dyn SemanticProvider>)
         })
         .collect()
 }
 
-fn local_semantic_chat_providers() -> Vec<Box<dyn SemanticChatProvider>> {
-    let Some((config_path, semantic)) = load_semantic_config() else {
-        return Vec::new();
-    };
-    let allow_inline_secret = config_file_allows_secret(&config_path);
+fn local_semantic_chat_providers(
+    semantic: &crate::config::SemanticConfig,
+    allow_inline_secret: bool,
+) -> Vec<Box<dyn SemanticChatProvider>> {
     semantic
         .routes
-        .into_iter()
+        .iter()
         .filter_map(|route| {
             let id = format!("config-route:{}", route.name);
-            OpenAiChatProvider::from_config(id, route, allow_inline_secret)
+            OpenAiChatProvider::from_config(id, route.clone(), allow_inline_secret)
                 .map(|provider| Box::new(provider) as Box<dyn SemanticChatProvider>)
         })
         .collect()
@@ -3504,18 +3528,20 @@ mod tests {
             std::env::set_var("HERDR_SEMANTIC_ROUTES", "[]");
         }
 
-        let providers = local_semantic_providers();
+        let (config_path, config) = load_semantic_config().unwrap();
+        let allow_inline_secret = config_file_allows_secret(&config_path);
+        let providers = local_semantic_providers(&config.semantic, allow_inline_secret);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id(), "config-route:fast_a");
-        let chat_providers = local_semantic_chat_providers();
+        let chat_providers = local_semantic_chat_providers(&config.semantic, allow_inline_secret);
         assert_eq!(chat_providers.len(), 1);
         assert_eq!(chat_providers[0].id(), "config-route:chat_a");
 
         #[cfg(unix)]
         {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(local_semantic_providers().is_empty());
-            assert!(local_semantic_chat_providers().is_empty());
+            assert!(local_semantic_providers(&config.semantic, false).is_empty());
+            assert!(local_semantic_chat_providers(&config.semantic, false).is_empty());
         }
 
         let _ = fs::remove_dir_all(&config_dir);
