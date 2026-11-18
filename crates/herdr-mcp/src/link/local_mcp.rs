@@ -1901,6 +1901,7 @@ mod tests {
     async fn worker_report_uses_trusted_ipc_and_fails_closed() {
         let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
         let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut config = LocalMcpConfig::new("token-test", "sha256:test");
         config.trusted_ipc_socket = Some(socket.clone());
         config.runtime_generation = Some("rust-test".to_owned());
@@ -1960,6 +1961,7 @@ mod tests {
     async fn webchat_caller_trace_uses_trusted_unix_ipc_without_bearer_fallback() {
         let response = json!({"jsonrpc": "2.0", "id": "local-1", "result": {"ok": true}});
         let (socket, request_rx) = spawn_unix_server(response.to_string(), "rust-test").await;
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut config = LocalMcpConfig::new("token-test", "sha256:test");
         config.trusted_ipc_socket = Some(socket.clone());
         config.runtime_generation = Some("rust-test".to_owned());

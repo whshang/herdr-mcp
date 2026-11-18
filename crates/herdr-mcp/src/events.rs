@@ -365,6 +365,7 @@ mod tests {
     #[test]
     fn normalizes_string_and_object_event_envelopes() {
         let socket = socket_path();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut peer, _) = listener.accept().unwrap();
@@ -422,6 +423,7 @@ mod tests {
     #[test]
     fn peer_eof_returns_distinct_closed_error_not_timeout() {
         let socket = socket_path();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut peer, _) = listener.accept().unwrap();
@@ -459,6 +461,7 @@ mod tests {
     #[test]
     fn daemon_error_ends_subscription() {
         let socket = socket_path();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
             let (mut peer, _) = listener.accept().unwrap();

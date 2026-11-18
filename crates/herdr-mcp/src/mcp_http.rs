@@ -4139,7 +4139,9 @@ mod tests {
                 .as_millis()
         ));
         std::fs::create_dir_all(&socket_dir).unwrap();
+        let _sock_guard_socket_dir = crate::test_env::TempUnixSocketGuard::dir(&socket_dir);
         let socket_path = socket_dir.join("h.sock");
+        let _sock_guard_socket_path = crate::test_env::TempUnixSocketGuard::file(&socket_path);
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let store = Arc::new(Mutex::new(
@@ -4771,6 +4773,7 @@ mod tests {
                     .as_nanos(),
                 advertised,
             ));
+            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let recorded = spawn_inspect_core_fixture(&socket, None, advertised);
             std::fs::write(config_dir.join("config.json"), json!({
                 "runtime": {"backend": "herdr-core", "herdr_core_socket": socket.to_string_lossy()}
@@ -4872,10 +4875,12 @@ mod tests {
             "/tmp/hc-nested-{}-{unique}.sock",
             std::process::id()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let tui_socket = std::path::PathBuf::from(format!(
             "/tmp/tui-nested-{}-{unique}.sock",
             std::process::id()
         ));
+        let _sock_guard_tui_socket = crate::test_env::TempUnixSocketGuard::file(&tui_socket);
         spawn_core_execution_fixture(&core_socket);
         let listener = UnixListener::bind(&tui_socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -5083,6 +5088,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         std::fs::remove_file(&core_socket).ok();
         spawn_core_execution_fixture(&core_socket);
         std::fs::write(
@@ -5293,6 +5299,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let recorded = spawn_recording_core_fixture(&core_socket, None);
         std::fs::write(
             config_dir.join("config.json"),
@@ -5429,6 +5436,8 @@ mod tests {
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         let missing_socket = root.join("no-such-core.sock");
+        let _sock_guard_missing_socket =
+            crate::test_env::TempUnixSocketGuard::file(&missing_socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -5505,6 +5514,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let log = root.join("calls.log");
         let core = start_core_child(&core_socket, &log);
         std::fs::write(
@@ -5630,6 +5640,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let recorded = spawn_recording_core_fixture(&core_socket, None);
         std::fs::write(config_dir.join("config.json"), json!({
             "runtime": {"backend": "herdr-core", "herdr_core_socket": core_socket.to_string_lossy()}
@@ -5756,6 +5767,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let recorded = spawn_recording_core_fixture(&core_socket, None);
         std::fs::write(
             config_dir.join("config.json"),
@@ -6033,6 +6045,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -6261,6 +6274,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         std::fs::write(
             config_dir.join("config.json"),
             json!({
@@ -9887,6 +9901,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10045,6 +10060,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state_with_snapshot(
             &root,
             &socket,
@@ -10264,6 +10280,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10453,6 +10470,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         let tcp = candidate_router(state.clone());
         state.trusted_extension_ipc = true;
@@ -10510,6 +10528,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         let tcp = candidate_router(state.clone());
         state.trusted_extension_ipc = true;
@@ -10584,6 +10603,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10674,6 +10694,7 @@ mod tests {
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}}),
         ]).collect();
         let (socket, requests) = spawn_scripted_herdr_socket(responses);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -10976,6 +10997,7 @@ mod tests {
                 "pane_id": "w1:p9", "agent_status": "generating", "state_change_seq": 2,
             }}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut state = dispatch_test_state_with_snapshot(
@@ -11108,6 +11130,7 @@ mod tests {
                 "agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 7},
             }}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -11293,6 +11316,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 16}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 17}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -11686,6 +11710,7 @@ mod tests {
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -11984,6 +12009,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -12118,6 +12144,7 @@ mod tests {
             }}),
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let broker = state.browser_actuation.clone();
@@ -12405,6 +12432,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 6}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 7}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state_with_snapshot(
             &root,
             &socket,
@@ -12775,6 +12803,7 @@ mod tests {
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -12922,6 +12951,7 @@ mod tests {
             json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 4}}),
             json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": 5}}}),
         ]);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -13099,6 +13129,7 @@ mod tests {
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         // The same state over the bearer TCP listener: the reserved handoff
         // headers are admitted only from the 0600 Unix IPC listener. Built
@@ -13288,6 +13319,7 @@ mod tests {
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store = state.state_store.clone();
@@ -13524,6 +13556,7 @@ mod tests {
             script.push(json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "generating", "state_change_seq": seq + 1}}}));
         }
         let (socket, _herdr_requests) = spawn_scripted_herdr_socket(script);
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let mut state = dispatch_test_state(&root, &socket);
         state.trusted_extension_ipc = true;
         let store_for_assertions = state.state_store.clone();
@@ -14203,6 +14236,7 @@ mod tests {
         let root = test_root("core-s2a-routes");
         std::fs::create_dir_all(&root).unwrap();
         let core_socket = root.join("core.sock");
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let core_config_file = root.join("config.json");
         std::fs::write(
             &core_config_file,
@@ -14383,6 +14417,7 @@ mod tests {
         let root = test_root("core-stream-admission");
         std::fs::create_dir_all(&root).unwrap();
         let core_socket = root.join("core.sock");
+        let _sock_guard_core_socket = crate::test_env::TempUnixSocketGuard::file(&core_socket);
         let core_config_file = root.join("config.json");
         std::fs::write(
             &core_config_file,
