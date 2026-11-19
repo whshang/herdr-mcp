@@ -3991,6 +3991,13 @@ mod tests {
             gate = gate.to_string_lossy(),
             marker = marker.to_string_lossy(),
         );
+        // Deterministic interleave for the teardown drain: the monitor thread
+        // holds `closed=true` while `persist_closed_evidence` is delayed, so
+        // the cleanup below must wait for real evidence commit, not just for
+        // `running=false` (P1/pi 7007661604, Codex/droid 7007226865/7007762562).
+        crate::exec_sessions::set_persist_delay_for_test(Duration::from_millis(200));
+        let startup_invalidations_before =
+            crate::exec_sessions::startup_invalidation_count_for_test();
         let runner = {
             let registry = Arc::clone(&registry);
             let snapshot = snapshot.clone();
@@ -4005,15 +4012,23 @@ mod tests {
             })
         };
 
-        // Wait for the child to publish `ready` — the startup invalidation is
-        // already behind us — then prime the clean cache and prove it serves.
+        // Two-stage barrier: `child-ready` proves the spawned process ran,
+        // and the startup invalidation tick proves the parent thread already
+        // completed exec_sessions' `invalidate_git_status_cache_for_path`.
+        // Waiting for the file alone races the parent's registration phase
+        // (Codex 7007226865): priming could precede the startup invalidation
+        // and make the completion-phase assertions vacuous.
         let wait_deadline = Instant::now() + Duration::from_secs(10);
-        while !ready.exists() {
+        let startup_done = || {
+            crate::exec_sessions::startup_invalidation_count_for_test()
+                > startup_invalidations_before
+        };
+        while !(ready.exists() && startup_done()) {
             assert!(
                 Instant::now() < wait_deadline,
-                "child never published the ready marker"
+                "child-ready or startup invalidation never completed"
             );
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(5));
         }
         crate::projects::invalidate_git_status_cache(&root);
         crate::projects::reset_git_status_probe_count(&root);
@@ -4033,7 +4048,12 @@ mod tests {
         );
 
         // Release the child's write, wait for run_durable to return, then a
-        // derive inside the TTL must see fresh evidence via a new probe.
+        // derive inside the TTL must see fresh evidence via a new probe. The
+        // measured window bounds the assertion to the real 250ms
+        // GIT_STATUS_CACHE_TTL: a busy runner that stalls past the TTL fails
+        // honestly here instead of passing through natural expiry (droid
+        // 7007762562).
+        let release_at = Instant::now();
         fs::write(&gate, b"go").unwrap();
         let result = runner.join().unwrap();
         assert_eq!(result["ok"], true, "unexpected result: {result}");
@@ -4041,6 +4061,11 @@ mod tests {
 
         let refreshed = crate::projects::derive(&snapshot);
         let project = &refreshed.projects[&root];
+        assert!(
+            release_at.elapsed() < Duration::from_millis(250),
+            "post-write derive ran {:?} after release — outside the 250ms TTL",
+            release_at.elapsed()
+        );
         assert!(project.dirty, "{project:?}");
         assert!(project.changed_files >= 1, "{project:?}");
         assert_eq!(
@@ -4049,37 +4074,20 @@ mod tests {
             "completion must force a new probe, not reuse the mid-flight cache"
         );
 
-        // Bounded drain: poll the registry until every session reports
-        // terminal (running == false), then assert the fixture directory
-        // really removes. No fixed sleep, no swallowed cleanup error (P2-2,
-        // review 7005105245).
-        let drain_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let pending = registry
-                .list_views()
-                .into_iter()
-                .filter(|view| view.get("running").and_then(Value::as_bool).unwrap_or(true))
-                .count();
-            if pending == 0 {
-                break;
-            }
-            assert!(
-                Instant::now() < drain_deadline,
-                "exec sessions did not settle within the drain deadline"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        // Evidence-level drain: `running == false` alone cannot prove the
+        // monitor thread finished `persist_closed_evidence` (closed is set
+        // before the lock-free persist). The persist delay above forces the
+        // interleave — the session is closed while its spool/SQLite write is
+        // still in flight — and the quiescence check waits for
+        // `evidence_persisted` plus drained output readers. Only then may the
+        // fixture be removed, with a single strict assertion instead of a
+        // retry loop that masks a still-writing monitor.
+        assert!(
+            registry.wait_for_writes_quiescent_for_test(Duration::from_secs(5)),
+            "exec sessions did not finish persisting evidence within 5s"
+        );
+        crate::exec_sessions::set_persist_delay_for_test(Duration::ZERO);
         drop(registry);
-        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match fs::remove_dir_all(&base) {
-                Ok(()) => break,
-                Err(error) if Instant::now() < cleanup_deadline => {
-                    let _ = error;
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => panic!("test fixture cleanup failed: {error}"),
-            }
-        }
+        fs::remove_dir_all(&base).unwrap();
     }
 }

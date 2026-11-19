@@ -739,6 +739,14 @@ impl ExecRegistry {
         // The spawned command may mutate the working tree under `cwd` before
         // any completion event; bound cached git-status staleness from start.
         crate::projects::invalidate_git_status_cache_for_path(cwd);
+        #[cfg(test)]
+        {
+            // Test-only completion signal for the startup invalidation: a
+            // child may already be running before this line, so tests that
+            // must observe a cache prime *after* startup invalidation poll
+            // this counter instead of inferring ordering from the child.
+            STARTUP_INVALIDATION_DONE.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(json!({
             "ok": true,
             "session_id": id,
@@ -1087,6 +1095,43 @@ impl ExecRegistry {
             PaneReclaimOutcome::NotApplicable => {}
         }
         Value::Object(result)
+    }
+
+    /// Test-only quiescence check for teardown ordering. `list_views`
+    /// reports `running == false` the moment `complete_session` sets
+    /// `status.closed`, but `persist_closed_evidence` still writes spool +
+    /// SQLite afterwards on the monitor thread. A fixture may be removed only
+    /// once every resident session is closed AND its evidence committed, and
+    /// the output-reader threads have drained. Returns false on timeout or a
+    /// poisoned sessions lock; polling callers assert the deadline.
+    #[cfg(test)]
+    pub(crate) fn wait_for_writes_quiescent_for_test(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let quiescent = match self.inner.sessions.try_lock() {
+                Ok(sessions) => sessions.values().all(|session| {
+                    let status = session_status(session);
+                    let persisted = status.closed && status.evidence_persisted;
+                    let readers_drained = match &session.backend {
+                        SessionBackend::Native { output_readers, .. } => {
+                            output_readers.load(Ordering::Acquire) == 0
+                        }
+                        _ => true,
+                    };
+                    persisted && readers_drained
+                }),
+                // A held sessions lock means the writer is mid-transition;
+                // keep polling rather than claim quiescence.
+                Err(_) => false,
+            };
+            if quiescent {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn list_views(&self) -> Vec<Value> {
@@ -2049,6 +2094,28 @@ fn persist_session_spool(state_dir: &Path, session: &Arc<Session>) -> Result<(),
     }
 }
 
+#[cfg(test)]
+static STARTUP_INVALIDATION_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only observable for the startup `invalidate_git_status_cache_for_path`
+/// in `start_native_process`. The child can signal readiness before the parent
+/// finishes session registration, so ordering tests poll this tick instead.
+#[cfg(test)]
+pub(crate) fn startup_invalidation_count_for_test() -> u64 {
+    STARTUP_INVALIDATION_DONE.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static PERSIST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only pause inside `persist_closed_evidence` so a test can observe the
+/// window where `closed` is already true but durable evidence is still being
+/// written — the interleave that `wait_for_writes_quiescent_for_test` covers.
+#[cfg(test)]
+pub(crate) fn set_persist_delay_for_test(delay: Duration) {
+    PERSIST_DELAY_MS.store(delay.as_millis() as u64, Ordering::Relaxed);
+}
+
 fn persist_closed_evidence(
     inner: &RegistryInner,
     session: &Arc<Session>,
@@ -2056,6 +2123,13 @@ fn persist_closed_evidence(
     exit_code: Option<i32>,
     signal: Option<&str>,
 ) {
+    #[cfg(test)]
+    {
+        let delay = PERSIST_DELAY_MS.load(Ordering::Relaxed);
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
+    }
     // Runs outside `session.status`: callers mark the transition inside the
     // lock, then persist here so the close path never holds a session mutex
     // across SQLite or spool I/O.
