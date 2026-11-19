@@ -46,12 +46,27 @@ export const RUNTIME_EXECUTION_CONTRACT = {
 } as const;
 
 /**
+ * Published runtime execution contract epoch 5.
+ *
+ * Retained in the hello window so already-deployed 1.1.1-era epoch-5
+ * workstations stay admitted while Edge rolls forward to epoch 7 ahead of
+ * the runtime upgrade.
+ */
+export const EPOCH5_RUNTIME_EXECUTION_CONTRACT = {
+  contract_epoch: 5,
+  contract_hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+  tool_count: 18,
+} as const;
+
+/**
  * Workstation hello acceptance window: epoch 7, the epoch-6 previous
- * runtime, the epoch-4 rollback basis, and the frozen epoch-2 catalog.
+ * runtime, the published epoch-5 runtime, the epoch-4 rollback basis, and
+ * the frozen epoch-2 catalog.
  */
 export const COMPATIBLE_RUNTIME_CONTRACTS = [
   RUNTIME_EXECUTION_CONTRACT,
   PREVIOUS_RUNTIME_EXECUTION_CONTRACT,
+  EPOCH5_RUNTIME_EXECUTION_CONTRACT,
   EPOCH4_RUNTIME_EXECUTION_CONTRACT,
   EPOCH2_CONTRACT,
 ] as const;

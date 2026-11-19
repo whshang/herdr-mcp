@@ -84,11 +84,11 @@ test("user keeps Edge runtime identity aligned | Given epoch-2 through epoch-7 d
   assert.equal(Number(epochMatch[1]), descriptor.contract_epoch);
   assert.equal(hashMatch[1], descriptor.contract_hash);
   assert.equal(Number(countMatch[1]), descriptor.tool_count);
-  // The acceptance window is the current identity plus epoch 6, epoch 4 and
+  // The acceptance window is the current identity plus epochs 6, 5, 4 and
   // the frozen epoch-2 catalog.
   assert.match(
     source,
-    /COMPATIBLE_RUNTIME_CONTRACTS = \[\s*RUNTIME_EXECUTION_CONTRACT,\s*PREVIOUS_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH4_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH2_CONTRACT,\s*\]/,
+    /COMPATIBLE_RUNTIME_CONTRACTS = \[\s*RUNTIME_EXECUTION_CONTRACT,\s*PREVIOUS_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH5_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH4_RUNTIME_EXECUTION_CONTRACT,\s*EPOCH2_CONTRACT,\s*\]/,
   );
   assert.match(source, /contract_epoch: 7,/);
   assert.match(
@@ -99,6 +99,10 @@ test("user keeps Edge runtime identity aligned | Given epoch-2 through epoch-7 d
   assert.match(
     source,
     /PREVIOUS_RUNTIME_EXECUTION_CONTRACT = \{\s*contract_epoch: 6,\s*contract_hash: "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e",\s*tool_count: 18,\s*\}/,
+  );
+  assert.match(
+    source,
+    /EPOCH5_RUNTIME_EXECUTION_CONTRACT = \{\s*contract_epoch: 5,\s*contract_hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",\s*tool_count: 18,\s*\}/,
   );
   assert.match(
     source,
