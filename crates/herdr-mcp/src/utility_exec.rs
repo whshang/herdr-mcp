@@ -271,38 +271,60 @@ fn exec_request_fingerprint(
 
 /// Fit a completed exec result under `MAX_EXEC_REPLAY_JSON_BYTES` for replay
 /// persistence. Output-heavy results (escaped bytes near the 4 MiB contract
-/// cap) get their `output` window shortened on a UTF-8 boundary; `bytes_total`
-/// and `truncated` keep reporting the real stream so a replay still directs
-/// callers to the durable read path for the remainder. The result the caller
-/// sees is untouched — this only shapes what is stored for replay.
+/// cap) get their `output`/`partial_output` windows shortened on UTF-8
+/// boundaries; `bytes_total` and `truncated` keep reporting the real stream so
+/// a replay still directs callers to the durable read path for the remainder.
+/// The result the caller sees is untouched — this only shapes what is stored
+/// for replay.
 fn replayable_exec_result(result: &Value) -> Value {
-    let Ok(encoded) = serde_json::to_string(result) else {
-        return result.clone();
+    // Timeout/durable completions carry captured text under `partial_output`
+    // rather than `output`; both share the same replay bound, so each round
+    // halves whichever retained-output field is currently largest.
+    const OUTPUT_FIELDS: [&str; 2] = ["output", "partial_output"];
+    let fits = |value: &Value| {
+        serde_json::to_string(value)
+            .map(|encoded| encoded.len() <= MAX_EXEC_REPLAY_JSON_BYTES)
+            .unwrap_or(false)
     };
-    if encoded.len() <= MAX_EXEC_REPLAY_JSON_BYTES {
+    if fits(result) {
         return result.clone();
     }
-    let Some(output) = result.get("output").and_then(Value::as_str) else {
-        return result.clone();
-    };
-    let mut keep = output.len();
     let mut shrunk = result.clone();
-    loop {
-        keep /= 2;
-        while keep > 0 && !output.is_char_boundary(keep) {
-            keep -= 1;
-        }
+    for _ in 0..64 {
+        let Some(field) = OUTPUT_FIELDS
+            .into_iter()
+            .filter(|field| {
+                shrunk
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            })
+            .max_by_key(|field| {
+                shrunk
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len)
+            })
+        else {
+            return shrunk;
+        };
+        let replacement = {
+            let text = shrunk[field].as_str().unwrap();
+            let mut keep = text.len() / 2;
+            while keep > 0 && !text.is_char_boundary(keep) {
+                keep -= 1;
+            }
+            json!(&text[..keep])
+        };
         if let Some(object) = shrunk.as_object_mut() {
-            object.insert("output".to_owned(), json!(&output[..keep]));
+            object.insert(field.to_owned(), replacement);
             object.insert("truncated".to_owned(), json!(true));
         }
-        let fits = serde_json::to_string(&shrunk)
-            .map(|encoded| encoded.len() <= MAX_EXEC_REPLAY_JSON_BYTES)
-            .unwrap_or(false);
-        if fits || keep == 0 {
+        if fits(&shrunk) {
             return shrunk;
         }
     }
+    shrunk
 }
 
 fn idempotency_error(code: &str, message: impl Into<String>) -> Value {
@@ -4123,5 +4145,66 @@ mod tests {
 
         drop(registry);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn oversized_partial_output_replay_still_persists_bounded() {
+        // A timeout/durable completion reports captured text under
+        // `partial_output`; near the 4 MiB contract cap with escape-heavy
+        // content it must still persist a bounded replay instead of failing
+        // the write and stranding the reservation Pending forever.
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let key = "oversized-timeout";
+        let fingerprint = "fp-oversized-timeout";
+        let key_hash = exec_key_hash(key);
+        let op_id = format!("op:exec:{}", &key_hash[..32]);
+        store
+            .lock()
+            .unwrap()
+            .reserve_operation(EXEC_OPERATION_KIND, &key_hash, fingerprint, &op_id, 1, None)
+            .unwrap();
+
+        let oversized = "\n".repeat(EXEC_MAX_OUTPUT_BYTES_CAP as usize);
+        let result = json!({
+            "ok": false,
+            "code": "exec_timeout",
+            "partial_output": oversized,
+            "bytes_total": oversized.len(),
+            "delivery_state": "unknown",
+        });
+        complete_durable_exec(&store, key, fingerprint, &result)
+            .expect("oversized partial_output must still persist");
+
+        let replay = reserve_durable_exec(
+            &store,
+            key,
+            fingerprint,
+            Some(ExecIntent::NonIdempotentWrite),
+        )
+        .expect("replay read")
+        .expect("a settled reservation replays");
+        assert_eq!(replay["truncated"], true);
+        assert_eq!(replay["bytes_total"], oversized.len() as u64);
+        assert!(
+            replay["partial_output"].as_str().unwrap().len() < oversized.len(),
+            "stored replay keeps a shortened partial_output window"
+        );
+    }
+
+    #[test]
+    fn oversized_output_and_partial_output_replay_persists_bounded() {
+        // Both retained-output fields may be large at once; the fitter halves
+        // whichever is largest each round until the payload fits.
+        let output = "x".repeat(EXEC_MAX_OUTPUT_BYTES_CAP as usize);
+        let partial = "y".repeat(EXEC_MAX_OUTPUT_BYTES_CAP as usize);
+        let shrunk = replayable_exec_result(&json!({
+            "ok": false,
+            "output": output,
+            "partial_output": partial,
+            "bytes_total": output.len() + partial.len(),
+        }));
+        assert_eq!(shrunk["truncated"], true);
+        let encoded = serde_json::to_string(&shrunk).unwrap();
+        assert!(encoded.len() <= MAX_EXEC_REPLAY_JSON_BYTES);
     }
 }
