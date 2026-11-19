@@ -234,6 +234,12 @@ struct RegistryInner {
     reaped_on_boot: usize,
     detached_on_boot: usize,
     closed_on_boot: usize,
+    /// Test-only pause inside `persist_closed_evidence` for this registry so
+    /// an interleave test can observe the window where `closed` is already
+    /// true but durable evidence is still being written. Registry-scoped so
+    /// concurrent tests in the same process keep their own persist timing.
+    #[cfg(test)]
+    persist_delay_ms: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -630,6 +636,8 @@ impl ExecRegistry {
                 reaped_on_boot: recovery.reaped,
                 detached_on_boot: recovery.detached,
                 closed_on_boot: recovery.closed,
+                #[cfg(test)]
+                persist_delay_ms: AtomicU64::new(0),
             }),
         })
     }
@@ -741,11 +749,14 @@ impl ExecRegistry {
         crate::projects::invalidate_git_status_cache_for_path(cwd);
         #[cfg(test)]
         {
-            // Test-only completion signal for the startup invalidation: a
-            // child may already be running before this line, so tests that
-            // must observe a cache prime *after* startup invalidation poll
-            // this counter instead of inferring ordering from the child.
-            STARTUP_INVALIDATION_DONE.fetch_add(1, Ordering::Relaxed);
+            // Test-only completion signal bound to this session: a child may
+            // already be running before this line, so ordering tests poll for
+            // their own session id instead of a process-wide tick that any
+            // concurrent session would satisfy.
+            STARTUP_INVALIDATION_SESSIONS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.clone());
         }
         Ok(json!({
             "ok": true,
@@ -1132,6 +1143,32 @@ impl ExecRegistry {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Test-only lookup for the session a durable runner spawned into `cwd`,
+    /// before the runner's result publishes the id. Lets an ordering test
+    /// bind the startup-invalidation wait to its own session instead of a
+    /// process-wide counter that concurrent sessions would satisfy.
+    #[cfg(test)]
+    pub(crate) fn native_session_id_with_cwd_for_test(&self, cwd: &Path) -> Option<String> {
+        self.inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .find(|session| session.cwd == cwd)
+            .map(|session| session.id.clone())
+    }
+
+    /// Set this registry's pause inside `persist_closed_evidence`. Scoped to
+    /// this registry so concurrent tests in the same process keep their own
+    /// persist timing; a registry is dropped with its fixture, so no panic
+    /// path can leak the delay into unrelated tests.
+    #[cfg(test)]
+    pub(crate) fn set_persist_delay_for_test(&self, delay: Duration) {
+        self.inner
+            .persist_delay_ms
+            .store(delay.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub fn list_views(&self) -> Vec<Value> {
@@ -2095,25 +2132,20 @@ fn persist_session_spool(state_dir: &Path, session: &Arc<Session>) -> Result<(),
 }
 
 #[cfg(test)]
-static STARTUP_INVALIDATION_DONE: AtomicU64 = AtomicU64::new(0);
+static STARTUP_INVALIDATION_SESSIONS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Test-only observable for the startup `invalidate_git_status_cache_for_path`
-/// in `start_native_process`. The child can signal readiness before the parent
-/// finishes session registration, so ordering tests poll this tick instead.
+/// in `start_native_process`, bound to the session id that ran it. The child
+/// can signal readiness before the parent finishes session registration, so
+/// ordering tests poll for *their* session's entry instead of a process-wide
+/// counter that any concurrent session would satisfy.
 #[cfg(test)]
-pub(crate) fn startup_invalidation_count_for_test() -> u64 {
-    STARTUP_INVALIDATION_DONE.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-static PERSIST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Test-only pause inside `persist_closed_evidence` so a test can observe the
-/// window where `closed` is already true but durable evidence is still being
-/// written — the interleave that `wait_for_writes_quiescent_for_test` covers.
-#[cfg(test)]
-pub(crate) fn set_persist_delay_for_test(delay: Duration) {
-    PERSIST_DELAY_MS.store(delay.as_millis() as u64, Ordering::Relaxed);
+pub(crate) fn startup_invalidation_done_for_test(session_id: &str) -> bool {
+    STARTUP_INVALIDATION_SESSIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(session_id)
 }
 
 fn persist_closed_evidence(
@@ -2125,7 +2157,7 @@ fn persist_closed_evidence(
 ) {
     #[cfg(test)]
     {
-        let delay = PERSIST_DELAY_MS.load(Ordering::Relaxed);
+        let delay = inner.persist_delay_ms.load(Ordering::Relaxed);
         if delay > 0 {
             thread::sleep(Duration::from_millis(delay));
         }

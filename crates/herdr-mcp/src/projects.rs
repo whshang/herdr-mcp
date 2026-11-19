@@ -140,6 +140,33 @@ fn git_status_cache_has(root: &Path) -> bool {
         .contains_key(root)
 }
 
+/// Count live cache entries whose key shares a path prefix or canonical
+/// spelling with `root`, regardless of expiry. Tests assert write
+/// invalidation deterministically: expired-but-kept entries keep counting,
+/// so a retained entry stays `>= 1` even when an observation point outlasts
+/// the TTL, while a dropped entry reads `0`. Scoping keeps parallel tests'
+/// roots from polluting the count.
+#[cfg(test)]
+pub(crate) fn git_status_cache_entry_count_for(root: &Path) -> usize {
+    let identity = std::fs::canonicalize(root).ok();
+    GIT_STATUS_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .keys()
+                .filter(|key| {
+                    root.starts_with(key.as_path())
+                        || key.starts_with(root)
+                        || std::fs::canonicalize(key.as_path()).ok() == identity
+                })
+                .count()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectInfo {
     pub root: PathBuf,

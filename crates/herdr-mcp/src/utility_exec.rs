@@ -3975,6 +3975,27 @@ mod tests {
         let snapshot = native_test_snapshot(&root);
         let registry = Arc::new(ExecRegistry::new(base.join("state")).unwrap());
 
+        // Deterministic interleave for the teardown drain: the monitor thread
+        // holds `closed=true` while `persist_closed_evidence` is delayed, so
+        // the cleanup below must wait for real evidence commit, not just for
+        // `running=false` (P1/pi 7007661604, Codex/droid 7007226865/7007762562).
+        // The delay is scoped to this registry, so a panic never leaks it to
+        // concurrent tests in the same process.
+        registry.set_persist_delay_for_test(Duration::from_millis(200));
+
+        // Interference session on a different cwd: its startup invalidation
+        // must NOT satisfy the wait for our session's signal — proving the
+        // per-session binding under the default parallel interleave (Codex
+        // 7010185316, droid 7007762562 #3).
+        let other_root = base.join("other-project");
+        fs::create_dir_all(&other_root).unwrap();
+        let interference = registry.start(&other_root, "true").unwrap();
+        let interference_id = interference["session_id"].as_str().unwrap().to_owned();
+        assert!(
+            crate::exec_sessions::startup_invalidation_done_for_test(&interference_id),
+            "interference session must record its own startup invalidation"
+        );
+
         // File barrier: the child creates `ready` then spin-waits for `gate`
         // before writing. The test re-warms the clean cache only after the
         // child has started — past run_durable's startup invalidation — so
@@ -3991,13 +4012,6 @@ mod tests {
             gate = gate.to_string_lossy(),
             marker = marker.to_string_lossy(),
         );
-        // Deterministic interleave for the teardown drain: the monitor thread
-        // holds `closed=true` while `persist_closed_evidence` is delayed, so
-        // the cleanup below must wait for real evidence commit, not just for
-        // `running=false` (P1/pi 7007661604, Codex/droid 7007226865/7007762562).
-        crate::exec_sessions::set_persist_delay_for_test(Duration::from_millis(200));
-        let startup_invalidations_before =
-            crate::exec_sessions::startup_invalidation_count_for_test();
         let runner = {
             let registry = Arc::clone(&registry);
             let snapshot = snapshot.clone();
@@ -4012,21 +4026,65 @@ mod tests {
             })
         };
 
-        // Two-stage barrier: `child-ready` proves the spawned process ran,
-        // and the startup invalidation tick proves the parent thread already
-        // completed exec_sessions' `invalidate_git_status_cache_for_path`.
-        // Waiting for the file alone races the parent's registration phase
-        // (Codex 7007226865): priming could precede the startup invalidation
-        // and make the completion-phase assertions vacuous.
-        let wait_deadline = Instant::now() + Duration::from_secs(10);
-        let startup_done = || {
-            crate::exec_sessions::startup_invalidation_count_for_test()
-                > startup_invalidations_before
+        // Unwind-safe barrier cleanup: a panic before the explicit join must
+        // still release the child's 20-second gate spin, join the runner, and
+        // terminate the session so no child or fixture outlives the test
+        // (droid 7007762562 #5).
+        struct RunnerGuard {
+            runner: Option<thread::JoinHandle<Value>>,
+            registry: Arc<ExecRegistry>,
+            gate: PathBuf,
+            session_id: Option<String>,
+        }
+        impl RunnerGuard {
+            fn join(&mut self) -> Value {
+                self.runner.take().map_or_else(
+                    || panic!("runner already joined"),
+                    |handle| handle.join().unwrap(),
+                )
+            }
+        }
+        impl Drop for RunnerGuard {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.gate, b"go");
+                if let Some(handle) = self.runner.take() {
+                    let _ = handle.join();
+                }
+                if let Some(session_id) = self.session_id.take() {
+                    let _ = self.registry.kill(&session_id);
+                }
+            }
+        }
+        let mut runner_guard = RunnerGuard {
+            runner: Some(runner),
+            registry: Arc::clone(&registry),
+            gate: gate.clone(),
+            session_id: None,
         };
-        while !(ready.exists() && startup_done()) {
+
+        // Session-bound barrier: `child-ready` proves the spawned process ran;
+        // the startup invalidation entry bound to *this* session id proves the
+        // parent already completed exec_sessions'
+        // `invalidate_git_status_cache_for_path` for this run — the
+        // interference session's entry above must not satisfy it.
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        let session_id = loop {
             assert!(
                 Instant::now() < wait_deadline,
-                "child-ready or startup invalidation never completed"
+                "native session never registered a cwd"
+            );
+            if let Some(id) = registry.native_session_id_with_cwd_for_test(&root) {
+                break id;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        runner_guard.session_id = Some(session_id.clone());
+        while !(ready.exists()
+            && crate::exec_sessions::startup_invalidation_done_for_test(&session_id))
+        {
+            assert!(
+                Instant::now() < wait_deadline,
+                "child-ready or this session's startup invalidation never completed"
             );
             thread::sleep(Duration::from_millis(5));
         }
@@ -4039,6 +4097,11 @@ mod tests {
             1,
             "the mid-flight inspect must probe once"
         );
+        let entries_after_prime = crate::projects::git_status_cache_entry_count_for(&root);
+        assert!(
+            entries_after_prime >= 1,
+            "clean derive must seed a cache entry"
+        );
         let cached = crate::projects::derive(&snapshot);
         assert!(!cached.projects[&root].dirty);
         assert_eq!(
@@ -4048,24 +4111,25 @@ mod tests {
         );
 
         // Release the child's write, wait for run_durable to return, then a
-        // derive inside the TTL must see fresh evidence via a new probe. The
-        // measured window bounds the assertion to the real 250ms
-        // GIT_STATUS_CACHE_TTL: a busy runner that stalls past the TTL fails
-        // honestly here instead of passing through natural expiry (droid
-        // 7007762562).
-        let release_at = Instant::now();
+        // derive must see fresh evidence via a new probe. The proof is
+        // structural, not wall-clock: `entries == 0` can only mean the
+        // completion-phase invalidation dropped the entry, because a merely
+        // EXPIRED entry stays in the map until a publish evicts it — no
+        // 250ms TTL window to race, regardless of scheduler load (Codex
+        // 7010185316, droid 7007762562 #1/#2).
         fs::write(&gate, b"go").unwrap();
-        let result = runner.join().unwrap();
+        let result = runner_guard.join();
         assert_eq!(result["ok"], true, "unexpected result: {result}");
         assert!(marker.exists());
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&root),
+            0,
+            "the completion phase must drop the mid-flight cache entries; \
+             an unexpired survivor proves the invalidation never ran"
+        );
 
         let refreshed = crate::projects::derive(&snapshot);
         let project = &refreshed.projects[&root];
-        assert!(
-            release_at.elapsed() < Duration::from_millis(250),
-            "post-write derive ran {:?} after release — outside the 250ms TTL",
-            release_at.elapsed()
-        );
         assert!(project.dirty, "{project:?}");
         assert!(project.changed_files >= 1, "{project:?}");
         assert_eq!(
@@ -4086,7 +4150,7 @@ mod tests {
             registry.wait_for_writes_quiescent_for_test(Duration::from_secs(5)),
             "exec sessions did not finish persisting evidence within 5s"
         );
-        crate::exec_sessions::set_persist_delay_for_test(Duration::ZERO);
+        drop(runner_guard);
         drop(registry);
         fs::remove_dir_all(&base).unwrap();
     }
