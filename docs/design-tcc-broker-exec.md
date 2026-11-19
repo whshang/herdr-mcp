@@ -91,9 +91,13 @@ Layers, weakest to strongest:
    any same-uid process. Same-uid is necessary but not sufficient: any user-owned
    binary can connect — image-path verification binds requests to the managed
    runtime.
-2. **`runtime_owner_token` (existing).** The runtime proves it wrote the
-   request file by embedding its per-instance owner token; broker rejects
-   requests whose token does not match the runtime owner record. Keep this.
+2. **`runtime_owner_token` (required for tier-1 exec, not implemented yet).**
+   The intended design is that the runtime proves it wrote the request by
+   embedding its per-instance owner token and the broker rejects a mismatch
+   against the runtime owner record. The current broker request schema
+   (`protocol`/`version`/`op`/`snapshot`/`args`) carries no token and performs
+   no such check, so today only layers 1 and 3 apply. Adding the field and its
+   rotation semantics (§9) is a precondition for enabling `exec`.
 3. **Broker code identity (existing).** `inspect_code_identity`,
    `installed_compat_state`, `installed_compat_revision` verify the broker's
    signature/TeamID and protocol revision before the runtime delegates. For an
@@ -221,8 +225,12 @@ mcp herdr_exec {workspace, project_root, command:"printf ok", timeout_ms:30000, 
 
 **Collection environment and time.** Samples were collected on 2026-11-18 on
 two macOS workstations (TCC-protected vs. home root) with the `herdr-mcp`
-runtime at `v1.2.0` and the pinned Herdr TUI `0.9.5`; each row is 10 consecutive
-runs of the same command after one warmup. Re-measure before treating these
+runtime at `v1.2.0` and the pinned Herdr TUI `0.9.5`. The two utility-pane rows
+are 10 consecutive measured runs each after one warmup. The native rows are
+**not** the same length: the E2E array holds 9 measured runs plus a separately
+reported warmup (~4500 ms), while its `internal ms` array holds 10 values — the
+original capture kept one E2E sample out of the table, so compare medians and
+outlier counts rather than pairing E2E with `internal` element by element. Re-measure before treating these
 numbers as a current baseline — runtime and Herdr versions both affect the
 utility-pane overhead, and this table is evidence for the design trade-off, not
 a release gate.
@@ -284,15 +292,24 @@ per-command latency, which is Edge-dominated anyway.
 
 ## 7. Proposed request/response contract (v1, tier 1)
 
-**Implementation precondition.** This contract is a proposal. Before any code
-lands, the acceptance side must be reconciled with the existing
-`runtime_owner_token` rotation semantics (the “`runtime_owner_token` rotation”
-item in §9): the broker verifies the token
-against the runtime owner record on every request, so v1 has to state what
-happens when the token rotates mid-connection (rejected request must fail
-closed, never fall back to a weaker check) and how a broker restart picks up the
-new token without accepting a stale one. Until that is written down, tier-1
-exec mediation stays unimplemented.
+**Implementation precondition.** This contract is a proposal, and the
+`runtime_owner_token` field below **is not accepted by the current broker**:
+`parse_request` in `crates/herdr-mcp/src/tcc_broker.rs` accepts exactly
+`protocol`, `version`, `op`, `snapshot` and `args`, and rejects any other
+top-level key. Before tier-1 exec lands, three things must be designed and
+implemented together (tracked as the “`runtime_owner_token` support and
+rotation” item in §9):
+
+1. the token joins the request schema and the broker verifies it against the
+   runtime owner record on every request;
+2. a mid-connection rotation fails closed (no weaker fallback, no retry under
+   the old token);
+3. a broker restart loads only the current owner record and never authorizes a
+   request with a token cached from before the restart.
+
+Until all three exist, tier-1 exec mediation stays unimplemented — the socket
+directory plus peer-image check in §3 is the only identity boundary the broker
+enforces today.
 
 ```jsonc
 // request
@@ -344,8 +361,12 @@ Error codes mirror the runtime's: `outside_managed_roots`, `program_not_allowed`
   is a runtime concept.)
 - Pane-occupancy vs broker-process cost under concurrent `herdr_exec` (10+
   parallel calls) — needs the real workload measurement once implemented.
-- **`runtime_owner_token` rotation (§7 precondition).** Two sub-decisions are
-  still open and must be written down before tier-1 exec mediation lands:
+- **`runtime_owner_token` support and rotation (§7 precondition).** The
+  current broker request schema has no token field and performs no token check
+  (`parse_request` accepts only `protocol`/`version`/`op`/`snapshot`/`args`), so
+  this is a design-and-implementation gap, not a parameter to tune. Three
+  sub-decisions are still open and must be written down before tier-1 exec
+  mediation lands:
   1. *Mid-connection rotation* — when the runtime writes a new owner token while
      a broker request is in flight, the request either fails closed as
      `owner_token_mismatch` (no weaker fallback, no retry on the old token) or
