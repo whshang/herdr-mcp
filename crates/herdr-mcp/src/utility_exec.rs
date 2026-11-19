@@ -19,6 +19,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const UTILITY_LABEL: &str = "herdr-mcp:utility";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// Default synchronous read window for a `herdr_exec` completion/timeout
+/// result (the head of the merged output buffer). `max_output_bytes` overrides
+/// it per call, capped at [`EXEC_MAX_OUTPUT_BYTES_CAP`].
+const EXEC_OUTPUT_READ_DEFAULT: usize = 65_536;
+/// Hard cap for a caller-supplied `herdr_exec.max_output_bytes`.
+const EXEC_MAX_OUTPUT_BYTES_CAP: u64 = 4 * 1024 * 1024;
+
+/// Per-stream retained-output cap for the exec session serving this request.
+/// A larger `max_output_bytes` widens the session's own stream buffer (up to
+/// the contract's 4 MiB) so the advertised read window is serviceable; the
+/// default stays at the registry's `MAX_STREAM_BUFFER_PER_STREAM`.
+fn stream_buffer_cap(max_output_bytes: usize) -> usize {
+    max_output_bytes.max(crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM)
+}
 const MAX_TIMEOUT_MS: u64 = 60_000;
 const PRE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const SPLIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,8 +47,11 @@ const MAX_IDEMPOTENCY_KEY_CHARS: usize = 256;
 /// session_id after the row would otherwise expire, and a shorter window would
 /// let the same key launch a duplicate of that live process.
 const EXEC_RECORD_TTL_MS: u64 = 60 * 60_000;
-/// Replay payload bound; a synchronous exec result stays well under this.
-const MAX_EXEC_REPLAY_JSON_BYTES: usize = 128 * 1024;
+/// Replay payload bound. It must cover a `max_output_bytes` completion at the
+/// contract cap (4 MiB of output plus envelope overhead); an oversized result
+/// is still persisted with a shortened output window rather than leaving the
+/// reservation permanently Pending (see `replayable_exec_result`).
+const MAX_EXEC_REPLAY_JSON_BYTES: usize = EXEC_MAX_OUTPUT_BYTES_CAP as usize + 1024 * 1024;
 /// Durable operations-ledger kind for `herdr_exec` idempotency.
 const EXEC_OPERATION_KIND: &str = "herdr_exec";
 #[cfg(unix)]
@@ -230,6 +247,7 @@ fn exec_request_fingerprint(
     intent: Option<ExecIntent>,
     confirm_busy: bool,
     timeout_ms: u64,
+    max_output_bytes: usize,
 ) -> String {
     let mut hasher = Sha256::new();
     for part in [
@@ -239,6 +257,7 @@ fn exec_request_fingerprint(
         intent.map(ExecIntent::as_str).unwrap_or("legacy"),
         if confirm_busy { "1" } else { "0" },
         &timeout_ms.to_string(),
+        &max_output_bytes.to_string(),
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
@@ -248,6 +267,64 @@ fn exec_request_fingerprint(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Fit a completed exec result under `MAX_EXEC_REPLAY_JSON_BYTES` for replay
+/// persistence. Output-heavy results (escaped bytes near the 4 MiB contract
+/// cap) get their `output`/`partial_output` windows shortened on UTF-8
+/// boundaries; `bytes_total` and `truncated` keep reporting the real stream so
+/// a replay still directs callers to the durable read path for the remainder.
+/// The result the caller sees is untouched — this only shapes what is stored
+/// for replay.
+fn replayable_exec_result(result: &Value) -> Value {
+    // Timeout/durable completions carry captured text under `partial_output`
+    // rather than `output`; both share the same replay bound, so each round
+    // halves whichever retained-output field is currently largest.
+    const OUTPUT_FIELDS: [&str; 2] = ["output", "partial_output"];
+    let fits = |value: &Value| {
+        serde_json::to_string(value)
+            .map(|encoded| encoded.len() <= MAX_EXEC_REPLAY_JSON_BYTES)
+            .unwrap_or(false)
+    };
+    if fits(result) {
+        return result.clone();
+    }
+    let mut shrunk = result.clone();
+    for _ in 0..64 {
+        let Some(field) = OUTPUT_FIELDS
+            .into_iter()
+            .filter(|field| {
+                shrunk
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            })
+            .max_by_key(|field| {
+                shrunk
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len)
+            })
+        else {
+            return shrunk;
+        };
+        let replacement = {
+            let text = shrunk[field].as_str().unwrap();
+            let mut keep = text.len() / 2;
+            while keep > 0 && !text.is_char_boundary(keep) {
+                keep -= 1;
+            }
+            json!(&text[..keep])
+        };
+        if let Some(object) = shrunk.as_object_mut() {
+            object.insert(field.to_owned(), replacement);
+            object.insert("truncated".to_owned(), json!(true));
+        }
+        if fits(&shrunk) {
+            return shrunk;
+        }
+    }
+    shrunk
 }
 
 fn idempotency_error(code: &str, message: impl Into<String>) -> Value {
@@ -398,7 +475,8 @@ fn complete_durable_exec(
     fingerprint: &str,
     result: &Value,
 ) -> Result<(), String> {
-    let result_json = serde_json::to_string(result)
+    let result = replayable_exec_result(result);
+    let result_json = serde_json::to_string(&result)
         .map_err(|error| format!("cannot encode herdr_exec replay payload: {error}"))?;
     if result_json.len() > MAX_EXEC_REPLAY_JSON_BYTES {
         return Err(format!(
@@ -416,7 +494,7 @@ fn complete_durable_exec(
             fingerprint,
             &result_json,
             now,
-            exec_completion_expiry(result, now),
+            exec_completion_expiry(&result, now),
         )
         .map_err(|error| format!("durable idempotency completion failed: {error}"))
 }
@@ -497,6 +575,12 @@ pub fn run_durable(
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
+    let max_output_bytes =
+        match optional_u64(args, "max_output_bytes", 1, EXEC_MAX_OUTPUT_BYTES_CAP) {
+            Ok(value) => usize::try_from(value.unwrap_or(EXEC_OUTPUT_READ_DEFAULT as u64))
+                .unwrap_or(EXEC_OUTPUT_READ_DEFAULT),
+            Err(error) => return error,
+        };
     let Some(workspace) = resolve_workspace(snapshot, workspace_target) else {
         return pre_start_rejection(json!({
             "ok": false,
@@ -560,6 +644,7 @@ pub fn run_durable(
             request.intent,
             confirm_busy,
             timeout_ms,
+            max_output_bytes,
         );
         match reserve_durable_exec(store, key, &fingerprint, request.intent) {
             Ok(Some(replay)) => return replay,
@@ -618,6 +703,7 @@ pub fn run_durable(
                     (&workspace.id, &effective_root),
                     &command,
                     timeout_ms,
+                    max_output_bytes,
                     &working,
                 )
             } else {
@@ -628,6 +714,7 @@ pub fn run_durable(
                     (&workspace.id, &effective_root),
                     &command,
                     timeout_ms,
+                    max_output_bytes,
                     &working,
                 )
             };
@@ -662,6 +749,7 @@ pub fn run_durable(
         &invocation,
         &command,
         timeout_ms,
+        max_output_bytes,
         &working,
     );
     projects::invalidate_git_status_cache(&effective_root);
@@ -753,10 +841,18 @@ pub(crate) fn start_private_pane_session(
     workspace_id: &str,
     effective_root: &Path,
     command: &str,
+    stream_cap: usize,
 ) -> Value {
     #[cfg(windows)]
     {
-        let _ = (client, registry, workspace_id, effective_root, command);
+        let _ = (
+            client,
+            registry,
+            workspace_id,
+            effective_root,
+            command,
+            stream_cap,
+        );
         return json!({
             "ok": false,
             "code": "unsupported_platform",
@@ -836,7 +932,8 @@ pub(crate) fn start_private_pane_session(
             return result;
         }
 
-        match registry.start_in_private_pane(effective_root, command, &pane_id) {
+        match registry.start_in_private_pane_with_cap(effective_root, command, &pane_id, stream_cap)
+        {
             Ok(mut value) => {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("workspace".to_owned(), json!(workspace_id));
@@ -882,11 +979,19 @@ fn run_oneshot_readonly(
     target: (&str, &Path),
     command: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     working: &[Value],
 ) -> Value {
     let (workspace_id, effective_root) = target;
     let started = Instant::now();
-    let start = start_private_pane_session(client, registry, workspace_id, effective_root, command);
+    let start = start_private_pane_session(
+        client,
+        registry,
+        workspace_id,
+        effective_root,
+        command,
+        stream_buffer_cap(max_output_bytes),
+    );
     let pane_id = start
         .get("pane_id")
         .and_then(Value::as_str)
@@ -914,7 +1019,7 @@ fn run_oneshot_readonly(
     };
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let read = registry.read(&session_id, "both", 0, 65_536);
+        let read = registry.read(&session_id, "both", 0, max_output_bytes);
         if read.get("phase").and_then(Value::as_str) == Some("completed") {
             let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
             let ok = exit_code.as_i64() == Some(0);
@@ -951,6 +1056,7 @@ fn run_oneshot_readonly(
                 "truncated",
                 "compacted",
                 "counts",
+                "bytes_total",
                 "pane_reclaimed",
                 "pane_reclaim_error",
             ] {
@@ -1059,6 +1165,7 @@ fn utility_owned_wait_budget(timeout_ms: u64) -> Duration {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_unix_durable(
     client: &HerdrClient,
     snapshot: &Value,
@@ -1066,6 +1173,7 @@ fn run_unix_durable(
     target: (&str, &Path),
     command: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     working: &[Value],
 ) -> Value {
     let (workspace_id, effective_root) = target;
@@ -1109,7 +1217,12 @@ fn run_unix_durable(
         return result;
     }
 
-    let start = match registry.start_in_existing_pane(effective_root, command, &pane_id) {
+    let start = match registry.start_in_existing_pane_with_cap(
+        effective_root,
+        command,
+        &pane_id,
+        stream_buffer_cap(max_output_bytes),
+    ) {
         Ok(value) => value,
         Err(message) => {
             return utility_pane_start_failure(workspace_id, &pane_id, command, message);
@@ -1124,7 +1237,7 @@ fn run_unix_durable(
     drop(submission_lock);
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let read = registry.read(session_id, "both", 0, 65_536);
+        let read = registry.read(session_id, "both", 0, max_output_bytes);
         let completed = read.get("phase").and_then(Value::as_str) == Some("completed");
         if completed {
             let exit_code = read.get("exit_code").cloned().unwrap_or(Value::Null);
@@ -1155,6 +1268,9 @@ fn run_unix_durable(
             }
             if let Some(truncated) = read.get("truncated") {
                 result.insert("truncated".to_owned(), truncated.clone());
+            }
+            if let Some(bytes_total) = read.get("bytes_total") {
+                result.insert("bytes_total".to_owned(), bytes_total.clone());
             }
             if let Some(compacted) = read.get("compacted") {
                 result.insert("compacted".to_owned(), compacted.clone());
@@ -1217,15 +1333,29 @@ fn run_native_durable(
     invocation: &ExecInvocation,
     command: &str,
     timeout_ms: u64,
+    max_output_bytes: usize,
     working: &[Value],
 ) -> Value {
     let (workspace_id, effective_root) = target;
     let started = Instant::now();
     let started_result = match invocation {
-        ExecInvocation::Command(command) => registry.start_native(effective_root, command),
+        ExecInvocation::Command(command) => registry.start_native_with_cap(
+            effective_root,
+            command,
+            stream_buffer_cap(max_output_bytes),
+        ),
         ExecInvocation::Steps(steps) => match steps.as_slice() {
-            [step] => registry.start_native_program(effective_root, &step.program, &step.args),
-            _ => registry.start_native(effective_root, &invocation.rendered()),
+            [step] => registry.start_native_program_with_cap(
+                effective_root,
+                &step.program,
+                &step.args,
+                stream_buffer_cap(max_output_bytes),
+            ),
+            _ => registry.start_native_with_cap(
+                effective_root,
+                &invocation.rendered(),
+                stream_buffer_cap(max_output_bytes),
+            ),
         },
     };
     let start = match started_result {
@@ -1265,7 +1395,7 @@ fn run_native_durable(
     let session_id = session_id.to_owned();
     let deadline = Duration::from_millis(timeout_ms);
     loop {
-        let read = registry.read(&session_id, "both", 0, 65_536);
+        let read = registry.read(&session_id, "both", 0, max_output_bytes);
         if read.get("phase").and_then(Value::as_str) == Some("completed") {
             return native_completed_result(
                 registry,
@@ -1321,7 +1451,14 @@ fn native_completed_result(
         "project_root".to_owned(),
         json!(effective_root.to_string_lossy()),
     );
-    for key in ["progress", "truncated", "compacted", "counts", "signal"] {
+    for key in [
+        "progress",
+        "truncated",
+        "compacted",
+        "counts",
+        "bytes_total",
+        "signal",
+    ] {
         if let Some(value) = read.get(key) {
             result.insert(key.to_owned(), value.clone());
         }
@@ -2201,8 +2338,14 @@ mod tests {
         let client = HerdrClient::new(&socket);
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
-        let result =
-            start_private_pane_session(&client, &registry, "w1", Path::new("/tmp"), "sleep 30");
+        let result = start_private_pane_session(
+            &client,
+            &registry,
+            "w1",
+            Path::new("/tmp"),
+            "sleep 30",
+            crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM,
+        );
         assert_eq!(result["ok"], true);
         assert_eq!(result["backend"], "private_pane");
         assert_eq!(result["pane_id"], "w1:p9");
@@ -2355,12 +2498,20 @@ mod tests {
                 (workspace_id, &base),
                 command,
                 15_000,
+                EXEC_OUTPUT_READ_DEFAULT,
                 &[],
             )
         };
 
         thread::scope(|scope| {
-            let owner = scope.spawn(|| registry.start_in_existing_pane(&base, ":", first_pane));
+            let owner = scope.spawn(|| {
+                registry.start_in_existing_pane_with_cap(
+                    &base,
+                    ":",
+                    first_pane,
+                    crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM,
+                )
+            });
             let launch_rpc = receive("pane.send_text", first_pane);
             let owner_launch = launch_rpc.1.clone();
             reply(launch_rpc, json!({"ok": true}));
@@ -2501,7 +2652,12 @@ mod tests {
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
         let started = registry
-            .start_in_existing_pane(Path::new("/tmp"), "sleep 30", "w1:p2")
+            .start_in_existing_pane_with_cap(
+                Path::new("/tmp"),
+                "sleep 30",
+                "w1:p2",
+                crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM,
+            )
             .unwrap();
         let owner = started["session_id"].as_str().unwrap().to_owned();
         let shell_ready = PaneReadiness {
@@ -2759,8 +2915,14 @@ mod tests {
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
 
-        let start =
-            start_private_pane_session(&client, &registry, "w1", &root, "printf 'read-only\\n'");
+        let start = start_private_pane_session(
+            &client,
+            &registry,
+            "w1",
+            &root,
+            "printf 'read-only\\n'",
+            crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM,
+        );
 
         assert_eq!(start["ok"], false, "{start}");
         assert_eq!(start["code"], "exec_start_failed", "{start}");
@@ -2904,8 +3066,14 @@ mod tests {
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
 
-        let result =
-            start_private_pane_session(&client, &registry, "w1", &base, "printf 'read-only\\n'");
+        let result = start_private_pane_session(
+            &client,
+            &registry,
+            "w1",
+            &base,
+            "printf 'read-only\\n'",
+            crate::exec_sessions::MAX_STREAM_BUFFER_PER_STREAM,
+        );
 
         assert_eq!(result["ok"], false, "{result}");
         assert_eq!(result["code"], "private_pane_unavailable", "{result}");
@@ -3476,6 +3644,50 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    /// `max_output_bytes` caps only the synchronous output window; `bytes_total`
+    /// and `herdr_exec_read` still expose the untruncated buffer.
+    #[cfg(unix)]
+    #[test]
+    fn native_max_output_bytes_caps_the_sync_read_window() {
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = native_test_snapshot(&root);
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &test_store(),
+            &json!({
+                "workspace": "w1",
+                "command": "printf '0123456789abcdefghijklmnopqrstuvwxyz'",
+                "timeout_ms": 15_000,
+                "max_output_bytes": 10,
+            }),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["output"], "0123456789");
+        assert_eq!(result["bytes_total"], 36);
+        let session_id = result["session_id"].as_str().unwrap();
+        let resumed = registry.read(session_id, "both", 0, 65_536);
+        assert_eq!(resumed["text"], "0123456789abcdefghijklmnopqrstuvwxyz");
+
+        // Bounds: 0 and over-cap values are invalid_params, non-integers too.
+        for args in [
+            json!({"workspace": "w1", "command": "true", "max_output_bytes": 0}),
+            json!({"workspace": "w1", "command": "true", "max_output_bytes": 4_194_305}),
+            json!({"workspace": "w1", "command": "true", "max_output_bytes": "10"}),
+        ] {
+            let refused = run_durable(&client, &snapshot, &registry, &test_store(), &args);
+            assert_eq!(refused["code"], "invalid_params", "{refused}");
+        }
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
+
     /// Regression for the real 1.0 failure: a child CLI exits 2 while printing
     /// exactly one JSON object. The result must prove the child process ran and
     /// ended, attribute the failure to it instead of to the Herdr control
@@ -3892,6 +4104,7 @@ mod tests {
             Some(ExecIntent::NonIdempotentWrite),
             false,
             DEFAULT_TIMEOUT_MS,
+            EXEC_OUTPUT_READ_DEFAULT,
         );
         store
             .lock()
@@ -3932,5 +4145,66 @@ mod tests {
 
         drop(registry);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn oversized_partial_output_replay_still_persists_bounded() {
+        // A timeout/durable completion reports captured text under
+        // `partial_output`; near the 4 MiB contract cap with escape-heavy
+        // content it must still persist a bounded replay instead of failing
+        // the write and stranding the reservation Pending forever.
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let key = "oversized-timeout";
+        let fingerprint = "fp-oversized-timeout";
+        let key_hash = exec_key_hash(key);
+        let op_id = format!("op:exec:{}", &key_hash[..32]);
+        store
+            .lock()
+            .unwrap()
+            .reserve_operation(EXEC_OPERATION_KIND, &key_hash, fingerprint, &op_id, 1, None)
+            .unwrap();
+
+        let oversized = "\n".repeat(EXEC_MAX_OUTPUT_BYTES_CAP as usize);
+        let result = json!({
+            "ok": false,
+            "code": "exec_timeout",
+            "partial_output": oversized,
+            "bytes_total": oversized.len(),
+            "delivery_state": "unknown",
+        });
+        complete_durable_exec(&store, key, fingerprint, &result)
+            .expect("oversized partial_output must still persist");
+
+        let replay = reserve_durable_exec(
+            &store,
+            key,
+            fingerprint,
+            Some(ExecIntent::NonIdempotentWrite),
+        )
+        .expect("replay read")
+        .expect("a settled reservation replays");
+        assert_eq!(replay["truncated"], true);
+        assert_eq!(replay["bytes_total"], oversized.len() as u64);
+        assert!(
+            replay["partial_output"].as_str().unwrap().len() < oversized.len(),
+            "stored replay keeps a shortened partial_output window"
+        );
+    }
+
+    #[test]
+    fn oversized_output_and_partial_output_replay_persists_bounded() {
+        // Both retained-output fields may be large at once; the fitter halves
+        // whichever is largest each round until the payload fits.
+        let output = "x".repeat(EXEC_MAX_OUTPUT_BYTES_CAP as usize);
+        let partial = "y".repeat(EXEC_MAX_OUTPUT_BYTES_CAP as usize);
+        let shrunk = replayable_exec_result(&json!({
+            "ok": false,
+            "output": output,
+            "partial_output": partial,
+            "bytes_total": output.len() + partial.len(),
+        }));
+        assert_eq!(shrunk["truncated"], true);
+        let encoded = serde_json::to_string(&shrunk).unwrap();
+        assert!(encoded.len() <= MAX_EXEC_REPLAY_JSON_BYTES);
     }
 }

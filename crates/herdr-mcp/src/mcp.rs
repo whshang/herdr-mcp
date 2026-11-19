@@ -1751,6 +1751,57 @@ fn request_status_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
     }
 }
 
+/// Parse the additive `herdr_inspect` inputs (runtime-exec contract v7):
+/// `workspace` (id or label), `since_cursor` (non-negative integer embedding
+/// the since-digest) and `view` ("full" default, or "compact").
+fn inspect_params(arguments: &Value) -> Result<native_tools::InspectParams<'_>, Value> {
+    let workspace = match arguments.get("workspace") {
+        None => None,
+        Some(value) => match value.as_str() {
+            Some(workspace) => Some(workspace),
+            None => {
+                return Err(json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "workspace must be a workspace_id or label string",
+                }));
+            }
+        },
+    };
+    let since_cursor = match arguments.get("since_cursor") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(cursor) => Some(cursor),
+            None => {
+                return Err(json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "since_cursor must be a non-negative integer",
+                }));
+            }
+        },
+    };
+    let compact = match arguments.get("view") {
+        None => false,
+        Some(value) => match value.as_str() {
+            Some("full") => false,
+            Some("compact") => true,
+            _ => {
+                return Err(json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "view must be \"full\" or \"compact\"",
+                }));
+            }
+        },
+    };
+    Ok(native_tools::InspectParams {
+        workspace,
+        since_cursor,
+        compact,
+    })
+}
+
 fn dispatch_admitted_tool(
     name: &str,
     arguments: Value,
@@ -1838,13 +1889,25 @@ fn admitted_tool_output(
                 None => native_tools::methods(query),
             }
         }
-        "herdr_inspect" => native_tools::inspect_with_selection(
-            context.client,
-            Some(context.cache),
-            Some(context.exec),
-            route.selection(),
-            herdr_core,
-        ),
+        "herdr_inspect" => {
+            let inspect_params = match inspect_params(&arguments) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Ok(AdmittedToolResult::Raw {
+                        output: error,
+                        is_error: true,
+                    });
+                }
+            };
+            native_tools::inspect_with_selection(
+                context.client,
+                Some(context.cache),
+                Some(context.exec),
+                route.selection(),
+                herdr_core,
+                &inspect_params,
+            )
+        }
         "herdr_since" => {
             let cursor = match arguments.get("cursor") {
                 None => 0,
@@ -2796,6 +2859,7 @@ fn workstation_preflight_call(
         Some(context.exec),
         selection,
         core_client,
+        &native_tools::InspectParams::default(),
     );
     // #768 Phase 2 slice 3: target/PID and backend-drift failures from the Core
     // inspect must never be wrapped into a successful preflight. The Core
@@ -17121,7 +17185,7 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "herdr-mcp");
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 6);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 7);
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("delivery, idempotency, and retryability evidence"));
         assert!(instructions.contains("current-state facts"));
@@ -17793,12 +17857,43 @@ mod tests {
     }
 
     #[test]
+    fn inspect_params_parses_additive_v7_inputs_and_rejects_bad_shapes() {
+        let empty = json!({});
+        let params = inspect_params(&empty).unwrap();
+        assert!(params.workspace.is_none());
+        assert!(params.since_cursor.is_none());
+        assert!(!params.compact);
+
+        let full_args = json!({
+            "workspace": "w1",
+            "since_cursor": 42,
+            "view": "compact",
+        });
+        let params = inspect_params(&full_args).unwrap();
+        assert_eq!(params.workspace, Some("w1"));
+        assert_eq!(params.since_cursor, Some(42));
+        assert!(params.compact);
+
+        for args in [
+            json!({"workspace": 3}),
+            json!({"since_cursor": -1}),
+            json!({"since_cursor": "0"}),
+            json!({"view": "minimal"}),
+            json!({"view": 1}),
+        ] {
+            let error = inspect_params(&args).unwrap_err();
+            assert_eq!(error["code"], "invalid_params", "{error}");
+        }
+        assert!(!inspect_params(&json!({"view": "full"})).unwrap().compact);
+    }
+
+    #[test]
     fn discover_advertises_current_native_identity_and_versions() {
         let result = discover_result();
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-        assert_eq!(result["_meta"]["herdr_contract_epoch"], 6);
+        assert_eq!(result["_meta"]["herdr_contract_epoch"], 7);
     }
 
     #[test]
@@ -18818,7 +18913,7 @@ mod tests {
         assert_eq!(remote_consent["code"], "unknown_local_method");
 
         let identity = contract::identity().unwrap();
-        assert_eq!(identity.epoch, 6);
+        assert_eq!(identity.epoch, 7);
         assert_eq!(identity.tool_count, 18);
     }
 

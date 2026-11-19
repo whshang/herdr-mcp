@@ -159,6 +159,217 @@ fn oversized_outbound_validation_code(code: &str) -> bool {
     )
 }
 
+/// Bulk-payload string fields eligible for transport degradation. Identity
+/// fields (`session_id`, `request_id`, `path`, `command`, codes) are never
+/// touched so the caller keeps the session resumption token and can page
+/// the remainder through the durable read path instead of receiving an
+/// unretryable `response_too_large`.
+const DEGRADABLE_PAYLOAD_FIELDS: [&str; 5] =
+    ["output", "partial_output", "content", "text", "diff"];
+
+#[derive(Clone)]
+enum PathSeg {
+    Key(String),
+    Index(usize),
+}
+
+/// Total bytes held in degradable payload fields — used to skip re-encoding
+/// the whole message while the bulk fields alone still exceed the budget.
+fn degradable_payload_bytes(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| {
+                if DEGRADABLE_PAYLOAD_FIELDS.contains(&key.as_str()) {
+                    item.as_str().map_or(0, str::len)
+                } else {
+                    degradable_payload_bytes(item)
+                }
+            })
+            .sum(),
+        Value::Array(items) => items.iter().map(degradable_payload_bytes).sum(),
+        _ => 0,
+    }
+}
+
+fn find_largest_payload(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    best: &mut Option<Vec<PathSeg>>,
+    best_len: &mut usize,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                match item {
+                    Value::String(text)
+                        if DEGRADABLE_PAYLOAD_FIELDS.contains(&key.as_str())
+                            && text.len() > *best_len =>
+                    {
+                        *best_len = text.len();
+                        let mut candidate = path.clone();
+                        candidate.push(PathSeg::Key(key.clone()));
+                        *best = Some(candidate);
+                    }
+                    Value::Object(_) | Value::Array(_) => {
+                        path.push(PathSeg::Key(key.clone()));
+                        find_largest_payload(item, path, best, best_len);
+                        path.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(index));
+                find_largest_payload(item, path, best, best_len);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Halve the largest degradable payload field inside `payload` on a UTF-8
+/// boundary and mark the owning object `truncated` (+ `bytes_total` hint
+/// when absent). Returns false when nothing shrinkable remains.
+fn truncate_largest_payload(payload: &mut Value) -> bool {
+    let mut best: Option<Vec<PathSeg>> = None;
+    // 256-byte floor: small strings are never bulk output, and shrinking a
+    // field yields at most a few bytes per round below this — the compact
+    // error is the better answer there.
+    let mut best_len = 256usize;
+    find_largest_payload(payload, &mut Vec::new(), &mut best, &mut best_len);
+    let Some(target) = best else {
+        return false;
+    };
+    let (last, parents) = match target.split_last() {
+        Some((PathSeg::Key(key), parents)) => (key, parents),
+        _ => return false,
+    };
+    let mut node = payload;
+    for seg in parents {
+        node = match seg {
+            PathSeg::Key(key) => match node.get_mut(key) {
+                Some(child) => child,
+                None => return false,
+            },
+            PathSeg::Index(index) => match node.get_mut(index) {
+                Some(child) => child,
+                None => return false,
+            },
+        };
+    }
+    let Some(object) = node.as_object_mut() else {
+        return false;
+    };
+    let total = match object.get(last).and_then(Value::as_str) {
+        Some(text) => text.len(),
+        None => return false,
+    };
+    // fs_read-style entries carry a `lines` cursor contract: never leave a
+    // half-delivered line and keep `lines.end`/`next_start_line`/`truncated_by`
+    // consistent with what `content` still holds so callers can page on.
+    let line_cursor = last == "content"
+        && object
+            .get("lines")
+            .and_then(|lines| lines.get("start"))
+            .and_then(Value::as_u64)
+            .is_some();
+    let Some(Value::String(field)) = object.get_mut(last) else {
+        return false;
+    };
+    let mut cut = field.len() / 2;
+    while !field.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut whole_lines = false;
+    if line_cursor && let Some(nl) = field[..cut].rfind('\n') {
+        cut = nl;
+        whole_lines = true;
+    }
+    field.truncate(cut);
+    if line_cursor {
+        // Delivered complete lines: every kept line is complete only when we
+        // cut at a newline; a mid-line fallback leaves a partial last line.
+        let kept_lines = field.matches('\n').count();
+        let delivered = if field.is_empty() {
+            0
+        } else if whole_lines {
+            kept_lines + 1
+        } else {
+            kept_lines
+        } as u64;
+        let start = object
+            .get("lines")
+            .and_then(|lines| lines.get("start"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        if let Some(lines) = object.get_mut("lines").and_then(Value::as_object_mut) {
+            lines.insert(
+                "end".to_owned(),
+                Value::from(start.saturating_add(delivered).saturating_sub(1)),
+            );
+        }
+        object.insert(
+            "next_start_line".to_owned(),
+            Value::from(start.saturating_add(delivered)),
+        );
+        object.insert("truncated_by".to_owned(), Value::from("bytes"));
+    }
+    object.insert("truncated".to_owned(), Value::Bool(true));
+    if !object.contains_key("bytes_total") {
+        object.insert("bytes_total".to_owned(), Value::from(total as u64));
+    }
+    true
+}
+
+/// Re-encode `message` after degrading its largest bulk-payload fields until
+/// the frame fits `options`' budget. Returns the encoded frame, or `None`
+/// when degradation cannot make it fit (caller falls back to the compact
+/// correlated error).
+///
+/// The loop keeps truncating while the frame is oversized and a shrinkable
+/// field remains. `MAX_DEGRADE_ROUNDS` only guards against pathological
+/// inputs: each round halves a field of at least the 256-byte floor, and a
+/// contract-legal `reads[]` batch (32 × 256 KiB) needs on the order of
+/// 32 × log2(256 KiB / 256) ≈ 320 rounds to converge.
+fn encode_tool_result_degraded(
+    message: &RelayMessage,
+    options: &RelayValidationOptions,
+) -> Option<String> {
+    const MAX_DEGRADE_ROUNDS: usize = 512;
+    let RelayMessage::ToolResult(result) = message else {
+        return None;
+    };
+    let mut result = result.clone();
+    // The caller only reaches here after the unmodified result failed the
+    // size check, so truncate before each encode attempt and skip the
+    // re-serialization while the bulk fields alone still exceed the budget.
+    for _ in 0..MAX_DEGRADE_ROUNDS {
+        let payload = result.result.as_mut()?;
+        if !truncate_largest_payload(payload) {
+            return None;
+        }
+        if options
+            .max_frame_bytes
+            .is_some_and(|max| degradable_payload_bytes(payload) > max)
+        {
+            continue;
+        }
+        let candidate = RelayMessage::ToolResult(result.clone());
+        match encode_relay_message(&candidate, Some(options)) {
+            Ok(frame) => return Some(frame),
+            Err(error) if oversized_outbound_validation_code(error.code.as_str()) => {
+                continue;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkTransportCore {
     workstation_id: String,
@@ -562,6 +773,16 @@ impl LinkTransportCore {
         let frame = match encode_relay_message(&message, Some(&self.validation_options())) {
             Ok(frame) => frame,
             Err(error) if oversized_outbound_validation_code(error.code.as_str()) => {
+                // Degrade first: a bulk result whose payload exceeds the
+                // frame budget (e.g. exec `max_output_bytes` up to 4 MiB, or
+                // a large `reads[]` batch) keeps `session_id` and friends by
+                // truncating payload fields rather than falling back to an
+                // unretryable `response_too_large` that drops the session.
+                if let Some(frame) =
+                    encode_tool_result_degraded(&message, &self.validation_options())
+                {
+                    return Ok(vec![TransportAction::SendFrame { attempt_id, frame }]);
+                }
                 let compact = match &message {
                     RelayMessage::ToolResult(result) => {
                         let runtime_generation = match &result.runtime_generation {
@@ -725,7 +946,7 @@ mod tests {
         ToolResultMessage,
     };
     use crate::relay::wire::{build_hello_message, decode_relay_frame, encode_relay_message};
-    use serde_json::{Number, json};
+    use serde_json::{Number, Value, json};
 
     fn runtime() -> RuntimeContractInfo {
         RuntimeContractInfo {
@@ -1056,6 +1277,318 @@ mod tests {
             error.runtime_generation,
             OptionalNullable::Value("g1".to_owned())
         );
+    }
+
+    #[test]
+    fn oversized_outbound_result_degrades_payload_and_preserves_session_id() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 512,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r1".to_owned(),
+            result: Some(json!({
+                "ok": true,
+                "session_id": "exec-session-1",
+                "output": "x".repeat(2_000),
+            })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded result");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result, not compact tool_error");
+        };
+        assert_eq!(result.request_id, "r1");
+        let payload = result.result.expect("result payload");
+        assert_eq!(payload["session_id"], "exec-session-1");
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["bytes_total"], 2_000);
+        let output = payload["output"].as_str().expect("output");
+        assert!(output.len() < 2_000);
+    }
+
+    #[test]
+    fn oversized_outbound_reads_batch_degrades_nested_content() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 2_048,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-reads".to_owned(),
+            result: Some(json!({
+                "ok": true,
+                "reads": [
+                    {"path": "/a/one.txt", "content": "y".repeat(3_000)},
+                    {"path": "/a/two.txt", "content": "z".repeat(3_000)},
+                ],
+            })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded reads");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result");
+        };
+        let reads = result
+            .result
+            .expect("result payload")
+            .get("reads")
+            .and_then(Value::as_array)
+            .expect("reads array")
+            .clone();
+        assert_eq!(reads.len(), 2);
+        // Paths must survive intact for the caller to page each file.
+        assert_eq!(reads[0]["path"], "/a/one.txt");
+        assert_eq!(reads[1]["path"], "/a/two.txt");
+        assert!(reads.iter().any(|entry| entry["truncated"] == true));
+    }
+
+    #[test]
+    fn oversized_outbound_reads_batch_at_contract_max_still_fits_frame() {
+        // Contract-legal worst case: reads[] with 32 entries each carrying a
+        // 256 KiB content field — the degradation loop must keep truncating
+        // until the frame fits the 256 KiB link budget, not stop at a fixed
+        // round count.
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 262_144,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let reads: Vec<Value> = (0..32)
+            .map(|index| {
+                json!({
+                    "path": format!("/a/file-{index:02}.txt"),
+                    "content": "x".repeat(256 * 1_024),
+                })
+            })
+            .collect();
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-reads-max".to_owned(),
+            result: Some(json!({ "ok": true, "reads": reads })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded max reads");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        assert!(
+            frame.len() <= 262_144,
+            "frame {} exceeds budget",
+            frame.len()
+        );
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result, not compact error");
+        };
+        assert_eq!(result.request_id, "r-reads-max");
+        let reads = result
+            .result
+            .expect("result payload")
+            .get("reads")
+            .and_then(Value::as_array)
+            .expect("reads array")
+            .clone();
+        assert_eq!(reads.len(), 32);
+        for (index, entry) in reads.iter().enumerate() {
+            assert_eq!(entry["path"], format!("/a/file-{index:02}.txt"));
+            assert_eq!(entry["truncated"], true);
+            assert_eq!(entry["bytes_total"], 256 * 1_024);
+        }
+    }
+
+    #[test]
+    fn oversized_outbound_three_mib_exec_output_still_fits_frame() {
+        // A 3 MiB exec output exceeds the 2 MiB local fetch budget — with the
+        // raised local cap it reaches transport degradation and must shrink
+        // into the 256 KiB link frame while keeping session correlation.
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 262_144,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-exec-3mib".to_owned(),
+            result: Some(json!({
+                "session_id": "sess-9",
+                "output": "z".repeat(3 * 1024 * 1024),
+            })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded exec output");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        assert!(
+            frame.len() <= 262_144,
+            "frame {} exceeds budget",
+            frame.len()
+        );
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result, not compact error");
+        };
+        let payload = result.result.expect("result payload");
+        assert_eq!(payload["session_id"], "sess-9");
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["bytes_total"], 3 * 1024 * 1024);
+        assert!(payload["output"].as_str().unwrap().len() < 262_144);
+    }
+
+    #[test]
+    fn oversized_outbound_fs_read_content_cuts_on_line_boundary() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 2_048,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        // 100 whole lines, one per line — a mid-line cut would break the
+        // paging contract, so the degraded entry must keep only complete
+        // lines and move `lines.end`/`next_start_line` accordingly.
+        let content = (1..=100)
+            .map(|line| format!("line-{line:03}-payload-payload-payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content_len = content.len();
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-lines".to_owned(),
+            result: Some(json!({
+                "ok": true,
+                "path": "/a/big.txt",
+                "lines": {"start": 1, "end": 100, "total": 100},
+                "next_start_line": null,
+                "truncated_by": null,
+                "truncated": false,
+                "content": content,
+            })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded lines");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result");
+        };
+        let payload = result.result.expect("result payload");
+        assert_eq!(payload["path"], "/a/big.txt");
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["truncated_by"], "bytes");
+        let content = payload["content"].as_str().expect("content");
+        let delivered = content.lines().count() as u64;
+        // No half-delivered line: the kept content ends at a line boundary
+        // and the cursor fields agree on how many lines arrived.
+        assert!((1..100).contains(&delivered));
+        assert_eq!(payload["lines"]["end"], delivered);
+        assert_eq!(payload["next_start_line"], delivered + 1);
+        assert_eq!(payload["bytes_total"], content_len);
+    }
+
+    #[test]
+    fn oversized_outbound_result_without_payload_fields_keeps_compact_error() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 512,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        // No degradable payload field: identity-only objects still fall
+        // back to the compact correlated error.
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-idonly".to_owned(),
+            result: Some(json!({ "marker": "x".repeat(2_000) })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("compact fallback");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("compact frame");
+        let RelayMessage::ToolError(error) = decoded else {
+            panic!("expected compact tool_error");
+        };
+        assert_eq!(error.code, "response_too_large");
+        assert!(!error.retryable);
     }
 
     #[test]

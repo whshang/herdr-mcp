@@ -38,7 +38,63 @@ const IMAGE_PREVIEW_MAX_PIXELS: u64 = 40_000_000;
 const IMAGE_PREVIEW_START_MAX_DIM: u32 = 1600;
 const IMAGE_PREVIEW_MIN_MAX_DIM: u32 = 320;
 
+/// Maximum entries accepted in one `herdr_fs_read` `reads[]` batch.
+const READ_BATCH_MAX_ENTRIES: usize = 32;
+
 pub fn read(snapshot: &Value, args: &Value) -> Value {
+    if args.get("reads").is_some() {
+        return read_batch(snapshot, args);
+    }
+    read_one(snapshot, args)
+}
+
+/// Validate the `reads[]` batch envelope and return the entry list. Shared by
+/// the in-process path and the TCC-broker fan-out so both enforce identical
+/// structure before any read executes.
+pub(crate) fn validate_read_batch_args(args: &Value) -> Result<Vec<Value>, Value> {
+    for key in ["path", "start_line", "end_line", "max_bytes"] {
+        if args.get(key).is_some() {
+            return Err(
+                json!({"ok": false, "code": "invalid_params", "message": format!("{key} is not accepted at the top level of a reads[] batch; put it inside each reads[] entry")}),
+            );
+        }
+    }
+    let entries = match args.get("reads").and_then(Value::as_array) {
+        Some(entries) if !entries.is_empty() && entries.len() <= READ_BATCH_MAX_ENTRIES => entries,
+        _ => {
+            return Err(
+                json!({"ok": false, "code": "invalid_params", "message": format!("reads must be a non-empty array of at most {READ_BATCH_MAX_ENTRIES} {{path, start_line, end_line, max_bytes}} objects")}),
+            );
+        }
+    };
+    Ok(entries.clone())
+}
+
+/// Batch mode: `reads[]` of `{path, start_line, end_line, max_bytes}`. Every
+/// entry goes through the same managed-root and secret gates plus its own
+/// line/byte budget; a failed entry reports its own `ok:false` without
+/// aborting the batch. Single-mode keys must not leak in alongside `reads`.
+fn read_batch(snapshot: &Value, args: &Value) -> Value {
+    let entries = match validate_read_batch_args(args) {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    let results = entries
+        .iter()
+        .map(|entry| {
+            if !entry.is_object() {
+                return json!({"ok": false, "code": "invalid_params", "message": "reads[] entries must be objects"});
+            }
+            read_one(snapshot, entry)
+        })
+        .collect::<Vec<_>>();
+    let ok = results
+        .iter()
+        .all(|entry| entry.get("ok").and_then(Value::as_bool) == Some(true));
+    json!({"ok": ok, "reads": results})
+}
+
+fn read_one(snapshot: &Value, args: &Value) -> Value {
     let path = match required_str(args, "path") {
         Ok(value) => value,
         Err(error) => return error,
@@ -1352,6 +1408,56 @@ mod tests {
             "outside_managed_roots"
         );
         fs::remove_dir_all(&sibling).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_batch_applies_the_same_gates_and_per_entry_budget() {
+        let root = operational_root();
+        let first = root.join("a.md");
+        let second = root.join("nested/b.md");
+        fs::write(&first, "one\ntwo\nthree\n").unwrap();
+        fs::write(&second, "inner\n").unwrap();
+        let snap = operational_snapshot(&root);
+
+        let batch = read(
+            &snap,
+            &json!({
+                "reads": [
+                    {"path": first, "start_line": 2, "end_line": 3},
+                    {"path": second},
+                    {"path": std::env::temp_dir().join(format!("herdr-mcp-fs-outside-{}", std::process::id())).join("x.md")}
+                ]
+            }),
+        );
+        // A refused entry reports its own ok:false without aborting the batch.
+        assert_eq!(batch["ok"], false, "{batch}");
+        let entries = batch["reads"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["ok"], true);
+        assert_eq!(entries[0]["content"], "two\nthree");
+        assert_eq!(entries[1]["ok"], true);
+        assert_eq!(entries[1]["content"], "inner\n");
+        assert_eq!(entries[2]["reason"], "outside_managed_roots");
+
+        // Single-mode keys must not leak in alongside reads[].
+        for args in [
+            json!({"reads": [{"path": first}], "path": first}),
+            json!({"reads": [{"path": first}], "max_bytes": 8}),
+        ] {
+            let refused = read(&snap, &args);
+            assert_eq!(refused["code"], "invalid_params", "{refused}");
+        }
+        // Shape validation: non-array, empty and oversized batches refuse.
+        for args in [
+            json!({"reads": "a.md"}),
+            json!({"reads": []}),
+            json!({"reads": vec![json!({"path": first}); 33]}),
+            json!({"reads": [1]}),
+        ] {
+            let refused = read(&snap, &args);
+            assert_eq!(refused["ok"], false, "{refused}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

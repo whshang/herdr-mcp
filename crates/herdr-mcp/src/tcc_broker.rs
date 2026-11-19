@@ -989,7 +989,51 @@ pub fn route_fs_git(op: &str, snapshot: &Value, args: &Value) -> Option<Result<V
     if std::env::var("HERDR_MCP_TCC_BROKER").ok().as_deref() != Some("1") {
         return None;
     }
-    Some(run_stable_broker(op, snapshot, args).map(annotate_operational_root_upgrade))
+    Some(match fs_read_batch_request(op, snapshot, args) {
+        Some(request) => request,
+        None => run_stable_broker(op, snapshot, args).map(annotate_operational_root_upgrade),
+    })
+}
+
+/// `herdr_fs_read` batch mode: installed stable brokers predate `reads[]`, so
+/// the runtime fans a validated batch out into one single-file `fs_read`
+/// request per entry and reassembles the batch shape. The envelope is
+/// validated here — before any broker call — with the same rules as the
+/// in-process path; per-entry failures report `ok:false` without aborting the
+/// batch.
+fn fs_read_batch_request(
+    op: &str,
+    snapshot: &Value,
+    args: &Value,
+) -> Option<Result<Value, String>> {
+    if op != "fs_read" || args.get("reads").is_none() {
+        return None;
+    }
+    Some(Ok(match fs_tools::validate_read_batch_args(args) {
+        Err(error) => error,
+        Ok(entries) => {
+            let results = entries
+                .iter()
+                .map(|entry| {
+                    if !entry.is_object() {
+                        return json!({"ok": false, "code": "invalid_params", "message": "reads[] entries must be objects"});
+                    }
+                    match run_stable_broker(op, snapshot, entry) {
+                        Ok(value) => annotate_operational_root_upgrade(value),
+                        Err(message) => json!({
+                            "ok": false,
+                            "code": "broker_failed",
+                            "message": message,
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let ok = results
+                .iter()
+                .all(|entry| entry.get("ok").and_then(Value::as_bool) == Some(true));
+            json!({"ok": ok, "reads": results})
+        }
+    }))
 }
 
 /// Explain an `outside_managed_roots` denial when the installed stable broker

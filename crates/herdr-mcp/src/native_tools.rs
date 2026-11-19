@@ -25,12 +25,28 @@ pub fn inspect(
     view
 }
 
+/// Optional `herdr_inspect` inputs (runtime-exec contract v7). Every field is
+/// additive: an all-default value reproduces the pre-v7 response byte-for-byte.
+#[derive(Debug, Default, Clone)]
+pub struct InspectParams<'a> {
+    /// Restrict workspaces/tabs/panes/agents/projects to one workspace
+    /// (matched on workspace `id` or `label`).
+    pub workspace: Option<&'a str>,
+    /// Embed the since-digest for this `herdr_since` cursor in the response's
+    /// `since` field.
+    pub since_cursor: Option<u64>,
+    /// `view="compact"`: project each collection down to identities and
+    /// statuses, dropping the verbose detail sections.
+    pub compact: bool,
+}
+
 pub fn inspect_with_selection(
     client: &HerdrClient,
     cache: Option<&EventCache>,
     exec: Option<&ExecRegistry>,
     selection: &crate::runtime_adapter::RuntimeBackendSelection,
     core_client: Option<&crate::runtime_adapter::HerdrCoreClient>,
+    params: &InspectParams,
 ) -> Value {
     // Capture the cursor before reading any cached or live snapshot. Events
     // arriving after this point are intentionally returned by herdr_since.
@@ -46,7 +62,173 @@ pub fn inspect_with_selection(
     };
     runtime_meta::augment_inspect(&mut view, cache, exec);
     annotate_since_cursor(&mut view, since_cursor);
+    if let Some(workspace) = params.workspace {
+        filter_view_to_workspace(&mut view, workspace);
+    }
+    if params.compact {
+        compact_inspect_view(&mut view);
+    }
+    if let (Some(cache), Some(cursor)) = (cache, params.since_cursor) {
+        // Reuse the herdr_since projection verbatim: it applies the same
+        // agent-visibility and workspace filtering as the standalone tool, so
+        // the embedded digest cannot leak hidden agents or foreign-workspace
+        // events that the plain view filter would have removed.
+        let digest = since(cache, cursor, params.workspace, Ok(None));
+        if let Some(object) = view.as_object_mut() {
+            object.insert("since".to_owned(), digest);
+        }
+    }
     view
+}
+
+/// Keep only the workspace whose `id` or `label` matches, then prune every
+/// collection whose entries belong to another workspace.
+fn filter_view_to_workspace(view: &mut Value, workspace: &str) {
+    // Error envelopes must pass through untouched: injecting empty
+    // workspaces/tabs/panes/agents into an ok:false result would falsify the
+    // failure view.
+    if view.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(object) = view.as_object_mut() else {
+        return;
+    };
+    let workspaces = object
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let retained: Vec<Value> = workspaces
+        .iter()
+        .filter(|entry| {
+            entry.get("id").and_then(Value::as_str) == Some(workspace)
+                || entry.get("label").and_then(Value::as_str) == Some(workspace)
+        })
+        .cloned()
+        .collect();
+    let ids: HashSet<String> = retained
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    object.insert("workspaces".to_owned(), Value::Array(retained));
+    for key in ["tabs", "panes", "agents"] {
+        let kept = object
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("workspace")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| ids.contains(id))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        object.insert(key.to_owned(), Value::Array(kept));
+    }
+    if let Some(shared) = object.get("shared_projects").and_then(Value::as_array) {
+        let kept = shared
+            .iter()
+            .filter(|entry| {
+                entry
+                    .get("workspace_ids")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ws| {
+                        ws.iter()
+                            .filter_map(Value::as_str)
+                            .any(|id| ids.contains(id))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        object.insert("shared_projects".to_owned(), Value::Array(kept));
+    }
+    // The inspect projection emits `focused_workspace`/`focused_pane` (the
+    // snapshot's focused_*_id fields are renamed on copy). A focus outside the
+    // retained workspaces must be nulled rather than left pointing at a
+    // workspace the caller just filtered out.
+    let focused = object
+        .get("focused_workspace")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("focused_workspace_id").and_then(Value::as_str))
+        .map(str::to_owned);
+    if focused.is_some_and(|id| !ids.contains(&id)) {
+        object.insert("focused_workspace".to_owned(), Value::Null);
+        object.insert("focused_workspace_id".to_owned(), Value::Null);
+        object.insert("focused_pane".to_owned(), Value::Null);
+    }
+}
+
+/// `view="compact"` projection: identities and statuses only.
+fn compact_inspect_view(view: &mut Value) {
+    let Some(object) = view.as_object_mut() else {
+        return;
+    };
+    // Verbose singleton sections are dropped entirely in compact view.
+    for key in [
+        "capability_inventory",
+        "semantic",
+        "semantic_judgment",
+        "workstation_info",
+        "herdr_native",
+        "exec_environment",
+        "capabilities",
+        "herdr_capabilities",
+        "endpoint_protocol_generation",
+    ] {
+        object.remove(key);
+    }
+    if let Some(workspaces) = object.get_mut("workspaces").and_then(Value::as_array_mut) {
+        for workspace in workspaces {
+            let Some(entry) = workspace.as_object_mut() else {
+                continue;
+            };
+            if let Some(projects) = entry.get_mut("projects").and_then(Value::as_array_mut) {
+                for project in projects {
+                    let Some(project) = project.as_object_mut() else {
+                        continue;
+                    };
+                    project.remove("pane_ids");
+                    project.remove("changed_files");
+                    project.remove("git_status_observed");
+                    project.remove("git_status_source");
+                    project.remove("also_open_in");
+                }
+            }
+        }
+    }
+    if let Some(panes) = object.get_mut("panes").and_then(Value::as_array_mut) {
+        for pane in panes {
+            let Some(entry) = pane.as_object_mut() else {
+                continue;
+            };
+            if let Some(agent) = entry.get_mut("agent").and_then(Value::as_object_mut) {
+                agent.remove("terminal_title");
+                agent.remove("state_change_seq");
+            }
+        }
+    }
+    if let Some(agents) = object.get_mut("agents").and_then(Value::as_array_mut) {
+        for agent in agents {
+            let Some(entry) = agent.as_object_mut() else {
+                continue;
+            };
+            for key in [
+                "cwd",
+                "terminal_title",
+                "state_change_seq",
+                "interactive_ready",
+                "session_ref",
+                "capabilities",
+            ] {
+                entry.remove(key);
+            }
+        }
+    }
 }
 
 fn annotate_since_cursor(view: &mut Value, since_cursor: u64) {
@@ -994,5 +1176,103 @@ mod tests {
         let (out, fact) = admit_agent_start_model(params.clone()).unwrap();
         assert_eq!(out, params);
         assert!(fact.is_none());
+    }
+
+    fn inspect_view_fixture() -> Value {
+        json!({
+            "ok": true,
+            "focused_workspace_id": "w2",
+            "focused_workspace": "w2",
+            "workspaces": [
+                {"id": "w1", "label": "main", "projects": [{"root": "/r1", "pane_ids": ["p1"], "changed_files": 3, "git_status_observed": true, "git_status_source": "cache", "managed": true, "dirty": true, "vcs": "git", "also_open_in": ["w2"]}]},
+                {"id": "w2", "label": "aux", "projects": []}
+            ],
+            "tabs": [{"id": "t1", "workspace": "w1"}, {"id": "t2", "workspace": "w2"}],
+            "panes": [
+                {"id": "p1", "workspace": "w1", "agent": {"name": "a1", "kind": "pi", "status": "working", "terminal_title": "t", "state_change_seq": 4}},
+                {"id": "p2", "workspace": "w2", "agent": null}
+            ],
+            "agents": [
+                {"name": "a1", "kind": "pi", "status": "working", "workspace": "w1", "pane": "p1", "cwd": "/r1", "terminal_title": "t", "state_change_seq": 4, "interactive_ready": true, "session_ref": {}, "capabilities": {}},
+                {"name": "a2", "kind": "omp", "status": "idle", "workspace": "w2", "pane": "p2"}
+            ],
+            "shared_projects": [{"root": "/r1", "workspace_ids": ["w1", "w2"], "pane_ids": ["p1"], "dirty": true, "managed": true, "vcs": "git"}],
+            "capability_inventory": {"record_count": 4},
+            "semantic": {"x": 1},
+            "semantic_judgment": {"x": 1},
+            "workstation_info": {"default_cwd": "/tmp"},
+            "herdr_native": {"installed": true},
+            "since_cursor": 9
+        })
+    }
+
+    #[test]
+    fn inspect_workspace_filter_keeps_only_the_named_workspace() {
+        let mut view = inspect_view_fixture();
+        filter_view_to_workspace(&mut view, "main");
+        assert_eq!(view["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(view["workspaces"][0]["id"], "w1");
+        assert_eq!(view["tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(view["panes"].as_array().unwrap().len(), 1);
+        assert_eq!(view["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(view["agents"][0]["name"], "a1");
+        // The shared project still names the workspace, so it stays.
+        assert_eq!(view["shared_projects"].as_array().unwrap().len(), 1);
+        // A focused workspace outside the filter is cleared, not silently stale.
+        assert_eq!(view["focused_workspace_id"], Value::Null);
+        assert_eq!(view["focused_workspace"], Value::Null);
+        assert_eq!(view["focused_pane"], Value::Null);
+    }
+
+    #[test]
+    fn inspect_workspace_filter_passes_error_envelopes_through_untouched() {
+        let mut error = json!({
+            "ok": false,
+            "code": "herdr_transport",
+            "message": "socket unavailable",
+        });
+        let before = error.clone();
+        filter_view_to_workspace(&mut error, "main");
+        assert_eq!(error, before, "ok:false results are not annotated");
+    }
+
+    #[test]
+    fn inspect_workspace_filter_by_label_and_unknown_values() {
+        let mut view = inspect_view_fixture();
+        filter_view_to_workspace(&mut view, "aux");
+        assert_eq!(view["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(view["agents"][0]["name"], "a2");
+        assert_eq!(view["focused_workspace_id"], "w2");
+
+        let mut empty = inspect_view_fixture();
+        filter_view_to_workspace(&mut empty, "missing");
+        assert!(empty["workspaces"].as_array().unwrap().is_empty());
+        assert!(empty["panes"].as_array().unwrap().is_empty());
+        assert!(empty["shared_projects"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inspect_compact_view_drops_detail_but_keeps_identities() {
+        let mut view = inspect_view_fixture();
+        compact_inspect_view(&mut view);
+        assert_eq!(view["ok"], true);
+        assert_eq!(view["since_cursor"], 9);
+        assert!(view.get("capability_inventory").is_none());
+        assert!(view.get("semantic").is_none());
+        assert!(view.get("semantic_judgment").is_none());
+        assert!(view.get("workstation_info").is_none());
+        assert!(view.get("herdr_native").is_none());
+        // Workspace/project identities stay; verbose project fields go.
+        let project = &view["workspaces"][0]["projects"][0];
+        assert_eq!(project["root"], "/r1");
+        assert!(project.get("changed_files").is_none());
+        assert!(project.get("git_status_observed").is_none());
+        // Pane/agent identities and statuses stay.
+        assert_eq!(view["panes"][0]["id"], "p1");
+        assert_eq!(view["panes"][0]["agent"]["status"], "working");
+        assert_eq!(view["agents"][0]["name"], "a1");
+        assert_eq!(view["agents"][0]["status"], "working");
+        assert!(view["agents"][0].get("session_ref").is_none());
+        assert!(view["agents"][0].get("capabilities").is_none());
     }
 }

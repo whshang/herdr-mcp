@@ -83,7 +83,7 @@ struct Scenario {
 
 /// Contract identity and state schema of a fixture release plus the identity the
 /// installed runtime reports. The default shape is the adjacent forward
-/// migration (local epoch 5 / schema 16 → target epoch 6).
+/// migration (local epoch 6 / schema 16 → target epoch 7).
 struct FixtureShape {
     local: ContractIdentity,
     manifest_contract: ContractIdentity,
@@ -95,8 +95,8 @@ impl FixtureShape {
     fn forward_migration() -> Self {
         let local = crate::contract::previous_identity().unwrap();
         let target = crate::contract::identity().unwrap();
-        assert_eq!(local.epoch, 5);
-        assert_eq!(target.epoch, 6);
+        assert_eq!(local.epoch, 6);
+        assert_eq!(target.epoch, 7);
         Self {
             local,
             manifest_contract: target,
@@ -108,8 +108,8 @@ impl FixtureShape {
     fn older_stable() -> Self {
         let local = crate::contract::identity().unwrap();
         let stable = crate::contract::previous_identity().unwrap();
-        assert_eq!(local.epoch, 6);
-        assert_eq!(stable.epoch, 5);
+        assert_eq!(local.epoch, 7);
+        assert_eq!(stable.epoch, 6);
         Self {
             local,
             manifest_contract: stable,
@@ -131,9 +131,9 @@ impl Scenario {
         Self::with_shape(version, FixtureShape::forward_migration(), edit, bad_probe)
     }
 
-    /// Real Stable shape (#829): the installed runtime is epoch 5 / schema 16
-    /// while the discovered release is epoch 4 / schema 15, exactly like a
-    /// v1.1.0 rc install seeing Stable v1.0.5.
+    /// Real Stable shape (#829): the installed runtime is one contract epoch
+    /// ahead of the discovered release, exactly like a v1.1.0 rc install
+    /// seeing Stable v1.0.5.
     fn older_stable(version: &str, edit: impl FnOnce(&mut Value), bad_probe: bool) -> Self {
         Self::with_shape(version, FixtureShape::older_stable(), edit, bad_probe)
     }
@@ -360,7 +360,7 @@ fn auto_refuses_skipped_epoch_missing_declaration_and_predecessor_mismatch_witho
     for case in ["skip", "missing", "from"] {
         let scenario = Scenario::new(
             |manifest| match case {
-                "skip" => manifest["contract"]["epoch"] = json!(7),
+                "skip" => manifest["contract"]["epoch"] = json!(8),
                 "missing" => {
                     manifest
                         .as_object_mut()
@@ -376,7 +376,7 @@ fn auto_refuses_skipped_epoch_missing_declaration_and_predecessor_mismatch_witho
             false,
         );
         let error = auto().unwrap_err();
-        assert!(error.contains("local epoch 5"), "{case}: {error}");
+        assert!(error.contains("local epoch 6"), "{case}: {error}");
         assert!(!scenario.root.join("update").exists());
         assert!(!scenario.root.join("worker-argv").exists());
         let paths = RuntimePaths::discover().unwrap();

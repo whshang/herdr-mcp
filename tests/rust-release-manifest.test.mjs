@@ -22,7 +22,7 @@ test("user receives a complete trusted manifest | Given all release assets | Whe
   await mkdir(assetsDir, { recursive: true });
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nname = "herdr-mcp"\nversion = "1.2.3-alpha.4"\n');
   await writeFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), 'pub const SCHEMA_VERSION: i64 = 4;\n');
-  await writeFile(join(root, "contracts", "runtime-exec-v6.json"), JSON.stringify({
+  await writeFile(join(root, "contracts", "runtime-exec-v7.json"), JSON.stringify({
     contract_epoch: 3,
     contract_hash: "sha256:test",
     tool_count: 18,
@@ -103,20 +103,20 @@ test("user receives a complete trusted manifest | Given all release assets | Whe
   }
 });
 
-test("user can cross one runtime epoch | Given the frozen rollback baseline | When building an epoch-6 manifest | Then it declares the frozen schema and one forward migration", async () => {
+test("user can cross one runtime epoch | Given the frozen rollback baseline | When building an epoch-7 manifest | Then it declares the frozen schema and one forward migration", async () => {
   const root = await mkdtemp(join(tmpdir(), "herdr-rust-release-migration-"));
   const assetsDir = join(root, "assets");
   await mkdir(join(root, "crates", "herdr-mcp", "src"), { recursive: true });
   await mkdir(join(root, "contracts"), { recursive: true });
   await mkdir(assetsDir);
-  const previous = JSON.parse(await readFile(new URL("../contracts/runtime-exec-v5.json", import.meta.url), "utf8"));
+  const previous = JSON.parse(await readFile(new URL("../contracts/runtime-exec-v6.json", import.meta.url), "utf8"));
   assert.deepEqual(
     { epoch: previous.contract_epoch, hash: previous.contract_hash, tool_count: previous.tool_count },
-    { epoch: 5, hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030", tool_count: 18 },
+    { epoch: 6, hash: "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e", tool_count: 18 },
   );
-  const current = await readFile(new URL("../contracts/runtime-exec-v6.json", import.meta.url), "utf8");
-  await writeFile(join(root, "contracts", "runtime-exec-v6.json"), current);
-  await writeFile(join(root, "contracts", "runtime-exec-v5.json"), JSON.stringify(previous));
+  const current = await readFile(new URL("../contracts/runtime-exec-v7.json", import.meta.url), "utf8");
+  await writeFile(join(root, "contracts", "runtime-exec-v7.json"), current);
+  await writeFile(join(root, "contracts", "runtime-exec-v6.json"), JSON.stringify(previous));
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nversion = "1.1.0-rc.1"\n');
   const schemaPath = join(root, "crates", "herdr-mcp", "src", "state_store.rs");
   await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 15;\n");
@@ -133,12 +133,12 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
     assert.equal(manifest.schema_version, 2);
     assert.equal(manifest.state_schema, 15);
     assert.deepEqual(manifest.contract_migration, {
-      from: { epoch: 5, hash: previous.contract_hash, tool_count: 18 },
+      from: { epoch: 6, hash: previous.contract_hash, tool_count: 18 },
       state_schema_from: 15,
     });
     assert.equal(Object.hasOwn(manifest, "state_schema_migration"), false);
     assert.deepEqual(manifest.contract, {
-      epoch: 6, hash: JSON.parse(current).contract_hash, tool_count: 18,
+      epoch: 7, hash: JSON.parse(current).contract_hash, tool_count: 18,
     });
     assert.equal(manifest.release_identity.source_ref, options.sourceRef);
     assert.equal(manifest.assets.length, RUST_RELEASE_TARGETS.length);
@@ -147,7 +147,7 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
     assert.equal(migrated.state_schema, 16);
     assert.deepEqual(migrated.state_schema_migration, { from: 15, to: 16, reversible: false });
     assert.deepEqual(migrated.contract_migration, {
-      from: { epoch: 5, hash: previous.contract_hash, tool_count: 18 },
+      from: { epoch: 6, hash: previous.contract_hash, tool_count: 18 },
       state_schema_from: 15,
     });
     for (const schema of [14, 17]) {
@@ -158,7 +158,7 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
       );
     }
     await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 15;\n");
-    await writeFile(join(root, "contracts", "runtime-exec-v5.json"), JSON.stringify({ ...previous, contract_epoch: 4 }));
+    await writeFile(join(root, "contracts", "runtime-exec-v6.json"), JSON.stringify({ ...previous, contract_epoch: 5 }));
     await assert.rejects(buildRustReleaseManifest(options), /invalid previous frozen runtime contract/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -176,7 +176,7 @@ test("Rust release manifest refuses incomplete assets and tag/version drift", as
   await mkdir(assetsDir, { recursive: true });
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nversion = "1.0.0"\n');
   await writeFile(join(root, "crates", "herdr-mcp", "src", "state_store.rs"), 'pub const SCHEMA_VERSION: i64 = 4;\n');
-  await writeFile(join(root, "contracts", "runtime-exec-v6.json"), JSON.stringify({ contract_epoch: 3, contract_hash: "h", tool_count: 18 }));
+  await writeFile(join(root, "contracts", "runtime-exec-v7.json"), JSON.stringify({ contract_epoch: 3, contract_hash: "h", tool_count: 18 }));
   try {
     await assert.rejects(
       buildRustReleaseManifest({

@@ -27,19 +27,27 @@ const RUNTIME_EXEC_V4_JSON: &str = include_str!("../../../contracts/runtime-exec
 #[cfg(test)]
 const RUNTIME_EXEC_V5_JSON: &str = include_str!("../../../contracts/runtime-exec-v5.json");
 
-/// Current runtime execution contract epoch 6: the epoch-5 catalog plus the
-/// `herdr_call` `params` schema widened to `anyOf:[object,string]` (a plain
-/// JSON object is the preferred wire form; the legacy JSON object string keeps
-/// working verbatim). Shaping is declarative over the frozen epoch-2 base via
-/// the descriptor `shapes[]` array.
+/// Frozen runtime execution contract epoch 6: the epoch-5 catalog plus the
+/// `herdr_call` `params` schema widened to `anyOf:[object,string]`. Retained
+/// exactly as shipped: it is now the immediately previous rollback baseline,
+/// and its identity is pinned by a deterministic hash regression.
+#[cfg(test)]
 const RUNTIME_EXEC_V6_JSON: &str = include_str!("../../../contracts/runtime-exec-v6.json");
 
+/// Current runtime execution contract epoch 7: the epoch-6 catalog plus three
+/// additive tool inputs — `herdr_inspect` `workspace`/`since_cursor`/`view`,
+/// `herdr_exec` `max_output_bytes`, and `herdr_fs_read` `reads[]` (with the
+/// descriptor `set.required` extension clearing its single-path requirement).
+/// Shaping is declarative over the frozen epoch-2 base via the descriptor
+/// `shapes[]` array.
+const RUNTIME_EXEC_V7_JSON: &str = include_str!("../../../contracts/runtime-exec-v7.json");
+
 /// Descriptor of the current runtime execution contract.
-const CURRENT_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V6_JSON;
+const CURRENT_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V7_JSON;
 /// Descriptor of the immediately previous runtime execution contract.
 #[cfg(test)]
-const PREVIOUS_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V5_JSON;
-const DESCRIPTOR_NAME: &str = "runtime-exec-v6";
+const PREVIOUS_RUNTIME_EXEC_JSON: &str = RUNTIME_EXEC_V6_JSON;
+const DESCRIPTOR_NAME: &str = "runtime-exec-v7";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ContractIdentity {
@@ -169,6 +177,25 @@ fn apply_shape(tools: &mut [Value], shape: &Value) -> Result<(), String> {
             "{DESCRIPTOR_NAME} descriptor shape {tool_name} inputSchema_properties must be an object"
         ));
     }
+    // Optional `set.required` override (v7+): replaces the tool's
+    // `inputSchema.required` list so a batch/alternate input form can lift a
+    // formerly required single-mode field. Only a string array is accepted;
+    // an empty array clears the requirement.
+    let required_override = shape
+        .get("set")
+        .and_then(|set| set.get("required"))
+        .map(|required| {
+            required
+                .as_array()
+                .filter(|items| items.iter().all(Value::is_string))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "{DESCRIPTOR_NAME} descriptor shape {tool_name} required must be a string array"
+                    )
+                })
+        })
+        .transpose()?;
     let mut shaped = false;
     for tool in tools.iter_mut() {
         if tool.get("name").and_then(Value::as_str) == Some(tool_name) {
@@ -196,6 +223,19 @@ fn apply_shape(tools: &mut [Value], shape: &Value) -> Result<(), String> {
                     })?;
                 for (property, definition) in extensions {
                     properties.insert(property.clone(), definition.clone());
+                }
+            }
+            if let Some(required) = &required_override {
+                let schema = object
+                    .get_mut("inputSchema")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        format!("{DESCRIPTOR_NAME} base tool {tool_name} has no inputSchema object")
+                    })?;
+                if required.is_empty() {
+                    schema.remove("required");
+                } else {
+                    schema.insert("required".to_owned(), Value::Array(required.clone()));
                 }
             }
             shaped = true;
@@ -241,9 +281,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn embedded_contract_identity_is_runtime_exec_v6() {
+    fn embedded_contract_identity_is_runtime_exec_v7() {
         let identity = identity().unwrap();
-        assert_eq!(identity.epoch, 6);
+        assert_eq!(identity.epoch, 7);
         assert_eq!(identity.tool_count, 18);
         // The exact hash is pinned below by the descriptor's contract_hash;
         // recomputing it here guards against the descriptor and the shaped
@@ -257,13 +297,13 @@ mod tests {
     }
 
     #[test]
-    fn previous_runtime_execution_contract_epoch_5_is_immutable() {
+    fn previous_runtime_execution_contract_epoch_6_is_immutable() {
         let previous = previous_identity().unwrap();
-        assert_eq!(previous.epoch, 5);
+        assert_eq!(previous.epoch, 6);
         assert_eq!(previous.tool_count, 18);
         assert_eq!(
             previous.hash,
-            "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
+            "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e"
         );
         assert_eq!(
             compute_contract_hash(&previous_tool_catalog().unwrap()).unwrap(),
@@ -274,8 +314,14 @@ mod tests {
             compute_contract_hash(&epoch2_tool_catalog().unwrap()).unwrap(),
             "sha256:7da23ad2ec8e7703d6380062126ba797218bde9e7711138c6b3e0ca6592efbf8"
         );
-        // The frozen epoch-3 and epoch-4 identities stay pinned by regression
-        // so the older rollback baselines cannot drift silently either.
+        // The frozen epoch-3/4/5 identities stay pinned by regression so the
+        // older rollback baselines cannot drift silently either.
+        let frozen_v5: Value = serde_json::from_str(RUNTIME_EXEC_V5_JSON).unwrap();
+        assert_eq!(frozen_v5["contract_epoch"], 5);
+        assert_eq!(
+            frozen_v5["contract_hash"],
+            "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
+        );
         let frozen_v3: Value = serde_json::from_str(RUNTIME_EXEC_V3_JSON).unwrap();
         assert_eq!(frozen_v3["contract_epoch"], 3);
         assert_eq!(
@@ -291,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_v5_evolves_epoch2_by_opt_in_idempotency_metadata_only() {
+    fn previous_v6_evolves_epoch2_by_exec_metadata_and_call_params_only() {
         let frozen = epoch2_tool_catalog().unwrap();
         let previous = previous_tool_catalog().unwrap();
         assert_eq!(frozen.len(), previous.len());
@@ -308,7 +354,10 @@ mod tests {
                 changed.push(name.to_owned());
             }
         }
-        assert_eq!(changed, vec!["herdr_exec".to_owned()]);
+        assert_eq!(
+            changed,
+            vec!["herdr_call".to_owned(), "herdr_exec".to_owned()]
+        );
 
         let previous_exec = previous
             .iter()
@@ -360,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn current_v6_evolves_v5_by_herdr_call_params_union_only() {
+    fn current_v7_evolves_v6_by_three_additive_tool_inputs() {
         let previous = previous_tool_catalog().unwrap();
         let current = tool_catalog().unwrap();
         assert_eq!(previous.len(), current.len());
@@ -374,52 +423,93 @@ mod tests {
                 changed.push(name.to_owned());
             }
         }
-        assert_eq!(changed, vec!["herdr_call".to_owned()]);
+        assert_eq!(
+            changed,
+            vec![
+                "herdr_inspect".to_owned(),
+                "herdr_fs_read".to_owned(),
+                "herdr_exec".to_owned()
+            ]
+        );
 
-        let current_call = current
+        // herdr_exec: exactly one additive optional property, nothing else
+        // changed (the v6 intent/idempotency properties stay verbatim).
+        let exec_prev = previous
             .iter()
-            .find(|tool| tool["name"] == "herdr_call")
+            .find(|tool| tool["name"] == "herdr_exec")
             .unwrap();
-        let previous_call = previous
+        let exec_now = current
             .iter()
-            .find(|tool| tool["name"] == "herdr_call")
+            .find(|tool| tool["name"] == "herdr_exec")
             .unwrap();
-        // Only the params property definition and the description may differ.
-        let previous_properties = previous_call["inputSchema"]["properties"]
+        let prev_properties = exec_prev["inputSchema"]["properties"].as_object().unwrap();
+        let now_properties = exec_now["inputSchema"]["properties"].as_object().unwrap();
+        for (key, value) in prev_properties {
+            assert_eq!(now_properties.get(key), Some(value), "{key} stays frozen");
+        }
+        assert_eq!(
+            now_properties
+                .keys()
+                .filter(|key| !prev_properties.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["max_output_bytes".to_owned()]
+        );
+        assert_eq!(
+            exec_prev["inputSchema"]["required"],
+            exec_now["inputSchema"]["required"]
+        );
+
+        // herdr_inspect: three optional params on an otherwise empty schema.
+        let inspect_now = current
+            .iter()
+            .find(|tool| tool["name"] == "herdr_inspect")
+            .unwrap();
+        let inspect_properties = inspect_now["inputSchema"]["properties"]
             .as_object()
             .unwrap();
-        let current_properties = current_call["inputSchema"]["properties"]
-            .as_object()
+        assert_eq!(
+            inspect_properties.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "since_cursor".to_owned(),
+                "view".to_owned(),
+                "workspace".to_owned()
+            ]
+        );
+        assert_eq!(
+            inspect_now["inputSchema"]["properties"]["view"]["enum"],
+            json!(["full", "compact"])
+        );
+
+        // herdr_fs_read: reads[] batch, single-mode properties intact, and the
+        // descriptor `set.required` extension cleared the path requirement.
+        let read_prev = previous
+            .iter()
+            .find(|tool| tool["name"] == "herdr_fs_read")
             .unwrap();
-        assert_eq!(previous_properties.len(), current_properties.len());
-        for (key, value) in previous_properties {
-            if key == "params" {
-                continue;
-            }
+        let read_now = current
+            .iter()
+            .find(|tool| tool["name"] == "herdr_fs_read")
+            .unwrap();
+        assert_eq!(read_prev["inputSchema"]["required"], json!(["path"]));
+        assert_eq!(read_now["inputSchema"].get("required"), None);
+        let read_properties = read_now["inputSchema"]["properties"].as_object().unwrap();
+        for key in ["path", "start_line", "end_line", "max_bytes"] {
             assert_eq!(
-                current_properties.get(key),
-                Some(value),
-                "{key} must stay frozen"
+                read_properties.get(key),
+                read_prev["inputSchema"]["properties"].get(key),
+                "{key} stays frozen"
             );
         }
-        // The widened schema accepts either a JSON object (preferred) or the
-        // legacy JSON object string; no other type is advertised.
-        let params = &current_call["inputSchema"]["properties"]["params"];
-        assert_eq!(
-            params.get("type"),
-            None,
-            "params uses anyOf, not a bare type"
-        );
-        assert_eq!(
-            params["anyOf"],
-            json!([{"type": "object"}, {"type": "string"}])
-        );
-        // The required list and every other tool field stay untouched.
-        let mut expected = previous_call.clone();
-        expected["description"] = current_call["description"].clone();
-        expected["inputSchema"]["properties"]["params"] =
-            current_call["inputSchema"]["properties"]["params"].clone();
-        assert_eq!(&expected, current_call);
+        let reads = &read_properties["reads"];
+        assert_eq!(reads["type"], "array");
+        assert_eq!(reads["items"]["required"], json!(["path"]));
+        for key in ["path", "start_line", "end_line", "max_bytes"] {
+            assert!(
+                reads["items"]["properties"].get(key).is_some(),
+                "reads[] item keeps {key}"
+            );
+        }
     }
 
     #[test]
@@ -479,6 +569,8 @@ mod tests {
                         current_tool["inputSchema"]["properties"]["intent"].clone();
                     expected["inputSchema"]["properties"]["idempotency_key"] =
                         current_tool["inputSchema"]["properties"]["idempotency_key"].clone();
+                    expected["inputSchema"]["properties"]["max_output_bytes"] =
+                        current_tool["inputSchema"]["properties"]["max_output_bytes"].clone();
                 }
                 "herdr_call" => {
                     expected.as_object_mut().unwrap().insert(
@@ -488,6 +580,26 @@ mod tests {
                     expected["inputSchema"]["properties"]["params"] =
                         current_tool["inputSchema"]["properties"]["params"].clone();
                 }
+                "herdr_inspect" => {
+                    expected.as_object_mut().unwrap().insert(
+                        "description".to_owned(),
+                        current_tool["description"].clone(),
+                    );
+                    expected["inputSchema"]["properties"] =
+                        current_tool["inputSchema"]["properties"].clone();
+                }
+                "herdr_fs_read" => {
+                    expected.as_object_mut().unwrap().insert(
+                        "description".to_owned(),
+                        current_tool["description"].clone(),
+                    );
+                    expected["inputSchema"]["properties"]["reads"] =
+                        current_tool["inputSchema"]["properties"]["reads"].clone();
+                    expected["inputSchema"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("required");
+                }
                 other => panic!("unexpected shaped tool {other}"),
             }
             assert_eq!(
@@ -495,7 +607,7 @@ mod tests {
                 "only the declared shape fields may change on {name}"
             );
         }
-        assert_eq!(changed, 2, "exactly two tool metadata shapes are applied");
+        assert_eq!(changed, 4, "exactly four tool metadata shapes are applied");
         let frozen_exec = frozen
             .iter()
             .find(|tool| tool["name"] == "herdr_exec")
