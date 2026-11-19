@@ -69,7 +69,10 @@ import {
   validateRelayMessage,
 } from "../dist/canonical-imports.js";
 import { filterWebChatGrantsForRuntime } from "../dist/webchat-grant-capability.js";
-import { RUNTIME_EXECUTION_CONTRACT } from "../dist/contracts/runtime.js";
+import {
+  COMPATIBLE_RUNTIME_CONTRACTS,
+  RUNTIME_EXECUTION_CONTRACT,
+} from "../dist/contracts/runtime.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** Repository root, derived from `edge/cloudflare/tests/`. */
@@ -451,13 +454,21 @@ export async function startEdgeRuntime({ deviceId, profileSeed = "edge-runtime-h
   // runtime-only execution-contract bump (schema widening owned by the
   // runtime, e.g. epoch 6) advances the advertised epoch while this Edge still
   // stamps the previous epoch — a valid deployment ordering, since requests
-  // carry the Edge's epoch and the runtime never gates on it. Accept the
-  // stamped epoch or stamped+1; a larger drift means the pair under test is
-  // not coherent.
+  // carry the Edge's epoch and the runtime never gates on it. An Edge-only
+  // bump is equally valid: any epoch in COMPATIBLE_RUNTIME_CONTRACTS is an
+  // advertised peer this Edge accepts at handshake. Accept the stamped
+  // epoch, stamped+1, or any compatible epoch; a larger drift means the pair
+  // under test is not coherent.
   const discovery = await runtime.discover();
   const advertisedEpoch = discovery?.result?._meta?.herdr_contract_epoch;
   const stampedEpoch = RUNTIME_EXECUTION_CONTRACT.contract_epoch;
-  if (advertisedEpoch !== stampedEpoch && advertisedEpoch !== stampedEpoch + 1) {
+  const compatible =
+    advertisedEpoch === stampedEpoch ||
+    advertisedEpoch === stampedEpoch + 1 ||
+    COMPATIBLE_RUNTIME_CONTRACTS.some(
+      (entry) => entry.contract_epoch === advertisedEpoch,
+    );
+  if (!compatible) {
     await runtime.stop();
     throw new Error(
       `runtime advertises execution contract epoch ${advertisedEpoch} but this edge stamps ${stampedEpoch}`,
