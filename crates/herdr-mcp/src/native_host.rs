@@ -73,6 +73,8 @@ const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_NATIVE_REQUEST_BATCH: usize = 24;
 #[cfg(unix)]
 const MAX_NATIVE_REQUEST_BATCH_PARALLEL: usize = 4;
+/// Bound concurrent control requests without blocking the input reader.
+const MAX_NATIVE_CONTROL_IN_FLIGHT: usize = 32;
 
 #[cfg(unix)]
 const ALLOWED_PROXY_PATHS: &[&str] = &[
@@ -402,7 +404,9 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = stdin.lock();
-    let mut writer = stdout.lock();
+    // Each control request writes a complete framed response under a mutex.
+    // `Stdout`, unlike `StdoutLock`, can be shared with scoped workers.
+    let mut writer = stdout;
     #[cfg(unix)]
     {
         serve(
@@ -424,7 +428,7 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
 ///
 /// `resolve_config` is the production environment read. Tests inject a config
 /// because they cannot own the installed extension registry.
-fn serve<R: Read, W: Write>(
+fn serve<R: Read, W: Write + Send>(
     caller_origin: &str,
     reader: &mut R,
     writer: &mut W,
@@ -436,74 +440,164 @@ fn serve<R: Read, W: Write>(
     let mut config = None;
     #[cfg(unix)]
     let mut resolve_config = Some(resolve_config);
-    let mut first_read = true;
-    let mut message_type = "-";
-    let mut last_reason = "native_host_eof";
-    loop {
-        let read = read_native_message(reader);
-        let current_message_type = read
-            .as_ref()
-            .ok()
-            .map(|(message, _)| message_type_code(message))
-            .unwrap_or("-");
-        if first_read {
-            record_connect(log, caller_origin, &read);
-            message_type = current_message_type;
-            first_read = false;
-        }
-        if matches!(&read, Err(error) if error == "native_host_eof") {
-            break;
-        }
-        if let Err(error) = &read {
-            let outcome = refuse(writer, error, None);
+    let writer = std::sync::Mutex::new(writer);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        let mut first_read = true;
+        let mut message_type = "-";
+        let mut last_reason = "native_host_eof";
+        loop {
+            while let Some(index) = workers.iter().position(
+                |handle: &std::thread::ScopedJoinHandle<'_, HostOutcome>| handle.is_finished(),
+            ) {
+                let outcome = workers
+                    .swap_remove(index)
+                    .join()
+                    .map_err(|_| "native-host worker panicked".to_owned())?;
+                last_reason = outcome.reason;
+                if let Some(error) = outcome.error {
+                    record_disconnect(log, outcome.reason, message_type, started);
+                    return Err(error);
+                }
+            }
+            let read = read_native_message(reader);
+            let current_message_type = read
+                .as_ref()
+                .ok()
+                .map(|(message, _)| message_type_code(message))
+                .unwrap_or("-");
+            if first_read {
+                record_connect(log, caller_origin, &read);
+                message_type = current_message_type;
+                first_read = false;
+            }
+            if matches!(&read, Err(error) if error == "native_host_eof") {
+                break;
+            }
+            if let Err(error) = &read {
+                let mut writer = writer
+                    .lock()
+                    .map_err(|_| "native stdout lock unavailable".to_owned())?;
+                let outcome = refuse(&mut **writer, error, None);
+                last_reason = outcome.reason;
+                if let Some(error) = outcome.error {
+                    record_disconnect(log, outcome.reason, message_type, started);
+                    return Err(error);
+                }
+                continue;
+            }
+            #[cfg(unix)]
+            if config.is_none() {
+                let resolved = resolve_config
+                    .take()
+                    .expect("native host config resolver called once")(
+                );
+                match resolved {
+                    Ok(value) => config = Some(value),
+                    Err(error) => {
+                        let request_id = read
+                            .as_ref()
+                            .ok()
+                            .and_then(|(message, _)| message.get("request_id"));
+                        let mut writer = writer
+                            .lock()
+                            .map_err(|_| "native stdout lock unavailable".to_owned())?;
+                        let outcome = refuse(&mut **writer, &error, request_id);
+                        last_reason = outcome.reason;
+                        if let Some(error) = outcome.error {
+                            record_disconnect(log, outcome.reason, message_type, started);
+                            return Err(error);
+                        }
+                        break;
+                    }
+                }
+            }
+            let has_request_id = read
+                .as_ref()
+                .ok()
+                .and_then(|(message, _)| message.get("request_id"))
+                .and_then(Value::as_str)
+                .is_some();
+            if has_request_id && current_message_type != "stream" {
+                if workers.len() >= MAX_NATIVE_CONTROL_IN_FLIGHT {
+                    let request_id = read
+                        .as_ref()
+                        .ok()
+                        .and_then(|(message, _)| message.get("request_id"));
+                    let mut writer = writer
+                        .lock()
+                        .map_err(|_| "native stdout lock unavailable".to_owned())?;
+                    let outcome = refuse(&mut **writer, "native_host_busy", request_id);
+                    if let Some(error) = outcome.error {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                #[cfg(unix)]
+                let worker_config = config
+                    .as_ref()
+                    .expect("native host config resolved")
+                    .clone();
+                let shared_writer = &writer;
+                workers.push(scope.spawn(move || {
+                    let mut response = Vec::new();
+                    let outcome = serve_message(
+                        caller_origin,
+                        read,
+                        &mut response,
+                        log,
+                        #[cfg(unix)]
+                        &worker_config,
+                    );
+                    if outcome.error.is_some() {
+                        return outcome;
+                    }
+                    let write_result = shared_writer
+                        .lock()
+                        .map_err(|_| "native stdout lock unavailable".to_owned())
+                        .and_then(|mut writer| {
+                            writer
+                                .write_all(&response)
+                                .and_then(|_| writer.flush())
+                                .map_err(|error| format!("native_stdout_failed: {error}"))
+                        });
+                    finish(write_result, outcome.reason)
+                }));
+                continue;
+            }
+            let mut writer = writer
+                .lock()
+                .map_err(|_| "native stdout lock unavailable".to_owned())?;
+            let outcome = serve_message(
+                caller_origin,
+                read,
+                &mut **writer,
+                log,
+                #[cfg(unix)]
+                config.as_ref().expect("native host config resolved"),
+            );
             last_reason = outcome.reason;
             if let Some(error) = outcome.error {
                 record_disconnect(log, outcome.reason, message_type, started);
                 return Err(error);
             }
-            continue;
-        }
-        #[cfg(unix)]
-        if config.is_none() {
-            let resolved = resolve_config
-                .take()
-                .expect("native host config resolver called once")();
-            match resolved {
-                Ok(value) => config = Some(value),
-                Err(error) => {
-                    let request_id = read
-                        .as_ref()
-                        .ok()
-                        .and_then(|(message, _)| message.get("request_id"));
-                    let outcome = refuse(writer, &error, request_id);
-                    last_reason = outcome.reason;
-                    if let Some(error) = outcome.error {
-                        record_disconnect(log, outcome.reason, message_type, started);
-                        return Err(error);
-                    }
-                    break;
-                }
+            if current_message_type == "stream" {
+                break;
             }
         }
-        let outcome = serve_message(
-            caller_origin,
-            read,
-            writer,
-            log,
-            #[cfg(unix)]
-            config.as_ref().expect("native host config resolved"),
-        );
-        last_reason = outcome.reason;
-        if let Some(error) = outcome.error {
-            record_disconnect(log, outcome.reason, message_type, started);
-            return Err(error);
+        for worker in workers {
+            let outcome = worker
+                .join()
+                .map_err(|_| "native-host worker panicked".to_owned())?;
+            last_reason = outcome.reason;
+            if let Some(error) = outcome.error {
+                record_disconnect(log, outcome.reason, message_type, started);
+                return Err(error);
+            }
         }
-        if current_message_type == "stream" {
-            break;
-        }
-    }
-    record_disconnect(log, last_reason, message_type, started);
-    Ok(ExitCode::SUCCESS)
+        record_disconnect(log, last_reason, message_type, started);
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
 fn serve_message<W: Write>(
@@ -1387,12 +1481,85 @@ mod tests {
             || Ok(config.clone()),
         );
         assert!(outcome.is_ok());
-        let responses = parse_frames(&writer);
+        let mut responses = parse_frames(&writer);
         assert_eq!(responses.len(), 2);
+        responses.sort_by(|left, right| {
+            left["request_id"]
+                .as_str()
+                .cmp(&right["request_id"].as_str())
+        });
         assert_eq!(responses[0]["request_id"], "native-1");
         assert_eq!(responses[1]["request_id"], "native-2");
         assert_eq!(responses[0]["transport"], "native");
         assert_eq!(responses[1]["transport"], "native");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_serves_fast_request_while_another_request_is_waiting() {
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let path = socket_path("concurrent-control");
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let (first_seen_tx, first_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            assert!(first.read(&mut request).unwrap() > 0);
+            first_seen_tx.send(()).unwrap();
+            let first_worker = thread::spawn(move || {
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                first
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+                    )
+                    .unwrap();
+            });
+            let (mut second, _) = listener.accept().unwrap();
+            assert!(second.read(&mut request).unwrap() > 0);
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfast")
+                .unwrap();
+            first_worker.join().unwrap();
+        });
+
+        let config = test_config(path, false);
+        let (mut input, mut host_input) = UnixStream::pair().unwrap();
+        let (mut output, mut host_output) = UnixStream::pair().unwrap();
+        output
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let host = thread::spawn(move || {
+            let origin = config.expected_origin.clone();
+            serve(&origin, &mut host_input, &mut host_output, None, || {
+                Ok(config)
+            })
+        });
+        input
+            .write_all(&frame(&json!({
+                "type": "request", "request_id": "slow", "path": "/push/state"
+            })))
+            .unwrap();
+        first_seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        input
+            .write_all(&frame(&json!({
+                "type": "request", "request_id": "fast", "path": "/extension/fleet"
+            })))
+            .unwrap();
+        let fast_before_release = read_native_message(&mut output);
+        release_tx.send(()).unwrap();
+        input.shutdown(Shutdown::Write).unwrap();
+        server.join().unwrap();
+        host.join().unwrap().unwrap();
+
+        let (response, _) =
+            fast_before_release.expect("fast response must not wait for slow request");
+        assert_eq!(response["request_id"], "fast");
+        assert_eq!(response["body"], "fast");
     }
 
     #[test]

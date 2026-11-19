@@ -37,6 +37,7 @@ const NATIVE_CONTROL_IDLE_MS = 30_000;
 let nativeControlPort = null;
 let nativeControlIdleTimer = null;
 let nativeControlSequence = 0;
+let nativeControlLegacyResponseSafe = true;
 const nativeControlPending = new Map();
 
 function clearNativeControlIdleTimer() {
@@ -76,15 +77,21 @@ function nativeControlPortForRequests() {
   if (nativeControlPort) return nativeControlPort;
   const port = chrome.runtime.connectNative(HERDR_NATIVE_HOST);
   nativeControlPort = port;
+  nativeControlLegacyResponseSafe = true;
   port.onMessage.addListener((response) => {
+    if (nativeControlPort !== port) return;
     if (!response || typeof response !== "object") {
       nativeControlDisconnected(port);
+      try { port.disconnect(); } catch (_) {}
       return;
     }
     const requestId = typeof response.request_id === "string" ? response.request_id : null;
-    const entry = requestId
-      ? nativeControlPending.get(requestId)
-      : nativeControlPending.values().next().value;
+    if (!requestId && (!nativeControlLegacyResponseSafe || nativeControlPending.size !== 1)) {
+      nativeControlDisconnected(port, "native-host-uncorrelated-response");
+      try { port.disconnect(); } catch (_) {}
+      return;
+    }
+    const entry = requestId ? nativeControlPending.get(requestId) : nativeControlPending.values().next().value;
     if (!entry) return;
     nativeControlPending.delete(entry.requestId);
     clearTimeout(entry.timer);
@@ -113,9 +120,15 @@ function nativePortMessage(message, timeoutMs = 30_000) {
   return new Promise((resolve) => {
     clearNativeControlIdleTimer();
     const timer = setTimeout(() => {
-      nativeControlDisconnected(port, "native-host-timeout");
-      try { port.disconnect(); } catch (_) {}
+      if (!nativeControlPending.delete(requestId)) return;
+      resolve({ ok: false, error: "native-host-timeout" });
+      nativeControlLegacyResponseSafe = false;
+      if (nativeControlPending.size === 0 && nativeControlPort === port) {
+        nativeControlDisconnected(port, "native-host-timeout");
+        try { port.disconnect(); } catch (_) {}
+      }
     }, boundedTimeout);
+    if (nativeControlPending.size > 0) nativeControlLegacyResponseSafe = false;
     nativeControlPending.set(requestId, { requestId, resolve, timer });
     try {
       port.postMessage({ ...message, request_id: requestId });
@@ -410,6 +423,9 @@ export function openLocalHerdrStream({ baseUrl, path = "/push/events", timeoutMs
 }
 
 export function resetLocalAuth() {
+  // Rebuilding the event stream must not cancel control requests that may
+  // already have reached the runtime. Close only an idle control port.
+  if (nativeControlPending.size > 0) return;
   clearNativeControlIdleTimer();
   const port = nativeControlPort;
   nativeControlPort = null;

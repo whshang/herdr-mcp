@@ -160,6 +160,125 @@ test("user keeps concurrent responses matched | Given two local requests share a
   }
 });
 
+test("user keeps other requests alive | Given two concurrent control requests | When one times out | Then the other can still receive its response", async () => {
+  const oldChrome = globalThis.chrome;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = new Map();
+  const messages = [];
+  let nextTimer = 0;
+  let listener;
+  let disconnects = 0;
+  globalThis.setTimeout = (fn, delay) => {
+    const id = ++nextTimer;
+    timers.set(id, { fn, delay });
+    return id;
+  };
+  globalThis.clearTimeout = (id) => timers.delete(id);
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      connectNative() {
+        return {
+          onMessage: { addListener(fn) { listener = fn; } },
+          onDisconnect: { addListener() {} },
+          postMessage(message) { messages.push(message); },
+          disconnect() { disconnects += 1; },
+        };
+      },
+    },
+  };
+  try {
+    const slow = localHerdrFetch("http://127.0.0.1:8772/slow", { nativeTimeoutMs: 12_000 });
+    const short = localHerdrFetch("http://127.0.0.1:8772/short", { nativeTimeoutMs: 4_000 });
+    const shortRejected = assert.rejects(short, /native-host-timeout/);
+    const shortTimer = [...timers.values()].find((timer) => timer.delay === 5_500);
+    assert.ok(shortTimer);
+    shortTimer.fn();
+    await shortRejected;
+    listener({
+      request_id: messages[1].request_id,
+      ok: true,
+      status: 200,
+      body: "late short response",
+    });
+    listener({
+      request_id: messages[0].request_id,
+      ok: true,
+      status: 200,
+      body: "slow completed",
+    });
+    assert.equal(await (await slow).text(), "slow completed");
+    assert.equal(disconnects, 0);
+  } finally {
+    resetLocalAuth();
+    globalThis.chrome = oldChrome;
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  }
+});
+
+test("user keeps a submitted request | Given a POST is in flight | When local auth is reset | Then its original response remains available", async () => {
+  const oldChrome = globalThis.chrome;
+  let listener;
+  let posted;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      connectNative() {
+        return {
+          onMessage: { addListener(fn) { listener = fn; } },
+          onDisconnect: { addListener() {} },
+          postMessage(message) { posted = message; },
+          disconnect() {},
+        };
+      },
+    },
+  };
+  try {
+    const pending = localHerdrFetch("http://127.0.0.1:8772/action", { method: "POST", body: "{}" });
+    resetLocalAuth();
+    listener({ request_id: posted.request_id, ok: true, status: 200, body: "applied" });
+    assert.equal(await (await pending).text(), "applied");
+  } finally {
+    resetLocalAuth();
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("user avoids mismatched replies | Given concurrent requests and a legacy host | When a reply has no request id | Then both requests fail closed", async () => {
+  const oldChrome = globalThis.chrome;
+  let listener;
+  let disconnected = false;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      connectNative() {
+        return {
+          onMessage: { addListener(fn) { listener = fn; } },
+          onDisconnect: { addListener() {} },
+          postMessage() {},
+          disconnect() { disconnected = true; },
+        };
+      },
+    },
+  };
+  try {
+    const first = localHerdrFetch("http://127.0.0.1:8772/one");
+    const second = localHerdrFetch("http://127.0.0.1:8772/two");
+    const rejected = Promise.all([
+      assert.rejects(first, /native-host-uncorrelated-response/),
+      assert.rejects(second, /native-host-uncorrelated-response/),
+    ]);
+    listener({ ok: true, status: 200, body: "unknown request" });
+    await rejected;
+    assert.equal(disconnected, true);
+  } finally {
+    resetLocalAuth();
+    globalThis.chrome = oldChrome;
+  }
+});
+
 test("user recovers after control disconnect | Given an in-flight local request | When the port disconnects | Then the request settles and the next call reconnects", async () => {
   const oldChrome = globalThis.chrome;
   const ports = [];
