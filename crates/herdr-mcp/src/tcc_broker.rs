@@ -1941,7 +1941,7 @@ const STREAM_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Structural fingerprint of the routing snapshot. Hashing the JSON tree
 /// avoids serializing the whole topology per call; a different fingerprint
 /// means the next frame must carry the snapshot again.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn topology_fingerprint(value: &Value) -> u64 {
     use std::hash::{Hash, Hasher};
     fn hash_value(value: &Value, state: &mut std::collections::hash_map::DefaultHasher) {
