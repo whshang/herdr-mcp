@@ -87,6 +87,14 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
             message,
         );
     }
+    // `edit` writes through `atomic_write` directly, not `write_bytes`. A
+    // successful replace still dirties the managed repository, so the next
+    // inspect must not reuse the pre-edit git-status cache.
+    // Use the caller-facing path. `target.real` is canonicalized and can miss
+    // a cache key that still uses the snapshot root (for example `/var` versus
+    // `/private/var` on macOS).
+    projects::invalidate_git_status_cache_for_path(&target.resolved);
+    projects::invalidate_git_status_cache_for_path(&target.real);
     success_with_working(
         json!({
             "ok": true,
@@ -415,6 +423,32 @@ mod tests {
         let project = &refreshed.projects[&root];
         assert!(project.dirty);
         assert_eq!(project.changed_files, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_invalidates_cache_and_next_inspect_observes_git_status() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let file = root.join("tracked.txt");
+
+        projects::invalidate_git_status_cache(&root);
+        let clean = projects::derive(&snap);
+        assert!(!clean.projects[&root].dirty);
+
+        let edited = edit(
+            &snap,
+            &json!({"path": file, "old_string": "before", "new_string": "after"}),
+        );
+        assert_eq!(edited["ok"], true, "{edited}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
+
+        // No manual invalidate: the successful edit must drop the cached
+        // status for the repository that contains the edited file.
+        let refreshed = projects::derive(&snap);
+        let project = &refreshed.projects[&root];
+        assert!(project.dirty, "{project:?}");
+        assert!(project.changed_files >= 1, "{project:?}");
         fs::remove_dir_all(root).unwrap();
     }
 }
