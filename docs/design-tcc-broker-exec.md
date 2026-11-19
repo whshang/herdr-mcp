@@ -219,9 +219,9 @@ mcp herdr_exec {workspace, project_root, command:"printf ok", timeout_ms:30000, 
 
 ### 6.2 Raw samples
 
-**Collection environment and time.** Samples were taken on two macOS
-workstations (TCC-protected vs. home root) with the `herdr-mcp` runtime built
-from the 1.2 line and the pinned Herdr TUI `0.9.5`; each row is 10 consecutive
+**Collection environment and time.** Samples were collected on 2026-11-18 on
+two macOS workstations (TCC-protected vs. home root) with the `herdr-mcp`
+runtime at `v1.2.0` and the pinned Herdr TUI `0.9.5`; each row is 10 consecutive
 runs of the same command after one warmup. Re-measure before treating these
 numbers as a current baseline — runtime and Herdr versions both affect the
 utility-pane overhead, and this table is evidence for the design trade-off, not
@@ -286,7 +286,8 @@ per-command latency, which is Edge-dominated anyway.
 
 **Implementation precondition.** This contract is a proposal. Before any code
 lands, the acceptance side must be reconciled with the existing
-`runtime_owner_token` rotation semantics (§9): the broker verifies the token
+`runtime_owner_token` rotation semantics (the “`runtime_owner_token` rotation”
+item in §9): the broker verifies the token
 against the runtime owner record on every request, so v1 has to state what
 happens when the token rotates mid-connection (rejected request must fail
 closed, never fall back to a weaker check) and how a broker restart picks up the
@@ -343,5 +344,16 @@ Error codes mirror the runtime's: `outside_managed_roots`, `program_not_allowed`
   is a runtime concept.)
 - Pane-occupancy vs broker-process cost under concurrent `herdr_exec` (10+
   parallel calls) — needs the real workload measurement once implemented.
+- **`runtime_owner_token` rotation (§7 precondition).** Two sub-decisions are
+  still open and must be written down before tier-1 exec mediation lands:
+  1. *Mid-connection rotation* — when the runtime writes a new owner token while
+     a broker request is in flight, the request either fails closed as
+     `owner_token_mismatch` (no weaker fallback, no retry on the old token) or
+     the broker re-reads the owner record and accepts the new token. Leaning
+     fail-closed: a request admitted under an older token must not silently
+     continue under a newer authority.
+  2. *Broker restart* — a restart must load the current owner record only; a
+     stale token cached from before the restart may never authorize a request.
+  The §7 precondition refers to this item; nothing here is implemented yet.
 - Windows/Linux parity: broker is macOS-only; the `backend` contract must
   degrade identically on other OSes (they already take `native`).

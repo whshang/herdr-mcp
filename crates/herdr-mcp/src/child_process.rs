@@ -1117,15 +1117,33 @@ mod poll_tests {
         assert_eq!(clock.now(), started + Duration::from_millis(5));
     }
 
-    /// user never gets a dead child registered | Given a child that exits right
-    /// at the registration grace boundary | When the waiter re-checks liveness
-    /// before writing the orphan registry | Then nothing is registered and the
-    /// exit status is returned (#1050 review).
+    /// user never gets a dead child registered | Given a child whose exit is
+    /// only visible on the poll that runs after the registration grace window |
+    /// When the waiter re-checks liveness before writing the orphan registry |
+    /// Then nothing is registered and the exit status is returned (#1050 review).
     #[test]
     fn child_exiting_at_the_grace_boundary_is_not_registered() {
+        // The exit has to land *after* the last poll inside `poll_until` and on
+        // the pre-register check, otherwise this only re-tests the grace loop.
+        // Discover the loop's poll count instead of hardcoding it, so a backoff
+        // change keeps the test pointed at the same window.
+        let grace_polls = {
+            let probe = FakeClock::new();
+            let started = probe.now();
+            let mut backoff = PollBackoff::default();
+            let mut polls = 0_u32;
+            poll_until(&probe, started + REGISTRATION_GRACE, &mut backoff, || {
+                polls += 1;
+                Ok(None::<u8>)
+            })
+            .expect("probe poll");
+            polls
+        };
+        assert!(grace_polls > 0, "the grace window must poll at least once");
+
         let clock = FakeClock::new();
         let started = clock.now();
-        let grace_deadline = started + REGISTRATION_GRACE;
+        let mut polls = 0_u32;
         let mut registrations = 0_u32;
         let (status, registration) = wait_with_deferred_registration(
             &clock,
@@ -1134,20 +1152,25 @@ mod poll_tests {
             Duration::from_secs(5),
             REGISTRATION_GRACE,
             |_| {
-                if clock.now() < grace_deadline {
-                    Ok(None::<u8>)
-                } else {
-                    // The child finished exactly as the grace window closed.
+                polls += 1;
+                if polls > grace_polls {
                     Ok(Some(7_u8))
+                } else {
+                    Ok(None)
                 }
             },
             |_| registrations += 1,
         )
         .expect("wait result");
+        assert_eq!(
+            polls,
+            grace_polls + 1,
+            "the exit must be observed by the pre-register liveness poll"
+        );
         assert_eq!(status, Some(7));
         assert!(
             registration.is_none(),
-            "a finished child must not be registered"
+            "a child that exited before registration must not be recorded"
         );
         assert_eq!(registrations, 0);
     }
