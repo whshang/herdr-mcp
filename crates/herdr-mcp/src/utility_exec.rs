@@ -3934,9 +3934,10 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    /// user dispatcher | Given a managed git workspace inspected before a
-    /// write | When run_durable modifies a file inside the 250ms cache TTL |
-    /// Then the next projects::derive sees the fresh dirty status end to end.
+    /// user dispatcher | Given a managed git workspace re-inspected while a
+    /// gated write is already running | When run_durable completes inside the
+    /// 250ms TTL | Then projects::derive probes fresh dirty evidence end to
+    /// end — proving the completion-phase invalidation, not the startup one.
     #[cfg(unix)]
     #[test]
     fn run_durable_write_invalidates_cached_git_status_for_next_derive() {
@@ -3972,37 +3973,113 @@ mod tests {
                 .success()
         );
         let snapshot = native_test_snapshot(&root);
+        let registry = Arc::new(ExecRegistry::new(base.join("state")).unwrap());
 
-        // Seed the 250ms TTL cache with the clean status so a missed
-        // invalidation would hand the next derive stale evidence.
+        // File barrier: the child creates `ready` then spin-waits for `gate`
+        // before writing. The test re-warms the clean cache only after the
+        // child has started — past run_durable's startup invalidation — so
+        // the post-write derive can only observe dirty evidence if the
+        // completion-phase invalidate_git_status_cache runs (P2-1, review
+        // 7005105245). Without the barrier the startup invalidation alone
+        // makes this assertion vacuously pass.
+        let ready = base.join("child-ready");
+        let gate = base.join("release-write");
+        let marker = root.join("written-by-exec.txt");
+        let command = format!(
+            "touch {ready}; i=0; while [ ! -f {gate} ] && [ $i -lt 2000 ]; do i=$((i+1)); sleep 0.01; done; printf dirty > {marker}",
+            ready = ready.to_string_lossy(),
+            gate = gate.to_string_lossy(),
+            marker = marker.to_string_lossy(),
+        );
+        let runner = {
+            let registry = Arc::clone(&registry);
+            let snapshot = snapshot.clone();
+            thread::spawn(move || {
+                run_durable(
+                    &HerdrClient::new("/tmp/definitely-missing-herdr.sock"),
+                    &snapshot,
+                    &registry,
+                    &test_store(),
+                    &json!({"workspace": "w1", "command": command}),
+                )
+            })
+        };
+
+        // Wait for the child to publish `ready` — the startup invalidation is
+        // already behind us — then prime the clean cache and prove it serves.
+        let wait_deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < wait_deadline,
+                "child never published the ready marker"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         crate::projects::invalidate_git_status_cache(&root);
+        crate::projects::reset_git_status_probe_count(&root);
         let clean = crate::projects::derive(&snapshot);
         assert!(!clean.projects[&root].dirty, "precondition: repo is clean");
-
-        let client = HerdrClient::new(base.join("missing-herdr.sock"));
-        let registry = ExecRegistry::new(base.join("state")).unwrap();
-        let marker = root.join("written-by-exec.txt");
-        let result = run_durable(
-            &client,
-            &snapshot,
-            &registry,
-            &test_store(),
-            &json!({
-                "workspace": "w1",
-                "command": format!("printf dirty > {}", marker.to_string_lossy()),
-            }),
+        assert_eq!(
+            crate::projects::git_status_probe_count(&root),
+            1,
+            "the mid-flight inspect must probe once"
         );
+        let cached = crate::projects::derive(&snapshot);
+        assert!(!cached.projects[&root].dirty);
+        assert_eq!(
+            crate::projects::git_status_probe_count(&root),
+            1,
+            "the second mid-flight inspect must hit the live cache"
+        );
+
+        // Release the child's write, wait for run_durable to return, then a
+        // derive inside the TTL must see fresh evidence via a new probe.
+        fs::write(&gate, b"go").unwrap();
+        let result = runner.join().unwrap();
         assert_eq!(result["ok"], true, "unexpected result: {result}");
         assert!(marker.exists());
 
-        // No TTL wait and no manual invalidate: run_durable's post-write
-        // invalidation must make the fresh git status visible at once.
         let refreshed = crate::projects::derive(&snapshot);
         let project = &refreshed.projects[&root];
         assert!(project.dirty, "{project:?}");
         assert!(project.changed_files >= 1, "{project:?}");
+        assert_eq!(
+            crate::projects::git_status_probe_count(&root),
+            2,
+            "completion must force a new probe, not reuse the mid-flight cache"
+        );
 
+        // Bounded drain: poll the registry until every session reports
+        // terminal (running == false), then assert the fixture directory
+        // really removes. No fixed sleep, no swallowed cleanup error (P2-2,
+        // review 7005105245).
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending = registry
+                .list_views()
+                .into_iter()
+                .filter(|view| view.get("running").and_then(Value::as_bool).unwrap_or(true))
+                .count();
+            if pending == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < drain_deadline,
+                "exec sessions did not settle within the drain deadline"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         drop(registry);
-        let _ = fs::remove_dir_all(base);
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::remove_dir_all(&base) {
+                Ok(()) => break,
+                Err(error) if Instant::now() < cleanup_deadline => {
+                    let _ = error;
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("test fixture cleanup failed: {error}"),
+            }
+        }
     }
 }
