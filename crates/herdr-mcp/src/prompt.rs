@@ -564,9 +564,9 @@ struct PromptRegistryInner {
     /// without decoding any history rows. Every `save_task` /
     /// `persist_task_with_supersede` write mutates it, and each full scan
     /// rebuilds it, so a stale miss self-heals on the next write or scan.
-    /// `task_activity_writes` (below) is the optimistic guard keeping a
-    /// refresh rebuilt from a pre-write snapshot from clobbering a
-    /// concurrent insert.
+    /// The first hydration includes every active row and pending terminal
+    /// notification, not only the recent task window. `task_activity_writes`
+    /// (below) prevents that snapshot from clobbering a concurrent insert.
     task_activity_index: Mutex<Option<HashSet<String>>>,
     /// Monotonic counter bumped on every task-row persist; the index refresh
     /// uses it as a happens-before guard against interleaved writes.
@@ -2292,22 +2292,59 @@ impl PromptRegistry {
     /// cursor event costs one `list_tasks(512)` decode instead of two. When
     /// the activity index is hydrated and empty there is nothing that could
     /// need attention, so both passes are skipped without touching the store.
-    /// A row written between the scan and a pass is still folded into the
-    /// index by its own `note_task_persisted`, and the next reconcile
-    /// re-scans.
+    /// The initial hydration also checks the unbounded active and pending
+    /// terminal phases, so a long-lived task cannot be evicted by newer
+    /// terminal history. A row written between the scan and a pass is still
+    /// folded into the index by its own `note_task_persisted`.
     fn reconcile_active_tasks(&self) {
         if self.task_activity_index_idle() {
             return;
         }
-        let Ok(tasks) = self.list_tasks(512) else {
+        let hydrate_full_index = self.task_activity_index_unhydrated();
+        let writes_before = self.inner.task_activity_writes.load(Ordering::SeqCst);
+        let Ok(recent_tasks) = self.list_tasks(512) else {
             return;
         };
-        self.refresh_task_activity_index(&tasks);
-        self.repair_supersession_gaps_in(&tasks);
-        for task in &tasks {
+        let mut tracker_tasks = recent_tasks.clone();
+        if hydrate_full_index {
+            let Ok(active_tasks) = self.list_active_tasks() else {
+                return;
+            };
+            let Ok(pending_terminal_tasks) = self.list_terminal_tasks() else {
+                return;
+            };
+            tracker_tasks.extend(active_tasks);
+            tracker_tasks.extend(
+                pending_terminal_tasks
+                    .into_iter()
+                    .filter(|task| task.notification_state == "pending"),
+            );
+        }
+        self.refresh_task_activity_index(&tracker_tasks, writes_before);
+        self.repair_supersession_gaps_in(&recent_tasks);
+        let mut seen = HashSet::with_capacity(tracker_tasks.len());
+        for task in tracker_tasks {
+            if !seen.insert(task.task_id.clone()) {
+                continue;
+            }
             if task.is_terminal() {
                 if task.notification_state == "pending" {
-                    self.maybe_notify_parent(task);
+                    self.maybe_notify_parent(&task);
+                }
+            } else {
+                let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+        for task_id in self.task_activity_index_task_ids() {
+            if !seen.insert(task_id.clone()) {
+                continue;
+            }
+            let Ok(Some(task)) = self.load_task(&task_id) else {
+                continue;
+            };
+            if task.is_terminal() {
+                if task.notification_state == "pending" {
+                    self.maybe_notify_parent(&task);
                 }
             } else {
                 let _ = self.reconcile_task(&task.task_id);
@@ -2319,7 +2356,7 @@ impl PromptRegistry {
         if self.task_activity_index_idle() {
             return;
         }
-        let Ok(tasks) = self.list_tasks(512) else {
+        let Ok(tasks) = self.list_active_tasks() else {
             return;
         };
         for task in tasks {
@@ -3137,39 +3174,62 @@ impl PromptRegistry {
     /// represent the whole ledger, so it keeps falling back to full scans
     /// until `reconcile_active_tasks` rebuilds it.
     fn note_task_persisted(&self, task: &PromptTaskRecord) {
-        self.inner
-            .task_activity_writes
-            .fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut index) = self.inner.task_activity_index.lock()
-            && let Some(set) = index.as_mut()
-        {
-            if Self::task_needs_tracker_attention(task) {
-                set.insert(task.task_id.clone());
-            } else {
-                set.remove(&task.task_id);
+        if let Ok(mut index) = self.inner.task_activity_index.lock() {
+            self.inner
+                .task_activity_writes
+                .fetch_add(1, Ordering::SeqCst);
+            if let Some(set) = index.as_mut() {
+                if Self::task_needs_tracker_attention(task) {
+                    set.insert(task.task_id.clone());
+                } else {
+                    set.remove(&task.task_id);
+                }
             }
+        } else {
+            self.inner
+                .task_activity_writes
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    /// Rebuild the index from one authoritative scan. The write counter is
-    /// sampled before and after: any task row committed mid-scan is folded in
-    /// by its own `note_task_persisted`, so a snapshot taken just before that
-    /// write must not be published over it.
-    fn refresh_task_activity_index(&self, tasks: &[PromptTaskRecord]) {
-        let Ok(mut index) = self.inner.task_activity_index.lock() else {
-            return;
-        };
-        let writes_before = self.inner.task_activity_writes.load(Ordering::SeqCst);
+    /// Rebuild the index from the first authoritative scan. Later writes are
+    /// folded incrementally by `note_task_persisted`, so replacing a hydrated
+    /// index with a recent-window snapshot would evict older active tasks.
+    fn refresh_task_activity_index(&self, tasks: &[PromptTaskRecord], writes_before: u64) {
         let mut set = HashSet::with_capacity(tasks.len());
         for task in tasks {
             if Self::task_needs_tracker_attention(task) {
                 set.insert(task.task_id.clone());
             }
         }
+        let Ok(mut index) = self.inner.task_activity_index.lock() else {
+            return;
+        };
+        if index.is_some() {
+            return;
+        }
         if self.inner.task_activity_writes.load(Ordering::SeqCst) != writes_before {
             return;
         }
         *index = Some(set);
+    }
+
+    fn task_activity_index_unhydrated(&self) -> bool {
+        self.inner
+            .task_activity_index
+            .lock()
+            .ok()
+            .is_some_and(|index| index.is_none())
+    }
+
+    fn task_activity_index_task_ids(&self) -> Vec<String> {
+        self.inner
+            .task_activity_index
+            .lock()
+            .ok()
+            .and_then(|index| index.clone())
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// Cheap pre-scan gate: only a hydrated, empty index proves no tracker
@@ -13878,6 +13938,26 @@ mod tests {
         }
     }
 
+    fn activity_test_registry(store: Arc<Mutex<StateStore>>) -> PromptRegistry {
+        PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
+                #[cfg(test)]
+                clock: None,
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: None,
+                client: None,
+            }),
+        }
+    }
+
     /// user owner | Given a running child whose pane reports done | When the
     /// terminal transition is reconciled | Then exactly one bounded native
     /// read is captured with ANSI stripped and trailing blanks trimmed.
@@ -17580,6 +17660,92 @@ mod tests {
             reconciled.lifecycle,
             PromptTaskLifecycle::DeliveryUncertain,
             "re-armed index must scan and fail the boot-fence closed"
+        );
+    }
+
+    #[test]
+    fn activity_index_refresh_rejects_a_write_after_snapshot() {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = activity_test_registry(store);
+        let writes_before = registry.inner.task_activity_writes.load(Ordering::SeqCst);
+
+        let task = excerpt_test_task("dispatch:prompt:index-write-race");
+        registry.save_task(&task, None).unwrap();
+        registry.refresh_task_activity_index(&[], writes_before);
+
+        assert!(
+            !registry.task_activity_index_idle(),
+            "a snapshot taken before a persist must not publish an empty index"
+        );
+        registry.reconcile_active_tasks();
+        assert!(!registry.task_activity_index_idle());
+    }
+
+    #[test]
+    fn initial_activity_index_includes_old_active_tasks() {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut old_active = excerpt_test_task("dispatch:prompt:old-active");
+        old_active.stall_after_ms = Some(1);
+        old_active.created_at_ms = 1;
+        old_active.updated_at_ms = 1;
+
+        let mut tasks = vec![old_active];
+        for index in 0..513 {
+            let mut terminal = excerpt_test_task(&format!("dispatch:prompt:terminal-{index}"));
+            terminal.lifecycle = PromptTaskLifecycle::Completed;
+            terminal.terminal_status = Some("done".to_owned());
+            terminal.terminal_at_ms = Some(10_000 + index);
+            terminal.notification_state = "delivered".to_owned();
+            terminal.created_at_ms = 10_000 + index;
+            terminal.updated_at_ms = 10_000 + index;
+            tasks.push(terminal);
+        }
+        let encoded = tasks
+            .iter()
+            .map(|task| serde_json::to_string(task).unwrap())
+            .collect::<Vec<_>>();
+        let inputs = tasks
+            .iter()
+            .zip(encoded.iter())
+            .map(|(task, result_json)| OperationLedgerInput {
+                op_id: &task.task_id,
+                kind: PROMPT_TASK_OPERATION_KIND,
+                idempotency_key: None,
+                request_hash: None,
+                phase: if task.is_terminal() {
+                    "terminal"
+                } else {
+                    "active"
+                },
+                state: task.lifecycle.as_str(),
+                result_json,
+                now_ms: i64::try_from(task.updated_at_ms).unwrap_or(i64::MAX),
+                expires_at: None,
+            })
+            .collect::<Vec<_>>();
+        store
+            .lock()
+            .unwrap()
+            .put_operation_ledgers_atomic(&inputs)
+            .unwrap();
+
+        let registry = PromptRegistry::with_store_only(Arc::clone(&store));
+        assert!(
+            !registry.task_activity_index_idle(),
+            "an active task outside the recent terminal window must keep tracking armed"
+        );
+        registry.sweep_task_budgets();
+
+        let stored = registry
+            .load_task("dispatch:prompt:old-active")
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .budget_events
+                .iter()
+                .any(|event| event.get("event").and_then(Value::as_str) == Some("agent_stalled")),
+            "the old active task must still receive its stall event"
         );
     }
 }
