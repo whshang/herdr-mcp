@@ -427,6 +427,8 @@ impl CacheState {
             "title",
             "display_agent",
             "state_change_seq",
+            "dispatch_id",
+            "turn_id",
         ] {
             if let Some(value) = input.data.get(key) {
                 digest.insert(key.to_owned(), value.clone());
@@ -782,6 +784,14 @@ impl EventCache {
             }),
             worker: None,
             boot_id: new_boot_id(),
+        }
+    }
+
+    /// Test seam: append one event to the digest the prompt reconciler reads.
+    #[cfg(test)]
+    pub fn inject_event_for_test(&self, event: Value) {
+        if let Ok(mut state) = self.shared.state.write() {
+            state.apply_event(event, "test".to_owned());
         }
     }
 
