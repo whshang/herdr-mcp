@@ -241,6 +241,16 @@ fn exec_wait_poll_delay(attempt: usize) -> Duration {
 }
 
 pub fn wait(registry: &ExecRegistry, args: &Value) -> Value {
+    wait_with_sleep(registry, args, thread::sleep)
+}
+
+/// `wait` with the sleep primitive injectable so tests can observe the
+/// requested backoff cadence without paying real sleeps.
+fn wait_with_sleep(
+    registry: &ExecRegistry,
+    args: &Value,
+    mut sleep: impl FnMut(Duration),
+) -> Value {
     let id = match required_str(args, "session_id") {
         Ok(value) => value,
         Err(error) => return error,
@@ -276,7 +286,7 @@ pub fn wait(registry: &ExecRegistry, args: &Value) -> Value {
             annotate_wait(&mut view, elapsed, true);
             return view;
         }
-        thread::sleep(exec_wait_poll_delay(attempt).min(timeout - elapsed));
+        sleep(exec_wait_poll_delay(attempt).min(timeout - elapsed));
         attempt = attempt.saturating_add(1);
     }
 }
@@ -506,7 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn exec_wait_catches_short_session_well_before_200ms() {
+    fn exec_wait_requests_the_backoff_ladder_until_ready() {
+        use std::time::Duration;
         let registry = registry("wait-backoff");
         let started = start(
             &HerdrClient::new(PathBuf::from("/nonexistent-herdr.sock")),
@@ -517,17 +528,38 @@ mod tests {
         assert_eq!(started["ok"], true, "{started}");
         let session_id = started["session_id"].as_str().unwrap().to_owned();
 
-        let view = wait(
+        let mut requested = Vec::new();
+        let view = super::wait_with_sleep(
             &registry,
             &json!({"session_id": session_id, "timeout_ms": 10_000}),
+            |delay| {
+                requested.push(delay);
+                // Real 1ms sleeps let the session progress while keeping the
+                // recorded sequence deterministic.
+                std::thread::sleep(Duration::from_millis(1));
+            },
         );
         assert_eq!(view["ok"], true, "{view}");
         assert_eq!(view["wait_timed_out"], false);
-        // With the fixed 200ms poll this session would always pay ~200ms of
-        // dead time; the backoff ladder must land it well under that bound.
         assert!(
-            view["waited_ms"].as_u64().unwrap() < 190,
-            "wait should catch the short session early: {view}"
+            !requested.is_empty(),
+            "a ~50ms session must take at least one poll: {view}"
+        );
+        let ramp: Vec<Duration> = [10, 20, 50, 100]
+            .iter()
+            .map(|ms| Duration::from_millis(*ms))
+            .collect();
+        let prefix_len = requested.len().min(ramp.len());
+        assert_eq!(
+            requested[..prefix_len],
+            ramp[..prefix_len],
+            "requested delays must follow the ramp: {requested:?}"
+        );
+        assert!(
+            requested[4.min(requested.len())..]
+                .iter()
+                .all(|delay| *delay == Duration::from_millis(200)),
+            "delays past the ramp must stay capped at 200ms: {requested:?}"
         );
     }
 
