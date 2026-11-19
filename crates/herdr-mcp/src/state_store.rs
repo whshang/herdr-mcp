@@ -14,10 +14,6 @@
 //! durable operations ledger; exec-session and continuity consumers remain
 //! incremental follow-ups.
 
-// Some foundation APIs are intentionally ahead of their consumers. Keep them
-// available while Reliability Kernel features migrate onto this shared store.
-#![allow(dead_code)]
-
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -532,6 +528,7 @@ pub struct BrowserEndpointRegistrationInput<'a> {
 pub struct BrowserEndpointConsentInput<'a> {
     pub endpoint_ref: &'a str,
     pub expected_revision: i64,
+    #[allow(dead_code)] // consent input kept for API symmetry with tool-bridge flags
     pub webchat_control_allowed: bool,
     pub tool_bridge_allowed: bool,
     pub tool_bridge_mutation_allowed: bool,
@@ -945,6 +942,7 @@ impl StateStore {
     /// Dedupe/status lookup for a `client_request_id` inside one caller
     /// scope; expired entries are dropped first so a resubmission past the
     /// TTL is a fresh request.
+    #[allow(dead_code)] // #332
     pub fn request_ledger_lookup(
         &mut self,
         client_request_id: &str,
@@ -957,6 +955,7 @@ impl StateStore {
 
     /// Reserve a pending record for one `client_request_id`; returns the
     /// request id used (wire correlation id when one was supplied).
+    #[allow(dead_code)] // #332
     pub fn request_ledger_begin(
         &mut self,
         client_request_id: &str,
@@ -1032,6 +1031,7 @@ impl StateStore {
     /// Run `body` inside a single transaction. On `Ok` the transaction commits;
     /// on `Err` it rolls back and the error is returned. Use for the future
     /// browser-binding cutover and operation-ledger updates that must be atomic.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn transaction<T>(
         &mut self,
         body: impl FnOnce(&mut Tx) -> Result<T, String>,
@@ -1055,6 +1055,7 @@ impl StateStore {
     }
 
     /// Execute a batch of SQL (used by tests and future migrations).
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn execute_batch(&self, sql: &str) -> Result<(), String> {
         self.conn
             .execute_batch(sql)
@@ -1062,6 +1063,7 @@ impl StateStore {
     }
 
     /// Execute a single SQL statement with no parameters.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn execute(&self, sql: &str) -> Result<usize, String> {
         self.conn
             .execute(sql, [])
@@ -1069,6 +1071,8 @@ impl StateStore {
     }
 
     /// Query the first column of the first row as i64, if present.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn scalar_i64(&self, sql: &str) -> Result<Option<i64>, String> {
         let mut stmt = self
             .conn
@@ -1111,6 +1115,7 @@ impl StateStore {
     }
 
     /// List all table names in the schema.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn table_names(&self) -> Result<Vec<String>, String> {
         list_names(
             &self.conn,
@@ -1119,6 +1124,7 @@ impl StateStore {
     }
 
     /// List all index names in the schema.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn index_names(&self) -> Result<Vec<String>, String> {
         list_names(
             &self.conn,
@@ -1127,18 +1133,21 @@ impl StateStore {
     }
 
     /// Current journal mode as reported by SQLite (`wal`, `memory`, ...).
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn journal_mode(&self) -> Result<String, String> {
         self.scalar_text("PRAGMA journal_mode")
             .map(|value| value.unwrap_or_else(|| "unknown".to_owned()))
     }
 
     /// Current `foreign_keys` pragma value (1 when on).
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn foreign_keys(&self) -> Result<i64, String> {
         self.scalar_i64("PRAGMA foreign_keys")
             .map(|value| value.unwrap_or(0))
     }
 
     /// Current `busy_timeout` pragma in milliseconds.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn busy_timeout(&self) -> Result<i64, String> {
         self.scalar_i64("PRAGMA busy_timeout")
             .map(|value| value.unwrap_or(0))
@@ -1159,17 +1168,6 @@ impl StateStore {
     /// Path of the open database file, if any (None for in-memory).
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
-    }
-
-    /// Basic diagnostics: path, version, journal mode, foreign_keys, timeout.
-    pub fn diagnostics(&self) -> Result<StateStoreDiagnostics, String> {
-        Ok(StateStoreDiagnostics {
-            path: self.path().map(|p| p.display().to_string()),
-            schema_version: self.schema_version()?,
-            journal_mode: self.journal_mode()?,
-            foreign_keys: self.foreign_keys()?,
-            busy_timeout_ms: self.busy_timeout()?,
-        })
     }
 
     /// Atomically reserve `(kind, idempotency_key)` for one mutation request.
@@ -3604,6 +3602,7 @@ impl StateStore {
     /// durable linkage so `browser_dispatch.status` can project settlement
     /// without a second result database. Replays are idempotent; a different
     /// assistant-message ref for an already-settled dispatch fails closed.
+    #[allow(dead_code)] // consumer lands with the browser-adapter platform (#775)
     pub fn settle_browser_dispatch_result(
         &mut self,
         input: BrowserDispatchResultInput<'_>,
@@ -4143,6 +4142,7 @@ impl StateStore {
         }))
     }
 
+    #[allow(dead_code)] // consumer lands with the browser-adapter platform (#775)
     pub fn work_memory_search(
         &self,
         project_ref: &str,
@@ -5232,6 +5232,7 @@ impl StateStore {
     /// continuity keep their provider-identity rows. The statement is idempotent:
     /// running it again removes nothing and every canonical-URL lookup answer is
     /// unchanged.
+    #[allow(dead_code)] // consumer lands with the browser-adapter platform (#775)
     pub fn retire_stale_browser_session_locators(&mut self) -> Result<usize, String> {
         retire_stale_browser_session_locators_in(&self.conn)
     }
@@ -5241,6 +5242,7 @@ impl StateStore {
     /// never stored. A key already bound to another browser session is a
     /// conflict, so late or ambiguous observations cannot silently retarget a
     /// future mutation.
+    #[allow(dead_code)] // consumer lands with the browser-adapter platform (#775)
     pub fn bind_browser_caller_session(
         &mut self,
         principal_ref: &str,
@@ -8995,16 +8997,6 @@ fn bounded_continuity_excerpt(text: &str) -> String {
     }
 }
 
-/// Human/ops-facing summary of an open store.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateStoreDiagnostics {
-    pub path: Option<String>,
-    pub schema_version: i64,
-    pub journal_mode: String,
-    pub foreign_keys: i64,
-    pub busy_timeout_ms: i64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecSessionFence {
     pub session_id: String,
@@ -9024,6 +9016,7 @@ pub struct ClosedExecSessionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
 pub struct RuntimeGenerationRecord {
     pub generation_id: String,
     pub runtime_path: String,
@@ -9328,6 +9321,7 @@ impl StateStore {
         Ok(result)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn stage_runtime_generation(
         &self,
         generation_id: &str,
@@ -9353,6 +9347,7 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS production path; exercised by state-store/updater tests
     pub fn activate_runtime_generation(
         &mut self,
         generation_id: &str,
@@ -9361,6 +9356,7 @@ impl StateStore {
         self.activate_runtime_generation_with_rollback(generation_id, None, now_ms)
     }
 
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS production path; exercised by state-store/updater tests
     pub fn activate_runtime_generation_with_rollback(
         &mut self,
         generation_id: &str,
@@ -9370,6 +9366,7 @@ impl StateStore {
         self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, None)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn activate_runtime_generation_with_transition(
         &mut self,
         generation_id: &str,
@@ -9386,6 +9383,7 @@ impl StateStore {
         self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, Some(transition))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     fn activate_runtime_generation_inner(
         &mut self,
         generation_id: &str,
@@ -9499,6 +9497,7 @@ impl StateStore {
         Ok(Some(transition))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn active_runtime_generation(&self) -> Result<Option<RuntimeGenerationRecord>, String> {
         self.conn
             .query_row(
@@ -9523,6 +9522,7 @@ impl StateStore {
             .map_err(|error| format!("cannot read active runtime generation: {error}"))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service path
     pub fn record_service_event(
         &self,
         action: &str,
@@ -9548,6 +9548,7 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
     pub fn record_generation_transition(
         &self,
         transition: &GenerationTransitionRecord,
@@ -9571,6 +9572,7 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn prepare_service_rollback(&self, record: &ServiceRollbackRecord) -> Result<(), String> {
         self.conn
             .execute(
@@ -9596,6 +9598,7 @@ impl StateStore {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // updater/state-store tests
     pub fn mark_service_rollback_ready(&mut self, rollback_id: &str) -> Result<(), String> {
         let tx = self
             .conn
@@ -9623,6 +9626,7 @@ impl StateStore {
             .map_err(|error| format!("cannot commit rollback-ready transition: {error}"))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
     pub fn mark_prepared_service_rollback(
         &self,
         rollback_id: &str,
@@ -9647,6 +9651,7 @@ impl StateStore {
         }
     }
 
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS production path; exercised by state-store/updater tests
     pub fn begin_latest_service_rollback(
         &mut self,
     ) -> Result<Option<ServiceRollbackRecord>, String> {
@@ -9656,6 +9661,7 @@ impl StateStore {
         self.claim_service_rollback(&record.rollback_id).map(Some)
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn latest_ready_service_rollback(&self) -> Result<Option<ServiceRollbackRecord>, String> {
         self.conn
             .query_row(
@@ -9673,6 +9679,7 @@ impl StateStore {
             .map_err(|error| format!("cannot read ready service rollback: {error}"))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
     pub fn protected_service_rollbacks(&self) -> Result<Vec<ServiceRollbackRecord>, String> {
         let mut statement = self
             .conn
@@ -9693,6 +9700,7 @@ impl StateStore {
             .map_err(|error| format!("cannot decode protected service rollback: {error}"))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn claim_service_rollback(
         &mut self,
         rollback_id: &str,
@@ -9736,6 +9744,7 @@ impl StateStore {
         })
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn service_rollback_by_id(
         &self,
         rollback_id: &str,
@@ -9754,6 +9763,7 @@ impl StateStore {
             .map_err(|error| format!("cannot read service rollback {rollback_id}: {error}"))
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn recover_service_rollback_after_guardian(
         &self,
         rollback_id: &str,
@@ -9798,6 +9808,7 @@ impl StateStore {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn finish_service_rollback(
         &self,
         rollback_id: &str,
@@ -9821,6 +9832,7 @@ impl StateStore {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn complete_service_rollback(
         &mut self,
         rollback_id: &str,
@@ -9902,6 +9914,7 @@ impl StateStore {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
 fn decode_service_rollback(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRollbackRecord> {
     Ok(ServiceRollbackRecord {
         rollback_id: row.get(0)?,
@@ -9922,44 +9935,18 @@ fn decode_service_rollback(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceR
 // ---------------------------------------------------------------------------
 
 /// A live SQLite transaction. Dropping it without commit rolls back.
+#[cfg_attr(not(test), allow(dead_code))] // state-store tests
 pub struct Tx<'conn> {
     conn: &'conn rusqlite::Transaction<'conn>,
 }
 
 impl Tx<'_> {
     /// Execute a statement with no parameters.
+    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn execute(&mut self, sql: &str) -> Result<usize, String> {
         self.conn
             .execute(sql, [])
             .map_err(|error| format!("tx execute failed: {error}"))
-    }
-
-    /// Execute a batch of SQL (used to apply migrations atomically).
-    pub fn execute_batch(&mut self, sql: &str) -> Result<(), String> {
-        self.conn
-            .execute_batch(sql)
-            .map_err(|error| format!("tx batch failed: {error}"))
-    }
-
-    /// Read a single integer scalar.
-    pub fn scalar_i64(&self, sql: &str) -> Result<Option<i64>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .map_err(|error| format!("tx prepare failed: {error}"))?;
-        let mut rows = stmt
-            .query([])
-            .map_err(|error| format!("tx query failed: {error}"))?;
-        match rows
-            .next()
-            .map_err(|error| format!("tx step failed: {error}"))?
-        {
-            Some(row) => row
-                .get(0)
-                .map(Some)
-                .map_err(|error| format!("tx get failed: {error}")),
-            None => Ok(None),
-        }
     }
 }
 
@@ -9967,6 +9954,7 @@ impl Tx<'_> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))] // state-store tests
 fn list_names(conn: &Connection, sql: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(sql)
