@@ -9269,6 +9269,61 @@ impl StateStore {
             .execute("CREATE TRIGGER fail_exec_settle BEFORE UPDATE OF state ON exec_sessions WHEN NEW.state = 'closed' BEGIN SELECT RAISE(ABORT, 'test settle failure'); END", []);
     }
 
+    /// Both the closed settle and the abandoned marker fail, matching a
+    /// `PRAGMA query_only` database. The row stays `running`.
+    #[cfg(test)]
+    pub fn fail_exec_state_writes_for_test(&self) {
+        let _ = self.conn.execute(
+            "CREATE TRIGGER fail_exec_state_writes BEFORE UPDATE OF state ON exec_sessions BEGIN SELECT RAISE(ABORT, 'test query_only'); END",
+            [],
+        );
+    }
+
+    /// A close whose settle and abandoned marker both failed. The row is still
+    /// `running`, so this lookup is only a read-side fallback for a committed
+    /// spool. It does not make the command replayable and does not change the
+    /// row into a live process recovery candidate.
+    pub fn get_unsettled_exec_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1 AND state = 'running' AND pid IS NULL",
+            )
+            .map_err(|error| format!("cannot prepare unsettled exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .map_err(|error| format!("cannot query unsettled exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode unsettled exec session: {error}"))?;
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms: u64::try_from(started_at).unwrap_or(0),
+                    ended_at_ms: ended_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                    exit_code,
+                    signal,
+                    expires_at_ms: expires_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn mark_exec_session_abandoned(
         &self,
         session_id: &str,

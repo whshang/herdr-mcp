@@ -490,6 +490,16 @@ fn load_session_from_spool_or_record(
                     },
                 ) {
                     Ok((stdout_data, stderr_data)) => {
+                        let stdout_matches = spool_stream_length_matches(
+                            artifact.stdout_bytes,
+                            stdout_data.len(),
+                            artifact.truncated,
+                        );
+                        let stderr_matches = spool_stream_length_matches(
+                            artifact.stderr_bytes,
+                            stderr_data.len(),
+                            artifact.truncated,
+                        );
                         stdout_bytes = stdout_data.len();
                         stderr_bytes = stderr_data.len();
                         let mut next_seq = 0u64;
@@ -509,13 +519,10 @@ fn load_session_from_spool_or_record(
                             });
                         }
                         truncated = artifact.truncated;
-                        // A declared byte count that the decoded tail cannot
-                        // carry is corrupt unless the artifact already says the
-                        // tail was truncated to the spool cap.
-                        if (!truncated)
-                            && (artifact.stdout_bytes != stdout_bytes
-                                || artifact.stderr_bytes != stderr_bytes)
-                        {
+                        // Each stream keeps its own length invariant. A
+                        // truncation on stderr does not excuse a stdout tail
+                        // that is shorter than its declared count.
+                        if !stdout_matches || !stderr_matches {
                             chunks.clear();
                             stdout_bytes = 0;
                             stderr_bytes = 0;
@@ -577,6 +584,17 @@ fn decode_spool_stream(encoded: &str, declared_bytes: usize) -> Result<Vec<u8>, 
         return Err(());
     }
     Ok(decoded)
+}
+
+/// A stream under the spool cap must decode to exactly its declared length.
+/// Only a stream that itself exceeds the cap may be the shorter retained tail,
+/// and that tail is exactly one cap. The other stream is checked on its own.
+fn spool_stream_length_matches(declared_bytes: usize, decoded_len: usize, truncated: bool) -> bool {
+    if declared_bytes > RECOVERY_SPOOL_CAP {
+        truncated && decoded_len == RECOVERY_SPOOL_CAP
+    } else {
+        decoded_len == declared_bytes
+    }
 }
 
 fn clean_expired_spools(state_dir: &Path, unexpired_session_ids: &HashSet<String>) {
@@ -1309,6 +1327,7 @@ impl ExecRegistry {
                 .ok()
                 .flatten()
                 .or_else(|| store.get_abandoned_exec_session(id).ok().flatten())
+                .or_else(|| store.get_unsettled_exec_session(id).ok().flatten())
         })?;
         let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
         // A row whose `.spool` has not committed yet is an in-flight close, a
@@ -2139,26 +2158,29 @@ fn persist_closed_evidence(
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
     let settle_result = settle_closed_evidence(inner, session, ended_at, exit_code, signal);
+    let mut durable_degraded = false;
     if settle_result.is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
         // The row would otherwise stay `running` with a null `expires_at`.
         // Mark it abandoned so eviction can still rebuild a non-replayable
         // incomplete fact instead of reporting `session_not_found`.
         let expires_at = ended_at.saturating_add(SESSION_TTL_MS);
-        if mark_exec_session_abandoned(inner, session, ended_at, exit_code, signal, expires_at)
-            .is_err()
-        {
-            inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        match mark_exec_session_abandoned(inner, session, ended_at, exit_code, signal, expires_at) {
+            Ok(()) => durable_degraded = true,
+            Err(_) => {
+                inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     if let Ok(mut status) = session.status.lock() {
         if spool_result.is_ok() && settle_result.is_ok() {
             status.evidence_persisted = true;
             status.persist_abandoned = false;
-        } else {
-            // `persist_session_spool` / `settle_closed_evidence` already spent
-            // PERSIST_RETRY_ATTEMPTS. Further closes of this resident session
-            // must not keep it immune to the cap.
+        } else if settle_result.is_ok() || durable_degraded {
+            // A closed or abandoned row now exists, so eviction can rebuild a
+            // readable fact. Both writes failing leaves the row `running`;
+            // dropping the resident session would turn the next read into
+            // `session_not_found`, including when the spool already landed.
             status.persist_abandoned = true;
         }
     }
@@ -4342,6 +4364,134 @@ mod tests {
         assert_eq!(empty_view["text"], "");
         assert_eq!(empty_view["phase"], "completed");
 
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given both the closed settle and the abandoned marker
+    /// fail | When the resident cap runs and the process restarts | Then the
+    /// session stays resident and a later read is not session_not_found.
+    #[test]
+    fn user_operator_keeps_session_resident_when_both_state_writes_fail() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-query-only-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_pane_exec_running("es_query_only", now)
+            .unwrap();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .fail_exec_state_writes_for_test();
+        let session = unpersisted_closed_session("es_query_only", "still-readable\n");
+        write_session_spool(&path, &session).unwrap();
+        persist_closed_evidence(&registry.inner, &session, now, Some(9), None);
+        assert!(
+            !session.status.lock().unwrap().persist_abandoned,
+            "a failed abandoned marker must not make the resident session evictable"
+        );
+        assert!(!session.status.lock().unwrap().evidence_persisted);
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), Arc::clone(&session));
+        for i in 0..RECOVERY_MAX_ENTRIES + 2 {
+            let session_id = format!("es_query_fill_{i:03}");
+            registry.inner.sessions.lock().unwrap().insert(
+                session_id.clone(),
+                loaded_completed_session(&session_id, now + 3_000 + i as u64, now + 3_000, "y\n"),
+            );
+        }
+        registry.prune();
+        assert!(
+            registry
+                .list_views()
+                .iter()
+                .any(|view| view["session_id"] == "es_query_only"),
+            "both durable writes failed, so the memory session must stay"
+        );
+        let resident = registry.read("es_query_only", "stdout", 0, 64);
+        assert_eq!(resident["ok"], true, "{resident}");
+        assert_eq!(resident["phase"], "completed");
+        assert_eq!(resident["text"], "still-readable\n");
+        assert_ne!(resident["reason"], "session_not_found");
+
+        drop(session);
+        drop(registry);
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+        let booted = restarted.read("es_query_only", "stdout", 0, 64);
+        // The row stayed `running` because neither state write landed. Restart
+        // still finds it through the unsettled lookup and serves the spool
+        // that did commit. It must not become `session_not_found`.
+        assert_eq!(booted["ok"], true, "{booted}");
+        assert_eq!(booted["phase"], "completed");
+        assert_eq!(booted["text"], "still-readable\n");
+        assert_ne!(booted["reason"], "session_not_found");
+        assert!(exec_spool_path(&path, "es_query_only").is_file());
+        drop(restarted);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given one stream is a real truncated tail and the other
+    /// declares bytes it did not store | When the spool is read | Then it is
+    /// session_spool_corrupt while a real empty capture stays successful.
+    #[test]
+    fn user_operator_rejects_a_short_stream_hidden_by_the_other_streams_truncation() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-mixed-truncation-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+        for id in ["es_mixed", "es_real_zero"] {
+            store.record_exec_running(id, 22_000, None, now).unwrap();
+            store
+                .settle_exec_session(
+                    id,
+                    "closed",
+                    Some(now + 4),
+                    Some(0),
+                    None,
+                    now + SESSION_TTL_MS,
+                )
+                .unwrap();
+        }
+        drop(store);
+        fs::create_dir_all(exec_spool_dir(&path)).unwrap();
+        let stderr_tail = "A".repeat(RECOVERY_SPOOL_CAP);
+        let stderr_b64 = BASE64.encode(stderr_tail.as_bytes());
+        let mixed = format!(
+            r#"{{"version":1,"session_id":"es_mixed","stdout_bytes":100,"stderr_bytes":{},"truncated":true,"stdout_tail":"","stderr_tail":"{stderr_b64}"}}"#,
+            RECOVERY_SPOOL_CAP + 50
+        );
+        fs::write(exec_spool_path(&path, "es_mixed"), mixed).unwrap();
+        let empty = unpersisted_closed_session("es_real_zero", "");
+        empty.buffers.lock().unwrap().chunks.clear();
+        empty.buffers.lock().unwrap().stdout_bytes = 0;
+        empty.buffers.lock().unwrap().stderr_bytes = 0;
+        write_session_spool(&path, &empty).unwrap();
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let mixed_view = registry.read("es_mixed", "both", 0, 64);
+        assert_eq!(mixed_view["ok"], false, "{mixed_view}");
+        assert_eq!(mixed_view["reason"], "session_spool_corrupt");
+        let zero = registry.read("es_real_zero", "both", 0, 64);
+        assert_eq!(zero["ok"], true, "{zero}");
+        assert_eq!(zero["phase"], "completed");
+        assert_eq!(zero["text"], "");
         drop(registry);
         let _ = fs::remove_dir_all(&path);
     }
