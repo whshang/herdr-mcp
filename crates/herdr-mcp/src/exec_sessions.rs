@@ -1287,6 +1287,56 @@ impl ExecRegistry {
         }
     }
 }
+impl ExecRegistry {
+    /// Test-only quiescence drain: `complete_session` marks `closed` inside the
+    /// status lock, then performs the spool/SQLite persistence (and for pane
+    /// sessions the reclaim bookkeeping) on whichever thread noticed the exit —
+    /// the synchronous reader OR the 25 ms monitor. A caller that observes
+    /// `phase == "completed"` therefore cannot assume the background writer has
+    /// finished touching `state_dir`; removing the directory at that point
+    /// races the in-flight `persist_closed_evidence` (spool tmp create/rename,
+    /// WAL write, `clean_expired_spools`) and intermittently fails with
+    /// `DirectoryNotEmpty` (see utility_exec teardown flake). This waits until
+    /// every resident session is closed with `evidence_persisted` set — the
+    /// flag `persist_closed_evidence` flips only after both durable writes —
+    /// and every native backend's `output_readers` has drained. Sessions
+    /// recovered row-only (`evidence_missing`) never persist and are skipped:
+    /// they perform no writes to drain.
+    #[cfg(test)]
+    pub(crate) fn wait_for_writes_quiescent(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let quiescent = self
+                .inner
+                .sessions
+                .lock()
+                .map(|sessions| {
+                    sessions.values().all(|session| {
+                        if session.evidence_missing {
+                            return true;
+                        }
+                        let status = session_status(session);
+                        if !status.closed || !status.evidence_persisted {
+                            return false;
+                        }
+                        !matches!(
+                            &session.backend,
+                            SessionBackend::Native { output_readers, .. }
+                                if output_readers.load(Ordering::Acquire) > 0
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            if quiescent {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
 
 /// Bound the resident set of completed sessions while leaving every durable
 /// spool and `exec_sessions` row untouched, so an evicted session is still
