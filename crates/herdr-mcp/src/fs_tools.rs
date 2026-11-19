@@ -322,6 +322,32 @@ fn image_mime(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Heavy dependency/build-artifact directories kept visible in recursive
+/// `fs.list` results but not descended into by default — see issue #1070.
+const HEAVY_ARTIFACT_DIRS: [&str; 5] = ["target", "node_modules", "dist", ".next", "build"];
+
+fn is_heavy_artifact_dir(name: &str) -> bool {
+    HEAVY_ARTIFACT_DIRS.contains(&name)
+}
+
+/// `true` when `path` is itself a heavy artifact directory or lives inside
+/// one — the caller explicitly asked to look there, so suppression must not
+/// apply anywhere in that walk.
+fn path_is_inside_heavy_dir(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(is_heavy_artifact_dir)
+    })
+}
+
+/// `true` when the caller's glob explicitly names the directory (e.g.
+/// `node_modules/**` or `**/dist/*`), re-enabling descent into it.
+fn glob_targets_dir(glob: Option<&str>, name: &str) -> bool {
+    glob.is_some_and(|pattern| pattern.split('/').any(|segment| segment.contains(name)))
+}
+
 pub fn list(snapshot: &Value, args: &Value) -> Value {
     let path = match required_str(args, "path") {
         Ok(value) => value,
@@ -353,15 +379,15 @@ pub fn list(snapshot: &Value, args: &Value) -> Value {
 
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_list(
-        &managed.real,
-        &managed.real,
+    let options = ListWalkOptions {
+        base: &managed.real,
         recursive,
-        glob_re.as_ref(),
+        glob: glob_re.as_ref(),
+        glob_raw: glob,
+        suppress_heavy_dirs: !path_is_inside_heavy_dir(&managed.real),
         max_entries,
-        &mut entries,
-        &mut truncated,
-    );
+    };
+    walk_list(&managed.real, &options, &mut entries, &mut truncated);
     json!({
         "ok": true,
         "path": managed.resolved.to_string_lossy(),
@@ -895,15 +921,22 @@ fn parse_rg_line(line: &str) -> Option<(String, usize, String)> {
     Some((file.to_owned(), line_no.parse().ok()?, content.to_owned()))
 }
 
-fn walk_list(
-    base: &Path,
-    dir: &Path,
+struct ListWalkOptions<'a> {
+    base: &'a Path,
     recursive: bool,
-    glob: Option<&Regex>,
+    glob: Option<&'a Regex>,
+    glob_raw: Option<&'a str>,
+    suppress_heavy_dirs: bool,
     max_entries: usize,
+}
+
+fn walk_list(
+    dir: &Path,
+    options: &ListWalkOptions<'_>,
     output: &mut Vec<Value>,
     truncated: &mut bool,
 ) {
+    let max_entries = options.max_entries;
     if output.len() >= max_entries {
         *truncated = true;
         return;
@@ -938,10 +971,19 @@ fn walk_list(
         } else {
             "other"
         };
-        if file_type.is_dir() && recursive {
-            walk_list(base, &full, true, glob, max_entries, output, truncated);
+        if file_type.is_dir() && options.recursive {
+            // Descend unless this is a suppressed heavy dir the caller did
+            // not ask for: the glob accepting the dir's own name (e.g. `*`
+            // or `node_*`) or literally naming it opts the dir back in.
+            let descend = !options.suppress_heavy_dirs
+                || !is_heavy_artifact_dir(&name)
+                || options.glob.is_some_and(|pattern| pattern.is_match(&name))
+                || glob_targets_dir(options.glob_raw, &name);
+            if descend {
+                walk_list(&full, options, output, truncated);
+            }
         }
-        if glob.is_some_and(|pattern| !pattern.is_match(&name)) {
+        if options.glob.is_some_and(|pattern| !pattern.is_match(&name)) {
             continue;
         }
         let mut record = Map::new();
@@ -950,7 +992,11 @@ fn walk_list(
         record.insert("path".to_owned(), json!(full.to_string_lossy()));
         record.insert(
             "relative_path".to_owned(),
-            json!(full.strip_prefix(base).unwrap_or(&full).to_string_lossy()),
+            json!(
+                full.strip_prefix(options.base)
+                    .unwrap_or(&full)
+                    .to_string_lossy()
+            ),
         );
         if file_type.is_file()
             && let Ok(metadata) = entry.metadata()
@@ -1709,6 +1755,120 @@ mod tests {
         assert!(!prepared.preview);
         assert_eq!(prepared.mime_type, "image/png");
         assert_eq!(prepared.data, bytes);
+    }
+
+    /// Recursive listing keeps heavy artifact dirs visible but does not
+    /// descend into them, so a huge `node_modules` cannot crowd source
+    /// files out of the default entry window.
+    #[test]
+    fn recursive_list_keeps_heavy_dirs_visible_but_unexpanded() {
+        let root = operational_root();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..210 {
+            fs::write(root.join(format!("node_modules/dep{index}.js")), "x").unwrap();
+        }
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        let snap = operational_snapshot(&root);
+
+        let listed = list(&snap, &json!({"path": root, "recursive": true}));
+        assert_eq!(listed["ok"], true, "{listed}");
+        let names: Vec<&str> = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert!(names.contains(&"node_modules"), "{names:?}");
+        assert!(names.contains(&"src"), "{names:?}");
+        assert!(names.contains(&"main.rs"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.starts_with("dep")),
+            "{names:?}"
+        );
+        assert_eq!(listed["truncated"], false, "{listed}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A glob that accepts the heavy dir's own name (e.g. `*`) opts it back
+    /// into recursion; a glob like `*.js` that does not name the dir still
+    /// suppresses descent.
+    #[test]
+    fn recursive_list_glob_opt_in_controls_heavy_dir_descent() {
+        let root = operational_root();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "x").unwrap();
+        fs::write(root.join("src/tool.js"), "x").unwrap();
+        let snap = operational_snapshot(&root);
+
+        let everything = list(
+            &snap,
+            &json!({"path": root, "recursive": true, "glob": "*"}),
+        );
+        assert_eq!(everything["ok"], true, "{everything}");
+        let paths: Vec<&str> = everything["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["relative_path"].as_str())
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.contains("node_modules/pkg/index.js")),
+            "glob=* must descend into node_modules: {paths:?}"
+        );
+
+        let js_only = list(
+            &snap,
+            &json!({"path": root, "recursive": true, "glob": "*.js"}),
+        );
+        assert_eq!(js_only["ok"], true, "{js_only}");
+        let js_paths: Vec<&str> = js_only["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["relative_path"].as_str())
+            .collect();
+        assert!(
+            js_paths.iter().any(|path| path.contains("src/tool.js")),
+            "{js_paths:?}"
+        );
+        assert!(
+            !js_paths.iter().any(|path| path.contains("node_modules")),
+            "glob=*.js must not descend into node_modules: {js_paths:?}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A start path already inside a heavy directory lists it fully.
+    #[test]
+    fn recursive_list_descends_when_start_is_inside_heavy_dir() {
+        let root = operational_root();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "x").unwrap();
+        let snap = operational_snapshot(&root);
+
+        let listed = list(
+            &snap,
+            &json!({"path": root.join("node_modules"), "recursive": true}),
+        );
+        assert_eq!(listed["ok"], true, "{listed}");
+        let paths: Vec<&str> = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["relative_path"].as_str())
+            .collect();
+        assert!(
+            paths.iter().any(|path| path.contains("pkg/index.js")),
+            "{paths:?}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

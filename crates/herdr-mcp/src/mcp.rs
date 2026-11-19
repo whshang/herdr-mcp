@@ -1820,15 +1820,20 @@ fn admitted_tool_output(
             });
         }
     }
-    let _work_capture = if herdr_core.is_none() {
-        Some(ToolCallCapture {
-            name,
-            arguments: &arguments,
-            context,
-        })
-    } else {
-        None
-    };
+    // One snapshot per dispatch: the capture and every topology-reading route
+    // below share this `Arc` instead of deep-copying the tree again.
+    let snapshot = context.cache.snapshot_arc();
+    let _work_capture =
+        if herdr_core.is_none() && crate::work_capture::may_record_tool_call(name, &arguments) {
+            Some(ToolCallCapture {
+                name,
+                arguments: &arguments,
+                snapshot: std::sync::Arc::clone(&snapshot),
+                context,
+            })
+        } else {
+            None
+        };
 
     let output = match name {
         "herdr_methods" => {
@@ -1918,11 +1923,7 @@ fn admitted_tool_output(
             } else if method.starts_with("work_memory.") {
                 work_memory_call(context.state_store, method, &params)
             } else if method == WORK_PICKUP_METHOD {
-                work_pickup_call(
-                    context.state_store,
-                    &params,
-                    Some(&context.cache.snapshot()),
-                )
+                work_pickup_call(context.state_store, &params, Some(snapshot.as_ref()))
             } else if method == WORKSTATION_PREFLIGHT_METHOD {
                 workstation_preflight_call(context, &params, route.selection(), herdr_core)
             } else if method == crate::progressive_skills::REQUEST_STATUS_METHOD {
@@ -2036,7 +2037,7 @@ fn admitted_tool_output(
                     context.client,
                     method,
                     &params,
-                    &context.cache.snapshot(),
+                    snapshot.as_ref(),
                 )
                 .unwrap_or_else(|| {
                     json!({
@@ -2169,11 +2170,11 @@ fn admitted_tool_output(
                 } else {
                     // A horizontal split must not create a pane whose agent output
                     // can only be captured as wrapping noise (#684).
-                    match pane_width::guard_split(&context.cache.snapshot(), &params) {
+                    match pane_width::guard_split(snapshot.as_ref(), &params) {
                         pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
                             context.client,
                             context.skill,
-                            &context.cache.snapshot(),
+                            snapshot.as_ref(),
                             method,
                             params,
                         ),
@@ -2182,12 +2183,14 @@ fn admitted_tool_output(
                 }
             } else if method.starts_with("artifact.") {
                 // Listing and inspecting cached artifacts do not require TUI topology.
-                let snapshot = if herdr_core.is_some() {
+                let local_snapshot = if herdr_core.is_some() {
                     json!({})
                 } else {
-                    context.cache.snapshot()
+                    // These two local-dispatch helpers take an owned snapshot;
+                    // the clone stays scoped to herdr_call local methods.
+                    snapshot.as_ref().clone()
                 };
-                artifact_call(&config_dir(), &snapshot, method, &params)
+                artifact_call(&config_dir(), &local_snapshot, method, &params)
             } else if method == TEXT_WRITE_METHOD {
                 if herdr_core.is_some() {
                     crate::runtime_adapter::herdr_core_unsupported(
@@ -2236,15 +2239,17 @@ fn admitted_tool_output(
             } else if method.starts_with("herdr_mcp.") {
                 // Snapshot-dependent local methods are refused above. Pure local
                 // methods receive no TUI snapshot on herdr-core.
-                let snapshot = if herdr_core.is_some() {
+                let local_snapshot = if herdr_core.is_some() {
                     json!({})
                 } else {
-                    context.cache.snapshot()
+                    // These two local-dispatch helpers take an owned snapshot;
+                    // the clone stays scoped to herdr_call local methods.
+                    snapshot.as_ref().clone()
                 };
                 native_tools::call_with_local(
                     context.client,
                     context.skill,
-                    &snapshot,
+                    &local_snapshot,
                     method,
                     params,
                 )
@@ -2256,7 +2261,7 @@ fn admitted_tool_output(
                 native_tools::call_with_local(
                     context.client,
                     context.skill,
-                    &context.cache.snapshot(),
+                    snapshot.as_ref(),
                     method,
                     params,
                 )
@@ -2270,14 +2275,14 @@ fn admitted_tool_output(
                     "the selected herdr-core backend cannot enforce the public tool's access and safety policies and result contract",
                 )
             } else {
-                route_fs_git("fs_read", &context.cache.snapshot(), &arguments)
+                route_fs_git("fs_read", snapshot.as_ref(), &arguments)
             }
         }
-        "herdr_fs_list" => route_fs_git("fs_list", &context.cache.snapshot(), &arguments),
-        "herdr_fs_grep" => route_fs_git("fs_grep", &context.cache.snapshot(), &arguments),
+        "herdr_fs_list" => route_fs_git("fs_list", snapshot.as_ref(), &arguments),
+        "herdr_fs_grep" => route_fs_git("fs_grep", snapshot.as_ref(), &arguments),
         "herdr_fs_image" => {
             return Ok(AdmittedToolResult::Envelope(
-                match tcc_broker::route_fs_git("fs_image", &context.cache.snapshot(), &arguments) {
+                match tcc_broker::route_fs_git("fs_image", snapshot.as_ref(), &arguments) {
                     Some(Ok(value)) => {
                         let value = crate::macos_permissions::map_fs_git_result(value);
                         match tcc_broker::image_tool_result_from_broker(&value) {
@@ -2302,7 +2307,7 @@ fn admitted_tool_output(
                         })),
                         true,
                     ),
-                    None => match fs_tools::image(&context.cache.snapshot(), &arguments) {
+                    None => match fs_tools::image(snapshot.as_ref(), &arguments) {
                         Ok(image) => image_tool_result(image),
                         Err(error) => {
                             tool_result(crate::macos_permissions::map_fs_git_result(error), false)
@@ -2324,7 +2329,7 @@ fn admitted_tool_output(
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                route_fs_git("fs_edit", &context.cache.snapshot(), &clean)
+                route_fs_git("fs_edit", snapshot.as_ref(), &clean)
             }
         }
         "herdr_fs_write" => {
@@ -2340,7 +2345,7 @@ fn admitted_tool_output(
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                route_fs_git("fs_write", &context.cache.snapshot(), &clean)
+                route_fs_git("fs_write", snapshot.as_ref(), &clean)
             }
         }
         "herdr_fs_patch" => {
@@ -2350,7 +2355,7 @@ fn admitted_tool_output(
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                route_fs_git("fs_patch", &context.cache.snapshot(), &clean)
+                route_fs_git("fs_patch", snapshot.as_ref(), &clean)
             }
         }
         "herdr_git" => {
@@ -2360,7 +2365,7 @@ fn admitted_tool_output(
                 conflict
             } else {
                 let clean = strip_lease_credential_fields(&arguments);
-                route_fs_git("git", &context.cache.snapshot(), &clean)
+                route_fs_git("git", snapshot.as_ref(), &clean)
             }
         }
         "herdr_exec_start" => {
@@ -2372,12 +2377,9 @@ fn admitted_tool_output(
                 let clean = strip_lease_credential_fields(&arguments);
                 match herdr_core {
                     Some(client) => crate::runtime_adapter::herdr_core_exec_start(client, &clean),
-                    None => exec_tools::start(
-                        context.client,
-                        &context.cache.snapshot(),
-                        context.exec,
-                        &clean,
-                    ),
+                    None => {
+                        exec_tools::start(context.client, snapshot.as_ref(), context.exec, &clean)
+                    }
                 }
             }
         }
@@ -2404,7 +2406,7 @@ fn admitted_tool_output(
                 let clean = strip_lease_credential_fields(&arguments);
                 utility_exec::run_durable(
                     context.client,
-                    &context.cache.snapshot(),
+                    snapshot.as_ref(),
                     context.exec,
                     context.state_store,
                     &clean,
@@ -2464,7 +2466,7 @@ fn admitted_tool_output(
         }
         "herdr_skill" => context
             .skill
-            .fetch_for_runtime(&arguments, &context.cache.snapshot()),
+            .fetch_for_runtime(&arguments, snapshot.as_ref()),
         pending if contract::tool_names().contains(&pending) => {
             return Ok(AdmittedToolResult::Raw {
                 output: json!({
@@ -2493,6 +2495,9 @@ fn admitted_tool_output(
 struct ToolCallCapture<'a, 'context> {
     name: &'a str,
     arguments: &'a Value,
+    /// Snapshot already taken by the dispatch for this call, so capture never
+    /// pays a second topology clone.
+    snapshot: std::sync::Arc<Value>,
     context: &'a RuntimeContext<'context>,
 }
 
@@ -2501,10 +2506,11 @@ impl Drop for ToolCallCapture<'_, '_> {
         // Capture is best-effort and must never panic out of Drop (a panic
         // during unwind would abort the process).
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let snapshot = self.context.cache.snapshot();
-            let Some(event) =
-                crate::work_capture::event_for_tool_call(self.name, self.arguments, &snapshot)
-            else {
+            let Some(event) = crate::work_capture::event_for_tool_call(
+                self.name,
+                self.arguments,
+                self.snapshot.as_ref(),
+            ) else {
                 return;
             };
             // This drop runs after the tool output is computed, so this
