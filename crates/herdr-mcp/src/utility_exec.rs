@@ -2390,8 +2390,18 @@ mod tests {
             let result = waiting.join().unwrap();
             assert_eq!(result["output"], "first", "{result}");
         });
+        // `phase == "completed"` only proves the status flip; whichever thread
+        // observed the exit (the final read or the 25 ms monitor) may still be
+        // committing the spool + SQLite close evidence under `base`. Drain the
+        // registry's background writers before unlinking the tree or the
+        // removal races an in-flight spool tmp write and intermittently fails
+        // with DirectoryNotEmpty.
+        assert!(
+            registry.wait_for_writes_quiescent(Duration::from_secs(10)),
+            "exec session persistence did not quiesce before teardown"
+        );
         drop(registry);
-        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[cfg(unix)]
