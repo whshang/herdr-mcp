@@ -882,6 +882,132 @@ mod tests {
     }
 
     #[test]
+    fn generated_release_manifest_is_admitted_by_previous_released_runtime() {
+        struct ScratchDir(std::path::PathBuf);
+        impl Drop for ScratchDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let previous_local = contract::previous_identity().unwrap();
+        let previous_schema = contract::previous_state_schema().unwrap();
+        let current_local = contract::identity().unwrap();
+        let current_schema = contract::state_schema().unwrap();
+        assert_eq!(previous_local.epoch, 5);
+        assert_eq!(current_local.epoch, 6);
+        assert_eq!(previous_schema, SCHEMA_VERSION);
+        assert_eq!(current_schema, SCHEMA_VERSION);
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        let tag = format!("v{version}");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let scratch = ScratchDir(std::env::temp_dir().join(format!(
+            "herdr-release-manifest-gate-{}-{unique}",
+            std::process::id()
+        )));
+        let assets_dir = scratch.0.join("assets");
+        std::fs::create_dir_all(&assets_dir).unwrap();
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ] {
+            let suffix = if target.contains("windows") {
+                ".exe"
+            } else {
+                ""
+            };
+            std::fs::write(
+                assets_dir.join(format!("herdr-mcp-{version}-{target}{suffix}")),
+                format!("binary-{target}"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            assets_dir.join(format!("herdr-edge-{version}.mjs")),
+            "export default {};\n",
+        )
+        .unwrap();
+        let manifest_path = scratch.0.join("runtime-manifest.json");
+        let output = std::process::Command::new("node")
+            .env_remove("GITHUB_WORKFLOW")
+            .env_remove("GITHUB_REPOSITORY")
+            .env_remove("GITHUB_REPOSITORY_ID")
+            .env_remove("GITHUB_SHA")
+            .env_remove("GITHUB_REF")
+            .env_remove("GITHUB_REF_NAME")
+            .arg(repo_root.join("scripts/build-rust-release-manifest.mjs"))
+            .arg("--root")
+            .arg(&repo_root)
+            .arg("--assets-dir")
+            .arg(&assets_dir)
+            .arg("--output")
+            .arg(&manifest_path)
+            .arg("--repo")
+            .arg(release_trust::RELEASE_REPOSITORY)
+            .arg("--tag")
+            .arg(&tag)
+            .arg("--repository-id")
+            .arg(release_trust::RELEASE_REPOSITORY_ID.to_string())
+            .arg("--source-commit")
+            .arg("a".repeat(40))
+            .arg("--source-ref")
+            .arg(format!("refs/tags/{tag}"))
+            .arg("--workflow-name")
+            .arg(release_trust::RELEASE_WORKFLOW_NAME)
+            .output()
+            .expect("node must be available to build the release manifest");
+        assert!(
+            output.status.success(),
+            "build-rust-release-manifest failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["state_schema"], json!(SCHEMA_VERSION));
+        assert_eq!(
+            manifest["contract_migration"]["state_schema_from"],
+            json!(previous_schema)
+        );
+        assert!(manifest.get("state_schema_migration").is_none());
+
+        // Simulate a v1.1.1 host (epoch 5, SCHEMA_VERSION = 16) admitting the
+        // generated manifest across the epoch 5 -> 6 transition.
+        let (admitted_target, migration) =
+            admit_release_contract(&manifest, &previous_local, SCHEMA_VERSION).unwrap();
+        assert_eq!(admitted_target, current_local);
+        assert_eq!(migration, None);
+
+        // Also verify full release-plan admission on the current contract baseline.
+        let plan = parse_release_plan(&manifest, current_target().unwrap()).unwrap();
+        assert_eq!(plan.contract, current_local);
+        assert_eq!(plan.state_schema_migration, None);
+
+        // Regression guard for the v1.2.0 failure mode: a stale state_schema_from=15
+        // must fail closed against an epoch-5 / schema-16 host.
+        let mut stale = manifest;
+        stale["contract_migration"]["state_schema_from"] = json!(SCHEMA_VERSION - 1);
+        let error = admit_release_contract(&stale, &previous_local, SCHEMA_VERSION).unwrap_err();
+        assert!(
+            error.contains(
+                "migration state schema is not rollback-compatible with the local schema"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn release_discovery_respects_update_channel() {
         let releases = json!([
             {
