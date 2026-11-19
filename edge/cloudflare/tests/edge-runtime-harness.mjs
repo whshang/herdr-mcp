@@ -70,7 +70,7 @@ import {
 } from "../dist/canonical-imports.js";
 import { filterWebChatGrantsForRuntime } from "../dist/webchat-grant-capability.js";
 import {
-  COMPATIBLE_RUNTIME_CONTRACTS,
+  PREVIOUS_RUNTIME_EXECUTION_CONTRACT,
   RUNTIME_EXECUTION_CONTRACT,
 } from "../dist/contracts/runtime.js";
 
@@ -455,20 +455,18 @@ export async function startEdgeRuntime({ deviceId, profileSeed = "edge-runtime-h
   // runtime, e.g. epoch 6) advances the advertised epoch while this Edge still
   // stamps the previous epoch — a valid deployment ordering, since requests
   // carry the Edge's epoch and the runtime never gates on it. An Edge-only
-  // bump is equally valid: any epoch in COMPATIBLE_RUNTIME_CONTRACTS is an
-  // advertised peer this Edge accepts at handshake. Accept the stamped
-  // epoch, stamped+1, or any compatible epoch; a larger drift means the pair
-  // under test is not coherent.
+  // single-step bump is equally valid: the previous contract epoch is the
+  // advertised peer this Edge accepts during its own rollout window. Accept
+  // the stamped epoch, stamped+1, or the immediately previous epoch; a
+  // larger drift means the pair under test is not coherent.
   const discovery = await runtime.discover();
   const advertisedEpoch = discovery?.result?._meta?.herdr_contract_epoch;
   const stampedEpoch = RUNTIME_EXECUTION_CONTRACT.contract_epoch;
-  const compatible =
-    advertisedEpoch === stampedEpoch ||
-    advertisedEpoch === stampedEpoch + 1 ||
-    COMPATIBLE_RUNTIME_CONTRACTS.some(
-      (entry) => entry.contract_epoch === advertisedEpoch,
-    );
-  if (!compatible) {
+  if (
+    advertisedEpoch !== stampedEpoch &&
+    advertisedEpoch !== stampedEpoch + 1 &&
+    advertisedEpoch !== PREVIOUS_RUNTIME_EXECUTION_CONTRACT.contract_epoch
+  ) {
     await runtime.stop();
     throw new Error(
       `runtime advertises execution contract epoch ${advertisedEpoch} but this edge stamps ${stampedEpoch}`,

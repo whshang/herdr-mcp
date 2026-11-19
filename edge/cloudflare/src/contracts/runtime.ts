@@ -48,9 +48,12 @@ export const RUNTIME_EXECUTION_CONTRACT = {
 /**
  * Published runtime execution contract epoch 5.
  *
- * Retained in the hello window so already-deployed 1.1.1-era epoch-5
- * workstations stay admitted while Edge rolls forward to epoch 7 ahead of
- * the runtime upgrade.
+ * Retained in the hello window so an epoch-5 workstation that passes the
+ * `/health` contract precheck stays admitted at handshake. Note the precheck
+ * itself only matches the published current/previous pair (epochs 7 and 6
+ * after this bump), so a pre-upgrade v1.1.1-era Link that hard-gates on
+ * epochs 5/4 at the precheck stage cannot reach hello — this entry covers
+ * epoch-5 runtimes that arrive through other admission paths.
  */
 export const EPOCH5_RUNTIME_EXECUTION_CONTRACT = {
   contract_epoch: 5,
