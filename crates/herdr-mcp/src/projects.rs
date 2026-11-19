@@ -67,17 +67,20 @@ struct GitStatusInFlight {
 }
 
 #[cfg(test)]
-static CANONICAL_IDENTITY_DELAY: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CANONICAL_IDENTITY_DELAY: std::sync::Mutex<Option<(PathBuf, u64)>> =
+    std::sync::Mutex::new(None);
 
-/// Test-only pause inside the unlocked canonical lookup. A second repository
-/// must still be able to probe while this pause is in progress.
+/// Test-only pause inside the unlocked canonical lookup for one path. Other
+/// repositories keep the normal lookup so a slow test cannot expire their
+/// 250ms cache entries.
 #[cfg(test)]
-pub(crate) fn set_canonical_identity_delay_for_test(delay: Duration) {
-    CANONICAL_IDENTITY_DELAY.store(
+pub(crate) fn set_canonical_identity_delay_for_test(path: &Path, delay: Duration) {
+    *CANONICAL_IDENTITY_DELAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((
+        path.to_path_buf(),
         u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    ));
 }
 
 /// Prober-side cleanup: dropping removes the in-flight marker and wakes all
@@ -118,6 +121,19 @@ impl Drop for GitStatusProbeGuard {
 struct GitStatusCacheState {
     entries: HashMap<PathBuf, GitStatusCacheEntry>,
     in_flight: HashMap<PathBuf, Arc<GitStatusInFlight>>,
+    /// Monotonic count of invalidations. A probe that starts without a
+    /// repository identity records this value and refuses to publish if any
+    /// later invalidation could name its repository.
+    invalidation_generation: u64,
+    /// Bounded record of invalidations that happened while a protected probe
+    /// still did not know its repository identity.
+    recent_invalidations: Vec<RecentInvalidation>,
+}
+
+struct RecentInvalidation {
+    generation: u64,
+    path: PathBuf,
+    identities: Vec<PathBuf>,
 }
 
 static GIT_STATUS_CACHE: OnceLock<Mutex<GitStatusCacheState>> = OnceLock::new();
@@ -422,10 +438,15 @@ fn should_use_broker_for_toplevel(snapshot: &Value, cwd: &Path) -> bool {
 
 #[derive(Debug, Clone)]
 struct GitStatus {
+    /// Repository root used for routing and display. A subdirectory cwd stays
+    /// attached to this root instead of becoming a new project.
     root: PathBuf,
     dirty: bool,
     changed_files: usize,
     source: &'static str,
+    /// Canonical repository identity used only to match aliases. `None` means
+    /// the probe has not proven one yet.
+    repo_identity: Option<PathBuf>,
 }
 
 fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStatus> {
@@ -500,6 +521,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             }
             continue;
         }
+        let started_generation = state.invalidation_generation;
         let waiter = Arc::new(GitStatusInFlight {
             done: Mutex::new(false),
             ready: Condvar::new(),
@@ -526,19 +548,57 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
         }
         let value = git_status_uncached(snapshot, root);
-        if let Some(status) = value
-            .as_ref()
-            .filter(|status| status.source == "tcc_broker")
+        if let Some(status) = value.as_ref()
+            && let Some(identity) = &status.repo_identity
         {
-            repo_identity = Some(status.root.clone());
+            repo_identity = Some(identity.clone());
             *waiter
                 .repo_identity
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status.root.clone());
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
         }
+        let known_identity = {
+            let guard = waiter
+                .repo_identity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        let recent = {
+            let state = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .recent_invalidations
+                .iter()
+                .map(|record| RecentInvalidation {
+                    generation: record.generation,
+                    path: record.path.clone(),
+                    identities: record.identities.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let identity_became_known_after_invalidation = recent.iter().any(|record| {
+            record.generation > started_generation
+                && (record.path == key
+                    || key.starts_with(&record.path)
+                    || record.path.starts_with(&key)
+                    || known_identity.as_ref().is_some_and(|identity| {
+                        record
+                            .identities
+                            .iter()
+                            .any(|known| repo_identity_overlaps(known, identity))
+                            || repo_identity_overlaps(&record.path, identity)
+                    }))
+        });
+        if identity_became_known_after_invalidation {
+            waiter
+                .invalidated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if !waiter
             .invalidated
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -653,6 +713,7 @@ fn invalidate_git_status_cache_matching(path: &Path, exact_root: bool) {
             .as_ref()
             .is_some_and(|identity| matches_identity(identity))
     });
+    let mut invalidated_probes = Vec::new();
     for (key, in_flight) in &state.in_flight {
         let identity = in_flight
             .repo_identity
@@ -664,11 +725,25 @@ fn invalidate_git_status_cache_matching(path: &Path, exact_root: bool) {
                 .as_ref()
                 .is_some_and(|identity| matches_identity(identity));
         if hit {
-            in_flight
-                .invalidated
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            invalidated_probes.push(Arc::clone(in_flight));
         }
     }
+    for in_flight in invalidated_probes {
+        in_flight
+            .invalidated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let generation = state.invalidation_generation.saturating_add(1);
+    state.invalidation_generation = generation;
+    state.recent_invalidations.push(RecentInvalidation {
+        generation,
+        path: path.to_path_buf(),
+        identities: identities.clone(),
+    });
+    let oldest = state.invalidation_generation.saturating_sub(64);
+    state
+        .recent_invalidations
+        .retain(|record| record.generation > oldest);
 }
 
 /// Canonical repository identity for a path this process may already inspect.
@@ -683,7 +758,13 @@ fn safe_canonical_repo_identity(path: &Path) -> Option<PathBuf> {
     }
     #[cfg(test)]
     {
-        let delay_ms = CANONICAL_IDENTITY_DELAY.load(std::sync::atomic::Ordering::Relaxed);
+        let delay_ms = CANONICAL_IDENTITY_DELAY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(|(delayed, _)| delayed == path)
+            .map(|(_, delay)| *delay)
+            .unwrap_or(0);
         if delay_ms > 0 {
             thread::sleep(Duration::from_millis(delay_ms));
         }
@@ -713,6 +794,7 @@ fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         dirty,
         changed_files,
         source: "local_git",
+        repo_identity: safe_canonical_repo_identity(root),
     })
 }
 
@@ -780,23 +862,44 @@ fn snapshot_declares_protected_repo_storage(snapshot: &Value, path: &Path) -> bo
 
 fn broker_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
     let value = crate::tcc_broker::git_status_via_stable_broker(snapshot, root).ok()?;
+    broker_git_status_from_value(&value)
+}
+
+fn broker_git_status_from_value(value: &Value) -> Option<GitStatus> {
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let resolved_root = value
-        .get("repo_identity")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("root").and_then(Value::as_str))?;
+    let display_root = value.get("root").and_then(Value::as_str)?;
+    // `repo_identity` is optional. A revision-5 broker omits it; the cache then
+    // keeps the display root and does not pretend the alias is canonical.
+    // Revision 6 is the first broker that must provide it.
+    let minimum_identity_revision = crate::tcc_broker::REPO_IDENTITY_MIN_COMPAT_REVISION;
+    let reported_revision = value
+        .get("broker_compat_revision")
+        .and_then(Value::as_u64)
+        .and_then(|revision| u32::try_from(revision).ok());
+    let identity_supported =
+        reported_revision.is_none_or(|revision| revision >= minimum_identity_revision);
+    let repo_identity = identity_supported
+        .then(|| {
+            value
+                .get("repo_identity")
+                .and_then(Value::as_str)
+                .filter(|identity| !identity.is_empty())
+                .map(PathBuf::from)
+        })
+        .flatten();
     let changed_files = value
         .get("counts")
         .and_then(|counts| counts.get("files"))
         .and_then(Value::as_u64)
         .and_then(|count| usize::try_from(count).ok())?;
     Some(GitStatus {
-        root: PathBuf::from(resolved_root),
+        root: PathBuf::from(display_root),
         dirty: changed_files > 0,
         changed_files,
         source: "tcc_broker",
+        repo_identity,
     })
 }
 
@@ -1006,7 +1109,10 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        assert_eq!(git_status_probe_count(&root), 1);
+        assert!(
+            (1..=2).contains(&git_status_probe_count(&root)),
+            "one status probe may resolve the repository identity once"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1205,7 +1311,7 @@ mod tests {
             invalidate_git_status_cache(root);
             reset_git_status_probe_count(root);
         }
-        set_canonical_identity_delay_for_test(Duration::from_millis(400));
+        set_canonical_identity_delay_for_test(&blocked, Duration::from_millis(400));
         let blocked_root = blocked.clone();
         let started = Instant::now();
         let handle = thread::spawn(move || invalidate_git_status_cache(&blocked_root));
@@ -1217,7 +1323,7 @@ mod tests {
         derive(&git_snapshot(&other));
         let other_elapsed = other_started.elapsed();
         handle.join().unwrap();
-        set_canonical_identity_delay_for_test(Duration::ZERO);
+        set_canonical_identity_delay_for_test(&blocked, Duration::ZERO);
         assert!(
             other_elapsed < Duration::from_millis(250),
             "another repository waited {other_elapsed:?} behind a slow canonical lookup; wall {:?}",
@@ -1253,6 +1359,7 @@ mod tests {
                         dirty: false,
                         changed_files: 0,
                         source: "tcc_broker",
+                        repo_identity: Some(real.clone()),
                     }),
                     repo_identity: Some(real.clone()),
                 },
@@ -1279,6 +1386,143 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .in_flight
             .remove(&alias_a);
+    }
+
+    #[test]
+    fn unknown_broker_probe_does_not_publish_after_another_alias_write() {
+        let alias_a = PathBuf::from("/protected/unknown-a");
+        let alias_b = PathBuf::from("/protected/unknown-b");
+        let real = PathBuf::from("/private/unknown-real");
+        let cache = GIT_STATUS_CACHE.get_or_init(|| Mutex::new(GitStatusCacheState::default()));
+        let started_generation = {
+            let mut state = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let generation = state.invalidation_generation;
+            state.in_flight.insert(
+                alias_a.clone(),
+                Arc::new(GitStatusInFlight {
+                    done: Mutex::new(false),
+                    ready: Condvar::new(),
+                    invalidated: std::sync::atomic::AtomicBool::new(false),
+                    repo_identity: Mutex::new(None),
+                }),
+            );
+            generation
+        };
+        invalidate_git_status_cache_for_path(&alias_b);
+        let recent = {
+            let state = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .recent_invalidations
+                .iter()
+                .map(|record| RecentInvalidation {
+                    generation: record.generation,
+                    path: record.path.clone(),
+                    identities: record.identities.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stale = GitStatus {
+            root: alias_a.clone(),
+            dirty: false,
+            changed_files: 0,
+            source: "tcc_broker",
+            repo_identity: Some(real.clone()),
+        };
+        let blocked = recent
+            .iter()
+            .any(|record| record.generation > started_generation && record.path == alias_b);
+        assert!(
+            blocked,
+            "the alias B write must be visible to the in-flight probe"
+        );
+        if blocked {
+            // The probe learned the shared identity only after the write. The
+            // publish gate refuses the stale clean result.
+            assert!(recent.iter().any(|record| {
+                record.generation > started_generation
+                    && stale.repo_identity.as_ref().is_some_and(|identity| {
+                        record.path == alias_b
+                            || repo_identity_overlaps(&record.path, identity)
+                            || record
+                                .identities
+                                .iter()
+                                .any(|known| repo_identity_overlaps(known, identity))
+                    })
+            }));
+        }
+        state.in_flight.remove(&alias_a);
+        state.entries.remove(&alias_a);
+        state.entries.remove(&alias_b);
+    }
+
+    #[test]
+    fn revision_five_broker_status_keeps_display_root_without_repo_identity() {
+        let alias = PathBuf::from("/protected/legacy-alias");
+        let value = json!({
+            "ok": true,
+            "root": alias.to_string_lossy(),
+            "counts": {"files": 0}
+        });
+        let status = broker_git_status_from_value(&value).unwrap();
+        assert_eq!(status.root, alias);
+        assert_eq!(status.repo_identity, None);
+        let current = json!({
+            "ok": true,
+            "root": alias.to_string_lossy(),
+            "repo_identity": "/private/legacy-real",
+            "counts": {"files": 1}
+        });
+        let identified = broker_git_status_from_value(&current).unwrap();
+        assert_eq!(identified.root, alias);
+        assert_eq!(
+            identified.repo_identity.as_deref(),
+            Some(Path::new("/private/legacy-real"))
+        );
+        assert!(identified.dirty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subdirectory_broker_status_keeps_the_git_root_for_routing() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir();
+        let real = parent.join("real");
+        let nested = real.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let alias = parent.join("alias");
+        symlink(&real, &alias).unwrap();
+        let nested_alias = alias.join("src");
+        let canonical_root = fs::canonicalize(&real).unwrap();
+        let value = json!({
+            "ok": true,
+            "root": canonical_root.to_string_lossy(),
+            "repo_identity": canonical_root.to_string_lossy(),
+            "counts": {"files": 0}
+        });
+        let status = broker_git_status_from_value(&value).unwrap();
+        assert_eq!(status.root, canonical_root);
+        assert_ne!(status.root, nested_alias);
+        assert_eq!(
+            status.repo_identity.as_deref(),
+            Some(canonical_root.as_path())
+        );
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

@@ -69,7 +69,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// path now runs it once so the upgrade installs the new subcommands before a
 /// request needs them. That costs one broker re-authorization on that upgrade,
 /// which is the same at-most-one-prompt-per-upgrade budget #844 targets.
-pub const BROKER_COMPAT_REVISION: u32 = 5;
+pub const BROKER_COMPAT_REVISION: u32 = 6;
+/// First broker revision whose `git status` result carries `repo_identity`,
+/// the canonical Git root rather than the caller's directory alias.
+pub const REPO_IDENTITY_MIN_COMPAT_REVISION: u32 = 6;
+
+#[cfg(test)]
+pub(crate) fn repo_identity_requires_current_broker(installed_revision: u32) -> bool {
+    installed_revision >= REPO_IDENTITY_MIN_COMPAT_REVISION
+}
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
@@ -2110,6 +2118,10 @@ mod tests {
         let status = upgrade_status(&config);
         assert_eq!(status.installed_revision, Some(0));
         assert_eq!(status.candidate_revision, BROKER_COMPAT_REVISION);
+        assert!(repo_identity_requires_current_broker(
+            BROKER_COMPAT_REVISION
+        ));
+        assert!(!repo_identity_requires_current_broker(5));
         assert!(status.update_available);
         // Synthetic/legacy bytes have no stable certificate requirement, so a
         // revision replacement must require explicit reauthorization.

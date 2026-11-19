@@ -104,9 +104,13 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     // process allowed to resolve it; the parent must not canonicalize the
     // protected path itself.
     output.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
+    // Canonicalize the validated Git root, not the caller path. A pane cwd
+    // inside the repository would otherwise publish that subdirectory as the
+    // repository identity and the parent would route it as a new project root.
+    let repo_identity = std::fs::canonicalize(&managed.root).unwrap_or(managed.root.clone());
     output.insert(
         "repo_identity".to_owned(),
-        json!(managed.real.to_string_lossy()),
+        json!(repo_identity.to_string_lossy()),
     );
     output.insert("action".to_owned(), json!(action));
     output.insert("exit_code".to_owned(), json!(result.exit_code));
