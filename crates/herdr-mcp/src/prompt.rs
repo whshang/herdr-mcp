@@ -370,6 +370,11 @@ struct PromptTaskRecord {
     session_evidence_dev: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_evidence_ino: Option<u64>,
+    /// SHA-256 of the first 64 bytes at submit. Linux can reuse the inode of
+    /// a file that was unlinked and recreated, so identity alone cannot tell
+    /// a rotation from an append.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_prefix: Option<String>,
     /// Unix nanos when this submit reserved its session window. Later submits
     /// on the same file publish a higher stamp before `agent.prompt`, so a
     /// slow RPC cannot hide the next window until registration.
@@ -981,6 +986,7 @@ impl PromptRegistry {
             session_evidence_turn_id: turn_id.clone(),
             session_evidence_dev: session_evidence.dev,
             session_evidence_ino: session_evidence.ino,
+            session_evidence_prefix: session_evidence.prefix.clone(),
             session_window_seq: window_seq,
             session_evidence_closed: false,
             session_evidence_seen_dev: session_evidence.dev,
@@ -3026,19 +3032,37 @@ impl PromptRegistry {
             task.session_evidence_closed = true;
             return false;
         }
-        match identity {
-            Some((expected_dev, expected_ino)) if dev != expected_dev || ino != expected_ino => {
-                task.session_evidence_closed = true;
-                return false;
-            }
+        if let Some((expected_dev, expected_ino)) = identity
+            && (dev != expected_dev || ino != expected_ino)
+        {
+            task.session_evidence_closed = true;
+            return false;
+        }
+        if identity.is_none() && baseline > 0 {
             // A file that already had bytes but no device identity cannot
-            // prove later bytes are the same file. A missing file (baseline 0)
-            // may appear after submit.
-            None if baseline > 0 => {
-                task.session_evidence_closed = true;
-                return false;
+            // prove later bytes are the same file.
+            task.session_evidence_closed = true;
+            return false;
+        }
+        // Same device and inode is not enough: unlink plus recreate can reuse
+        // the inode and still be a different file. The captured prefix must
+        // still sit at the start.
+        if baseline > 0
+            && let Some(expected) = task.session_evidence_prefix.as_deref()
+        {
+            // Hash only the bytes that existed at submit. An append past that
+            // length must not change the digest.
+            let current = file_prefix_digest(Path::new(path), baseline as usize);
+            match current {
+                Some(current) if current == expected => {}
+                _ => {
+                    task.session_evidence_closed = true;
+                    return false;
+                }
             }
-            _ => {}
+        } else if baseline > 0 {
+            task.session_evidence_closed = true;
+            return false;
         }
         task.session_evidence_seen_dev = Some(dev);
         task.session_evidence_seen_ino = Some(ino);
@@ -3408,6 +3432,7 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "session_evidence_turn_id",
     "session_evidence_dev",
     "session_evidence_ino",
+    "session_evidence_prefix",
     "session_window_seq",
     "session_evidence_closed",
     "session_evidence_seen_dev",
@@ -4041,6 +4066,7 @@ struct SessionEvidence {
     bytes: Option<u64>,
     dev: Option<u64>,
     ino: Option<u64>,
+    prefix: Option<String>,
 }
 
 impl SessionEvidence {
@@ -4050,6 +4076,7 @@ impl SessionEvidence {
             bytes: None,
             dev: None,
             ino: None,
+            prefix: None,
         }
     }
 
@@ -4059,15 +4086,19 @@ impl SessionEvidence {
             bytes: Some(0),
             dev: None,
             ino: None,
+            prefix: None,
         }
     }
 
     fn known(path: impl Into<String>, len: u64, dev: u64, ino: u64) -> Self {
+        let path = path.into();
+        let prefix = file_prefix_digest(Path::new(&path), len as usize);
         Self {
-            path: Some(path.into()),
+            path: Some(path),
             bytes: Some(len),
             dev: Some(dev),
             ino: Some(ino),
+            prefix,
         }
     }
 }
@@ -4092,6 +4123,22 @@ fn session_file_stat(path: &Path) -> SessionFileStat {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionFileStat::Missing,
         Err(_) => SessionFileStat::Unreadable,
     }
+}
+
+const SESSION_PREFIX_BYTES: usize = 64;
+
+fn file_prefix_digest(path: &Path, baseline: usize) -> Option<String> {
+    let limit = baseline.min(SESSION_PREFIX_BYTES);
+    if limit == 0 {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut prefix = vec![0_u8; limit];
+    let count = std::io::Read::read(&mut file, &mut prefix).ok()?;
+    if count == 0 {
+        return None;
+    }
+    Some(format!("{:x}", Sha256::digest(&prefix[..count])))
 }
 
 fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
@@ -13101,6 +13148,15 @@ mod tests {
             b"{\"message\":{\"role\":\"assistant\",\"content\":\"other file\"}}\n",
         )
         .unwrap();
+        // Linux can hand the new file the inode that was just released. Store
+        // that identity before reconcile, so the prefix check is what rejects
+        // the rotation even when the inode did not change.
+        let mut same_inode = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        same_inode.session_evidence_dev = Some(dev);
+        same_inode.session_evidence_ino = Some(ino);
+        registry.save_task(&same_inode, None).unwrap();
         let rotated = registry.reconcile_task(task_id).unwrap().unwrap();
         assert_eq!(rotated.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
         assert_eq!(
@@ -14107,6 +14163,7 @@ mod tests {
             session_evidence_turn_id: None,
             session_evidence_dev: None,
             session_evidence_ino: None,
+            session_evidence_prefix: None,
             session_window_seq: None,
             session_evidence_closed: false,
             session_evidence_seen_dev: None,
@@ -15812,6 +15869,7 @@ mod tests {
             session_evidence_turn_id: None,
             session_evidence_dev: None,
             session_evidence_ino: None,
+            session_evidence_prefix: None,
             session_window_seq: None,
             session_evidence_closed: false,
             session_evidence_seen_dev: None,
