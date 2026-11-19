@@ -11,8 +11,8 @@ Herdr-MCP には互いに独立した複数のプロトコル層があります�
 | 層 | 現在のプロダクション identity | 有界な互換性 | fail-closed ルール |
 | --- | --- | --- | --- |
 | 公開 MCP クライアントプロトコル | `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`、`2024-10-07` が `initialize` ネゴシエーションで受け入れられます | ChatGPT/OpenAI discovery は probe バージョン `2026-07-28` を advertise する場合がありますが、その probe 値は追加の `initialize` プロトコルではありません | 欠落または未認識の `initialize` プロトコル値は、明示的な legacy baseline `2025-11-25` までネゴシエートダウンします。リストにないプロトコルがサポート済みとして advertise されることはありません |
-| 公開 Edge ツール契約 | epoch **7**、**19** actions | クライアント会話が古いツールスナップショットを保持している場合がありますが、Edge は現在の DEV/PROD 公開 catalog を publish します。epoch 3 identity は、保守的な非 DEV/PROD フォールバックおよび rollback ベースラインとしてのみ残ります | 現在の公開契約の外にあるツールは拒否されます |
-| Workstation Runtime Execution Contract | epoch **4**、**18** tools | 直前の凍結された epoch **3**、**18** tools が有界な rollback ベースラインとして、また凍結された epoch **2**、**18** ツール catalog とともに受け入れられます | それ以外の epoch/hash の組み合わせは、ワークステーション実行の前に拒否されます |
+| 公開 Edge ツール契約 | epoch **9**、**19** actions | クライアント会話が古いツールスナップショットを保持している場合がありますが、Edge は現在の DEV/PROD 公開 catalog を publish します。epoch 3 identity は、保守的な非 DEV/PROD フォールバックおよび rollback ベースラインとしてのみ残ります | 現在の公開契約の外にあるツールは拒否されます |
+| Workstation Runtime Execution Contract | epoch **7**、**18** tools | 直前の epoch **6**、公開済み epoch **5**、凍結された epoch **4** rollback ベース、および凍結された epoch **2**、**18** ツール catalog がロールアウト中も受け入れられます。古い epoch **3** ベースラインは退役しました | それ以外の epoch/hash の組み合わせは、ワークステーション実行の前に拒否されます |
 | Relay wire protocol | 数値の `protocol_version = 1` | なし | 欠落、文字列値、または未知のプロトコルバージョンは、Relay 状態が書き込まれる前に拒否されます |
 | 永続 runtime 状態 | 現在のバイナリ schema。Release は自動アクティベーションのために同じ rollback 互換の状態 schema を宣言しなければなりません | 古い store は append-only マイグレーションを通じてトランザクショナルに前方移行します | 実行中のバイナリより新しい store は拒否されます。自動 updater は、状態 schema または runtime contract identity が自身の rollback-safe なアクティベーション要件と正確に一致しない Release を拒否します |
 
@@ -32,7 +32,7 @@ herdr-mcp が操作する Herdr runtime は **Herdr TUI** の一つだけです�
 `N` は、現在デプロイされている Edge 契約と、現在 qualified な runtime generation を意味します。
 
 - **N → N** は通常のプロダクション経路です。Candidate のアクティベーションは、トラフィックを移す前にヘルスと正確な runtime execution contract を確認します。Release 更新のアクティベーションではさらに、release manifest がローカルの durable-state schema と一致することが要求されます。
-- **N-1 runtime execution** は有界な rollback 経路であり、一般的な互換性の約束ではありません。現時点では、直前の凍結された epoch-4 runtime contract、および現場にまだ存在する凍結された epoch-2 catalog が、現在の epoch 5 と並んで受け入れられます。この組は epoch と hash によって検証され、任意の古い catalog が受け入れられるわけではありません。
+- **N-1 runtime execution** は有界な rollback 経路であり、一般的な互換性の約束ではありません。現時点では、直前の epoch-6 と公開済み epoch-5 runtime contract、凍結された epoch-4 rollback ベース、および現場にまだ存在する凍結された epoch-2 catalog が、現在の epoch 7 と並んで受け入れられます。この組は epoch と hash によって検証され、任意の古い catalog が受け入れられるわけではありません。
 - **N+1 runtime または control plane** は推測されません。将来の epoch、relay protocol、durable-state schema は、対応する Edge/runtime マイグレーションが明示的に出荷され qualified になるまで互換ではありません。現在のコードは、ベストエフォートのダウングレードを試みる代わりに、未知の contract pair と将来の durable-state schema を拒否します。
 - **durable state の移行はアップグレード時に一方向です。** 各 SQLite migration は append-only かつトランザクショナルです。rollback が安全なのは、先行するバイナリがその結果の状態をまだ読める場合だけであり、これが自動 Release アクティベーションで宣言された state schema の rollback 互換維持を要求する理由です。runtime の rollback は実行の所有権を変えるものであり、ツール呼び出しによってすでに行われた Git/ファイル/サービスへの副作用を取り消すものではありません。
 

@@ -11,8 +11,8 @@ Herdr-MCP 有多层彼此独立的协议，它们不会共用一个版本号。
 | 层 | 当前生产身份 | 有界兼容范围 | 失败关闭规则 |
 | --- | --- | --- | --- |
 | 公共 MCP 客户端协议 | `initialize` 协商接受 `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`、`2024-10-07` | ChatGPT/OpenAI discovery 可公布探测版本 `2026-07-28`；该值不是额外的 `initialize` 协议版本 | 缺失或无法识别的 `initialize` 协议值会明确降到 legacy baseline `2025-11-25`，不会把未列出的协议对外声明为支持 |
-| 公共 Edge 工具契约 | epoch **7**，**19** 个 action | 旧对话可能保留历史工具快照，但 Edge 只发布当前 DEV/PROD 公共 catalog；epoch 3 身份仅作为非 DEV/PROD 的保守回退与 rollback 基线 | 不在当前公共契约内的工具会被拒绝 |
-| Workstation Runtime Execution Contract | epoch **4**，**18** 个工具 | 紧邻上一代冻结的 epoch **3**、**18** 个工具作为有界 rollback 基线，同时保留仍在现场的冻结 epoch **2**、**18** 个工具 catalog | 其他 epoch/hash 组合在 workstation 执行前直接拒绝 |
+| 公共 Edge 工具契约 | epoch **9**，**19** 个 action | 旧对话可能保留历史工具快照，但 Edge 只发布当前 DEV/PROD 公共 catalog；epoch 3 身份仅作为非 DEV/PROD 的保守回退与 rollback 基线 | 不在当前公共契约内的工具会被拒绝 |
+| Workstation Runtime Execution Contract | epoch **7**，**18** 个工具 | 上一代 epoch **6**、已发布 epoch **5**、冻结的 epoch **4** rollback 基线，以及仍在现场的冻结 epoch **2**、**18** 个工具 catalog 在滚动升级期间继续接受；更早的 epoch **3** 基线已退出窗口 | 其他 epoch/hash 组合在 workstation 执行前直接拒绝 |
 | Relay wire protocol | 数字 `protocol_version = 1` | 无 | 缺失、字符串形式或未知版本会在写入 Relay 状态前被拒绝 |
 | 持久运行时状态 | 当前二进制 schema；只有一个已声明且不可逆的前向步骤（N→N+1）可通过显式 `herdr-mcp update` 并在备份状态后接纳 | 旧 store 通过追加式迁移事务性升级 | 降级、多步或未声明的 schema 变更都会拒绝；定时更新拒绝迁移，更新后的 store 对旧二进制失败关闭 |
 
@@ -32,7 +32,7 @@ herdr-mcp 只驱动一种 Herdr 运行时：**Herdr TUI**。下表版本核对�
 `N` 表示当前部署的 Edge 契约和当前已验证的 runtime generation。
 
 - **N → N** 是常规生产路径。候选 runtime 只有在健康检查和精确 runtime execution contract 验证通过后才能切换流量；Release 更新还要求 manifest 与本地 durable-state schema 匹配。
-- **N-1 runtime execution** 只是有界 rollback，不是任意历史版本兼容承诺。当前同时接受紧邻上一代冻结的 epoch-4 runtime contract、仍在现场的冻结 epoch-2 catalog 与当前 epoch 5，并且按 epoch + hash 校验；更老的任意 catalog 不会被接收。
+- **N-1 runtime execution** 只是有界 rollback，不是任意历史版本兼容承诺。当前同时接受上一代 epoch-6、已发布 epoch-5 runtime contract、冻结 epoch-4 rollback 基线、仍在现场的冻结 epoch-2 catalog 与当前 epoch 7，并且按 epoch + hash 校验；更老的任意 catalog 不会被接收。
 - **N+1 runtime 或 control plane** 不做猜测兼容。未来 epoch、Relay protocol 或 durable-state schema 必须经过显式迁移和验证后才能使用；当前实现会拒绝未知 contract pair 和未来 schema，而不是尝试“尽量降级运行”。
 - **durable state 升级是单向迁移。** 只有一个已声明且不可逆的前向 state-schema 步骤（N→N+1）可通过显式 `herdr-mcp update`，并先创建状态备份。降级、多步和未声明变更都会拒绝；定时更新拒绝迁移。回滚必须先恢复备份，之后才能启动旧 binary。Runtime rollback 只切回执行所有权，不会撤销已经发生的 Git、文件、远程服务或 Agent 副作用。
 
