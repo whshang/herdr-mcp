@@ -661,6 +661,7 @@ impl ExecRegistry {
 
         let state_store = StateStore::open_in_dir(&state_dir, "state.db")?;
         let now = now_ms();
+        bound_completed_pidless_sessions(&state_store, &state_dir, now)?;
         state_store.prune_exec_sessions(now)?;
         let recovery = recover_state_store(&state_store)?;
 
@@ -1382,6 +1383,9 @@ impl ExecRegistry {
 
     fn prune(&self) {
         let now = now_ms();
+        if let Ok(store) = self.inner.state_store.lock() {
+            let _ = bound_completed_pidless_sessions(&store, &self.inner.state_dir, now);
+        }
         if let Ok(mut sessions) = self.inner.sessions.lock() {
             sessions.retain(|id, session| {
                 let status = session_status(session);
@@ -1407,6 +1411,33 @@ impl ExecRegistry {
             }
         }
     }
+}
+
+/// Bind a TTL only for a pid-less running row whose committed spool is valid.
+/// A pane that is still active has no such spool and stays unbounded. A native
+/// row keeps its pid and is not selected here.
+fn bound_completed_pidless_sessions(
+    store: &StateStore,
+    state_dir: &Path,
+    now: u64,
+) -> Result<(), String> {
+    let expires_at = now.saturating_add(SESSION_TTL_MS);
+    for session_id in store.unsettled_pidless_exec_session_ids()? {
+        let record = ClosedExecSessionRecord {
+            session_id: session_id.clone(),
+            started_at_ms: now,
+            ended_at_ms: None,
+            exit_code: None,
+            signal: None,
+            expires_at_ms: None,
+        };
+        let session = load_session_from_spool_or_record(state_dir, &record);
+        if session.evidence_missing || session.spool_corrupt {
+            continue;
+        }
+        store.bound_unsettled_exec_session(&session_id, now, expires_at)?;
+    }
+    Ok(())
 }
 
 /// Bound the resident set of completed sessions while leaving every durable
@@ -4515,6 +4546,81 @@ mod tests {
             "a bounded degraded row must leave after its TTL"
         );
         drop(restarted);
+    }
+
+    /// user operator | Given an unread pid-less row with a committed spool and
+    /// an active pane row without one | When the registry restarts and prunes
+    /// after the TTL | Then only the completed row is bounded and removed.
+    #[test]
+    fn user_operator_expires_unread_completed_pidless_row_without_reading_it() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-unread-ttl-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+        store
+            .record_pane_exec_running("es_unread_done", now)
+            .unwrap();
+        store
+            .record_pane_exec_running("es_active_pane", now)
+            .unwrap();
+        drop(store);
+        let completed = unpersisted_closed_session("es_unread_done", "unread-output\n");
+        write_session_spool(&path, &completed).unwrap();
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let bounded = registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_unsettled_exec_session("es_unread_done")
+            .unwrap()
+            .expect("startup bounds the committed pidless row");
+        assert!(bounded.expires_at_ms.is_some());
+        let active = registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_unsettled_exec_session("es_active_pane")
+            .unwrap()
+            .expect("an active pane row stays running");
+        assert_eq!(active.expires_at_ms, None);
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .expire_exec_session_for_test("es_unread_done", 1)
+            .unwrap();
+        registry.prune();
+        assert!(
+            registry
+                .inner
+                .state_store
+                .lock()
+                .unwrap()
+                .get_unsettled_exec_session("es_unread_done")
+                .unwrap()
+                .is_none(),
+            "the unread completed row expires without a session read"
+        );
+        assert!(
+            registry
+                .inner
+                .state_store
+                .lock()
+                .unwrap()
+                .get_unsettled_exec_session("es_active_pane")
+                .unwrap()
+                .is_some(),
+            "the active pane row is not removed"
+        );
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
     }
 
     /// user operator | Given a real native command whose spool committed but

@@ -9313,6 +9313,24 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn unsettled_pidless_exec_session_ids(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id FROM exec_sessions
+                 WHERE state = 'running' AND pid IS NULL AND expires_at IS NULL",
+            )
+            .map_err(|error| format!("cannot prepare pidless exec session query: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query pidless exec sessions: {error}"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|error| format!("cannot decode pidless exec session: {error}"))?);
+        }
+        Ok(ids)
+    }
+
     pub fn bound_unsettled_exec_session(
         &self,
         session_id: &str,
