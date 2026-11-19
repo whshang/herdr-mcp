@@ -940,6 +940,12 @@ mod tests {
         .unwrap();
         let manifest_path = scratch.0.join("runtime-manifest.json");
         let output = std::process::Command::new("node")
+            .env_remove("GITHUB_WORKFLOW")
+            .env_remove("GITHUB_REPOSITORY")
+            .env_remove("GITHUB_REPOSITORY_ID")
+            .env_remove("GITHUB_SHA")
+            .env_remove("GITHUB_REF")
+            .env_remove("GITHUB_REF_NAME")
             .arg(repo_root.join("scripts/build-rust-release-manifest.mjs"))
             .arg("--root")
             .arg(&repo_root)
@@ -957,6 +963,8 @@ mod tests {
             .arg("a".repeat(40))
             .arg("--source-ref")
             .arg(format!("refs/tags/{tag}"))
+            .arg("--workflow-name")
+            .arg(release_trust::RELEASE_WORKFLOW_NAME)
             .output()
             .expect("node must be available to build the release manifest");
         assert!(
