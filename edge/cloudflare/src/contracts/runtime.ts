@@ -48,12 +48,13 @@ export const RUNTIME_EXECUTION_CONTRACT = {
 /**
  * Published runtime execution contract epoch 5.
  *
- * Retained in the hello window so an epoch-5 workstation that passes the
- * `/health` contract precheck stays admitted at handshake. Note the precheck
- * itself only matches the published current/previous pair (epochs 7 and 6
- * after this bump), so a pre-upgrade v1.1.1-era Link that hard-gates on
- * epochs 5/4 at the precheck stage cannot reach hello — this entry covers
- * epoch-5 runtimes that arrive through other admission paths.
+ * Retained in the hello window for staged-deploy skew only: while this
+ * bump rolls out (or rolls back), edge PoPs may still serve a `/health`
+ * payload advertising the previous {6,5} pair, letting an epoch-5-era
+ * Link pass its precheck and then reach hello here. Once the deploy
+ * converges, `/health` advertises only the `PREVIOUS` identity (epoch 6)
+ * plus the frozen epoch-2 catalog — a v1.1.1-era Link that hard-gates on
+ * epochs 5/4 at the precheck stage can no longer reach hello.
  */
 export const EPOCH5_RUNTIME_EXECUTION_CONTRACT = {
   contract_epoch: 5,
