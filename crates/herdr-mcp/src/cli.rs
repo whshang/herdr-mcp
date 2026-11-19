@@ -345,6 +345,7 @@ pub enum AgentCommand {
         dispatch_id: String,
         kind: String,
         summary: Option<String>,
+        turn_id: Option<String>,
     },
     Status {
         task_id: String,
@@ -1261,6 +1262,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
             let mut dispatch_id = None;
             let mut kind = None;
             let mut summary = None;
+            let mut turn_id = None;
             let mut index = 1;
             while index < args.len() {
                 let value = args
@@ -1271,6 +1273,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                     "--dispatch-id" => dispatch_id = Some(value.clone()),
                     "--kind" => kind = Some(value.clone()),
                     "--summary" => summary = Some(value.clone()),
+                    "--turn-id" => turn_id = Some(value.clone()),
                     flag => return Err(format!("unknown agent report option '{flag}'")),
                 }
                 index += 2;
@@ -1301,6 +1304,7 @@ fn parse_agent(args: &[String]) -> Result<Command, String> {
                 dispatch_id: valid_id(dispatch_id, "--dispatch-id")?,
                 kind,
                 summary,
+                turn_id: turn_id.filter(|value| !value.is_empty()),
             }))
         }
         Some("status") => {
@@ -3273,7 +3277,7 @@ User path:\n\
   herdr-mcp agent gate create --task-id ID --question TEXT --option TEXT --option TEXT [--option TEXT ...]\n\
   herdr-mcp agent gate status|cancel --gate-id ID\n\
   herdr-mcp agent gate resolve --gate-id ID --resolution TEXT  (independent interactive TTY only; retype option)\n\
-  herdr-mcp agent report --task-id ID --dispatch-id ID --kind heartbeat|worker_done [--summary TEXT]  (trusted local IPC only)\n\
+  herdr-mcp agent report --task-id ID --dispatch-id ID --kind heartbeat|worker_done [--turn-id ID] [--summary TEXT]  (trusted local IPC only)\n\
   herdr-mcp memory <resume|search> ...  (bounded Work Memory access for local coding agents)\n\
   herdr-mcp webchat <endpoints|resources|inspect|create|send|dispatch-status|open|archive|archive-status|handoff> ...  (supported local WebChat control)\n\
   herdr-mcp profile check --file <profile.json>  (read-only desired-vs-actual workstation drift)\n\
@@ -3572,7 +3576,8 @@ mod tests {
                 task_id: "task".to_owned(),
                 dispatch_id: "dispatch".to_owned(),
                 kind: "worker_done".to_owned(),
-                summary: Some("done".to_owned())
+                summary: Some("done".to_owned()),
+                turn_id: None,
             })
         );
         for input in [

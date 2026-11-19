@@ -179,10 +179,14 @@ pub(crate) fn run_agent(command: AgentCommand) -> Result<ExitCode, String> {
             dispatch_id,
             kind,
             summary,
+            turn_id,
         } => {
             let mut params = json!({"task_id": task_id, "dispatch_id": dispatch_id, "kind": kind});
             if let Some(summary) = summary {
                 params["summary"] = json!(summary);
+            }
+            if let Some(turn_id) = turn_id {
+                params["turn_id"] = json!(turn_id);
             }
             print_private_result(call_private(AGENT_TASK_REPORT_METHOD, params, None)?)
         }
