@@ -1009,7 +1009,10 @@ impl ExecRegistry {
 
     pub fn read(&self, id: &str, stream: &str, offset: usize, limit: usize) -> Value {
         self.prune();
-        let Some(session) = self.session(id) else {
+        let Some(session) = self
+            .session(id)
+            .or_else(|| self.committed_spool_session(id))
+        else {
             return self.recovered_or_missing(id);
         };
         let Some(stream_filter) = parse_stream(stream) else {
@@ -1296,6 +1299,28 @@ impl ExecRegistry {
         })
     }
 
+    fn committed_spool_session(&self, id: &str) -> Option<Arc<Session>> {
+        let state = self
+            .inner
+            .recovered
+            .lock()
+            .ok()
+            .and_then(|recovered| recovered.get(id).cloned())?;
+        if !state.starts_with("settle_failed") {
+            return None;
+        }
+        let record = ClosedExecSessionRecord {
+            session_id: id.to_owned(),
+            started_at_ms: now_ms(),
+            ended_at_ms: Some(now_ms()),
+            exit_code: None,
+            signal: None,
+            expires_at_ms: Some(now_ms().saturating_add(SESSION_TTL_MS)),
+        };
+        let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
+        (!session.evidence_missing && !session.spool_corrupt).then_some(session)
+    }
+
     fn recovered_or_missing(&self, id: &str) -> Value {
         let state = self
             .inner
@@ -1329,6 +1354,19 @@ impl ExecRegistry {
                 .or_else(|| store.get_abandoned_exec_session(id).ok().flatten())
                 .or_else(|| store.get_unsettled_exec_session(id).ok().flatten())
         })?;
+        let mut record = record;
+        if record.ended_at_ms.is_none() && record.expires_at_ms.is_none() {
+            let ended_at = now_ms();
+            let expires_at = ended_at.saturating_add(SESSION_TTL_MS);
+            if let Ok(store) = self.inner.state_store.lock()
+                && store
+                    .bound_unsettled_exec_session(id, ended_at, expires_at)
+                    .unwrap_or(false)
+            {
+                record.ended_at_ms = Some(ended_at);
+                record.expires_at_ms = Some(expires_at);
+            }
+        }
         let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
         // A row whose `.spool` has not committed yet is an in-flight close, a
         // crashed write, or lost output. Do not cache the empty projection:
@@ -2253,14 +2291,21 @@ fn recover_state_store(store: &StateStore) -> Result<RecoveryResult, String> {
                     .states
                     .insert(id.clone(), "closed_before_restart".to_owned());
                 result.closed += 1;
-                store.settle_exec_session(
+                if let Err(error) = store.settle_exec_session(
                     &id,
                     "closed_before_restart",
                     Some(now),
                     None,
                     None,
                     expires_at,
-                )?;
+                ) {
+                    // The process is already gone. A locked database must not
+                    // hide a committed spool; the row stays auditable as the
+                    // pre-restart state until a later writable settle.
+                    result
+                        .states
+                        .insert(id.clone(), format!("settle_failed:{error}"));
+                }
                 continue;
             }
             if process_group != Some(pid)
@@ -4440,6 +4485,120 @@ mod tests {
         assert_eq!(booted["text"], "still-readable\n");
         assert_ne!(booted["reason"], "session_not_found");
         assert!(exec_spool_path(&path, "es_query_only").is_file());
+        let bounded = restarted
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_unsettled_exec_session("es_query_only")
+            .unwrap()
+            .expect("bounded unsettled row");
+        assert!(bounded.ended_at_ms.is_some());
+        assert!(bounded.expires_at_ms.is_some());
+        restarted
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .expire_exec_session_for_test("es_query_only", 1)
+            .unwrap();
+        restarted.prune();
+        assert!(
+            restarted
+                .inner
+                .state_store
+                .lock()
+                .unwrap()
+                .get_unsettled_exec_session("es_query_only")
+                .unwrap()
+                .is_none(),
+            "a bounded degraded row must leave after its TTL"
+        );
+        drop(restarted);
+    }
+
+    /// user operator | Given a real native command whose spool committed but
+    /// both state updates failed | When the dead process is recovered after
+    /// restart | Then the committed spool is readable and no exit code is
+    /// invented.
+    #[cfg(unix)]
+    #[test]
+    fn user_operator_reads_committed_native_spool_after_restart_state_writes_fail() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-native-restart-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        let cwd = path.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let started = registry.start(&cwd, "printf native-saved").unwrap();
+        let session_id = started["session_id"].as_str().unwrap().to_owned();
+        let mut completed = false;
+        for _ in 0..100 {
+            let view = registry.read(&session_id, "stdout", 0, 64);
+            if view["phase"] == "completed" {
+                completed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(completed, "the native command must finish before restart");
+        let native_pid = registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .exec_session_pid_for_test(&session_id)
+            .unwrap()
+            .expect("native session records a pid");
+        assert_ne!(native_pid, 0);
+        drop(registry);
+        fs::remove_dir_all(path.join("exec-spools")).unwrap();
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_exec_running("es_native_blocked", native_pid, Some(native_pid), now_ms())
+            .unwrap();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .fail_exec_state_writes_for_test();
+        let session = unpersisted_closed_session("es_native_blocked", "native-saved");
+        write_session_spool(&path, &session).unwrap();
+        let spool = fs::read(exec_spool_path(&path, "es_native_blocked")).unwrap();
+        persist_closed_evidence(&registry.inner, &session, now_ms(), Some(0), None);
+        assert!(!session.status.lock().unwrap().persist_abandoned);
+        let session_id = "es_native_blocked".to_owned();
+        drop(session);
+        drop(registry);
+
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+        let booted = restarted.read(&session_id, "stdout", 0, 64);
+        assert_eq!(booted["ok"], true, "{booted}");
+        assert_eq!(booted["text"], "native-saved");
+        assert_eq!(booted["phase"], "completed");
+        assert_ne!(
+            restarted
+                .inner
+                .recovered
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .map(String::as_str),
+            Some("closed_before_restart"),
+            "a committed spool must be readable instead of only a recovery refusal"
+        );
+        assert_eq!(
+            fs::read(exec_spool_path(&path, &session_id)).unwrap(),
+            spool
+        );
         drop(restarted);
         let _ = fs::remove_dir_all(&path);
     }

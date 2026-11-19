@@ -9221,7 +9221,8 @@ impl StateStore {
             .prepare(
                 "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
                  FROM exec_sessions
-                 WHERE session_id = ?1 AND state = 'closed'",
+                 WHERE session_id = ?1
+                   AND state = 'closed'",
             )
             .map_err(|error| format!("cannot prepare closed exec session query: {error}"))?;
         let mut rows = stmt
@@ -9282,7 +9283,62 @@ impl StateStore {
     /// A close whose settle and abandoned marker both failed. The row is still
     /// `running`, so this lookup is only a read-side fallback for a committed
     /// spool. It does not make the command replayable and does not change the
-    /// row into a live process recovery candidate.
+    /// row into a live process recovery candidate. A native row keeps its pid;
+    /// restart recovery settles that dead process before this lookup runs.
+    #[cfg(test)]
+    pub fn exec_session_pid_for_test(&self, session_id: &str) -> Result<Option<u32>, String> {
+        let pid = self
+            .conn
+            .query_row(
+                "SELECT pid FROM exec_sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|error| format!("cannot read exec session pid: {error}"))?;
+        Ok(pid.and_then(|pid| u32::try_from(pid).ok()))
+    }
+
+    #[cfg(test)]
+    pub fn expire_exec_session_for_test(
+        &self,
+        session_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE exec_sessions SET expires_at = ?2 WHERE session_id = ?1",
+                rusqlite::params![session_id, i64::try_from(expires_at_ms).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| format!("cannot expire exec session: {error}"))?;
+        Ok(())
+    }
+
+    pub fn bound_unsettled_exec_session(
+        &self,
+        session_id: &str,
+        ended_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE exec_sessions SET
+                    ended_at = COALESCE(ended_at, ?2),
+                    expires_at = COALESCE(expires_at, ?3)
+                 WHERE session_id = ?1
+                   AND state = 'running'
+                   AND pid IS NULL
+                   AND ended_at IS NULL",
+                rusqlite::params![
+                    session_id,
+                    i64::try_from(ended_at_ms).unwrap_or(i64::MAX),
+                    i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("cannot bound unsettled exec session: {error}"))?;
+        Ok(changed == 1)
+    }
+
     pub fn get_unsettled_exec_session(
         &self,
         session_id: &str,
