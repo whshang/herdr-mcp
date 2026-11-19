@@ -16231,7 +16231,12 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
             "git" => git_tools::run(snapshot, arguments),
             _ => json!({"ok": false, "code": "unknown_operation", "op": op}),
         },
-        Some(Ok(value)) => value,
+
+        Some(Ok(value)) => {
+            invalidate_git_status_after_broker_write(op, &value);
+            value
+        }
+
         Some(Err(message)) => json!({
             "ok": false,
             "code": "broker_failed",
@@ -16239,6 +16244,29 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
         }),
     };
     crate::macos_permissions::map_fs_git_result(value)
+}
+
+/// A mutating op that ran inside the broker child invalidates that child's
+/// git-status cache only — the parent's `projects` cache still holds the
+/// pre-write status (#1023 comment 6976715344 item 2). Drop the parent entry
+/// for the touched root after a broker success so the next inspect re-probes.
+/// Read ops and broker failures leave the cache untouched. The result's
+/// `root` is the caller-facing alias; `repo_identity`, when the broker
+/// validated one, lets alias keys that share a canonical repository drop
+/// together without the parent resolving a protected path itself.
+fn invalidate_git_status_after_broker_write(op: &str, value: &Value) {
+    const MUTATING_OPS: [&str; 4] = ["fs_edit", "fs_write", "fs_patch", "git"];
+    if !MUTATING_OPS.contains(&op) {
+        return;
+    }
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    for key in ["repo_identity", "root"] {
+        if let Some(path) = value.get(key).and_then(Value::as_str) {
+            crate::projects::invalidate_git_status_cache_for_path(std::path::Path::new(path));
+        }
+    }
 }
 
 fn id(request: &Value) -> Value {
@@ -17826,6 +17854,76 @@ mod tests {
 
     fn route_fs_git_map_for_test(value: Value) -> Value {
         crate::macos_permissions::map_fs_git_result(value)
+    }
+
+    /// user operator | Given a cached clean status in the parent process |
+    /// When a broker-routed fs_write succeeds in the child | Then the next
+    /// derive re-probes instead of serving the stale clean entry.
+    #[test]
+    fn user_next_inspect_after_a_broker_write_reprobes_git_status() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-broker-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": root.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+            }],
+        });
+
+        crate::projects::invalidate_git_status_cache(&root);
+        crate::projects::reset_git_status_probe_count(&root);
+        let clean = crate::projects::derive(&snapshot);
+        assert!(!clean.projects[&root].dirty);
+        assert_eq!(crate::projects::git_status_probe_count(&root), 1);
+
+        // Simulate the child having written outside the parent's process and
+        // returned success. The parent must drop its stale entry itself; the
+        // child's invalidation cannot reach this cache.
+        std::fs::write(root.join("written-by-broker.txt"), "dirty\n").unwrap();
+        invalidate_git_status_after_broker_write(
+            "fs_write",
+            &json!({"ok": true, "root": root.to_string_lossy()}),
+        );
+        let refreshed = crate::projects::derive(&snapshot);
+        let project = &refreshed.projects[&root];
+        assert!(project.dirty, "{project:?}");
+        assert_eq!(crate::projects::git_status_probe_count(&root), 2);
+
+        // Read ops and failed broker results must not churn the cache: the
+        // dirty entry survives, so the next derive is a cache hit with no
+        // new probe and no dropped evidence.
+        invalidate_git_status_after_broker_write("fs_read", &json!({"ok": true}));
+        invalidate_git_status_after_broker_write(
+            "fs_write",
+            &json!({"ok": false, "root": root.to_string_lossy()}),
+        );
+        let cached = crate::projects::derive(&snapshot);
+        assert!(cached.projects[&root].dirty);
+        assert_eq!(crate::projects::git_status_probe_count(&root), 2);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
