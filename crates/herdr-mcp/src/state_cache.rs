@@ -81,7 +81,10 @@ struct DigestInput<'a> {
 
 #[derive(Debug, Clone)]
 struct CacheState {
-    state: Value,
+    /// Shared, immutable snapshot of the full topology. Writers mutate through
+    /// [`CacheState::state_mut`], which clones once when a reader still holds
+    /// the previous `Arc`, so an in-flight tool never observes a torn tree.
+    state: Arc<Value>,
     digest_history: VecDeque<Value>,
     digest_cursor: u64,
     last_activity_by_pane: HashMap<String, String>,
@@ -94,7 +97,7 @@ struct CacheState {
 impl Default for CacheState {
     fn default() -> Self {
         Self {
-            state: json!({}),
+            state: Arc::new(json!({})),
             digest_history: VecDeque::with_capacity(DIGEST_HISTORY_MAX),
             digest_cursor: 0,
             last_activity_by_pane: HashMap::new(),
@@ -107,8 +110,14 @@ impl Default for CacheState {
 }
 
 impl CacheState {
+    /// Copy-on-write access: mutates in place when this cache is the only
+    /// holder, and clones the tree once when a snapshot `Arc` is still alive.
+    fn state_mut(&mut self) -> &mut Value {
+        Arc::make_mut(&mut self.state)
+    }
+
     fn bootstrap(&mut self, state: Value) {
-        self.state = if state.is_object() { state } else { json!({}) };
+        self.state = Arc::new(if state.is_object() { state } else { json!({}) });
         self.live_workspace_ids = array(&self.state, "workspaces")
             .iter()
             .filter_map(workspace_id)
@@ -246,7 +255,7 @@ impl CacheState {
             && let Some(pane_id) = pane.get("pane_id").and_then(Value::as_str)
         {
             upsert(
-                &mut self.state,
+                self.state_mut(),
                 "panes",
                 "pane_id",
                 pane_id,
@@ -294,7 +303,7 @@ impl CacheState {
                 self.last_activity_by_pane
                     .insert(pane_id.clone(), at.clone());
                 upsert(
-                    &mut self.state,
+                    self.state_mut(),
                     "panes",
                     "pane_id",
                     &pane_id,
@@ -320,14 +329,14 @@ impl CacheState {
                         agent.insert("cwd".to_owned(), cwd);
                     }
                     upsert(
-                        &mut self.state,
+                        self.state_mut(),
                         "agents",
                         "pane_id",
                         &pane_id,
                         Value::Object(agent),
                     );
                 } else {
-                    remove_by_id(&mut self.state, "agents", "pane_id", &pane_id);
+                    remove_by_id(self.state_mut(), "agents", "pane_id", &pane_id);
                 }
             }
         } else if kind.starts_with("pane_")
@@ -347,7 +356,7 @@ impl CacheState {
                 .map(str::to_owned)
             {
                 upsert(
-                    &mut self.state,
+                    self.state_mut(),
                     "workspaces",
                     "workspace_id",
                     &workspace_id,
@@ -361,10 +370,10 @@ impl CacheState {
         if let Some(tab) = tab {
             if let Some(tab_id) = tab.get("tab_id").and_then(Value::as_str).map(str::to_owned) {
                 if kind == "tab_closed" {
-                    remove_by_id(&mut self.state, "tabs", "tab_id", &tab_id);
+                    remove_by_id(self.state_mut(), "tabs", "tab_id", &tab_id);
                 } else {
                     upsert(
-                        &mut self.state,
+                        self.state_mut(),
                         "tabs",
                         "tab_id",
                         &tab_id,
@@ -374,7 +383,7 @@ impl CacheState {
             }
         } else if kind == "tab_closed" {
             if let Some(tab_id) = data.get("tab_id").and_then(Value::as_str) {
-                remove_by_id(&mut self.state, "tabs", "tab_id", tab_id);
+                remove_by_id(self.state_mut(), "tabs", "tab_id", tab_id);
             }
         } else if kind.starts_with("tab_") && kind != "tab_focused" {
             self.needs_reconcile = true;
@@ -383,12 +392,16 @@ impl CacheState {
         match kind.as_str() {
             "workspace_focused" => {
                 if let Some(workspace_id) = resolved_workspace_id {
-                    set_field(&mut self.state, "focused_workspace_id", json!(workspace_id));
+                    set_field(
+                        self.state_mut(),
+                        "focused_workspace_id",
+                        json!(workspace_id),
+                    );
                 }
             }
             "pane_focused" => {
                 if let Some(pane_id) = pane_id {
-                    set_field(&mut self.state, "focused_pane_id", json!(pane_id));
+                    set_field(self.state_mut(), "focused_pane_id", json!(pane_id));
                 }
             }
             "tab_focused" => {
@@ -398,7 +411,7 @@ impl CacheState {
                         .and_then(Value::as_str)
                 });
                 if let Some(tab_id) = tab_id {
-                    set_field(&mut self.state, "focused_tab_id", json!(tab_id));
+                    set_field(self.state_mut(), "focused_tab_id", json!(tab_id));
                 }
             }
             _ => {}
@@ -448,21 +461,21 @@ impl CacheState {
     }
 
     fn remove_pane(&mut self, pane_id: &str) {
-        remove_by_id(&mut self.state, "panes", "pane_id", pane_id);
-        remove_by_id(&mut self.state, "agents", "pane_id", pane_id);
+        remove_by_id(self.state_mut(), "panes", "pane_id", pane_id);
+        remove_by_id(self.state_mut(), "agents", "pane_id", pane_id);
         self.last_activity_by_pane.remove(pane_id);
     }
 
     fn remove_workspace(&mut self, workspace_id: &str) {
         self.live_workspace_ids.remove(workspace_id);
-        remove_by_id(&mut self.state, "workspaces", "workspace_id", workspace_id);
-        remove_where(&mut self.state, "panes", |value| {
+        remove_by_id(self.state_mut(), "workspaces", "workspace_id", workspace_id);
+        remove_where(self.state_mut(), "panes", |value| {
             value.get("workspace_id").and_then(Value::as_str) == Some(workspace_id)
         });
-        remove_where(&mut self.state, "agents", |value| {
+        remove_where(self.state_mut(), "agents", |value| {
             value.get("workspace_id").and_then(Value::as_str) == Some(workspace_id)
         });
-        remove_where(&mut self.state, "tabs", |value| {
+        remove_where(self.state_mut(), "tabs", |value| {
             value.get("workspace_id").and_then(Value::as_str) == Some(workspace_id)
         });
         let live_panes = array(&self.state, "panes")
@@ -927,17 +940,27 @@ impl EventCache {
             .unwrap_or(0)
     }
 
-    pub fn snapshot(&self) -> Value {
+    /// Zero-copy snapshot: clone the `Arc` instead of the whole topology tree.
+    /// The returned value is immutable for as long as it is held; writers go
+    /// through `Arc::make_mut`, so they clone once instead of mutating a tree a
+    /// reader still observes.
+    pub fn snapshot_arc(&self) -> Arc<Value> {
         self.shared
             .state
             .read()
-            .map(|state| state.state.clone())
-            .unwrap_or_else(|_| json!({}))
+            .map(|state| Arc::clone(&state.state))
+            .unwrap_or_else(|_| Arc::new(json!({})))
+    }
+
+    /// Compatibility wrapper: callers that need an owned `Value` still get the
+    /// same deep tree as before, at the cost of one clone.
+    pub fn snapshot(&self) -> Value {
+        Arc::unwrap_or_clone(self.snapshot_arc())
     }
 
     /// Return a live event-backed snapshot only while the cache is ready,
     /// subscribed, and not waiting for a reconciliation refresh.
-    pub fn fresh_snapshot(&self) -> Option<Value> {
+    pub fn fresh_snapshot_arc(&self) -> Option<Arc<Value>> {
         if !self.shared.stream_live.load(Ordering::Acquire) {
             return None;
         }
@@ -948,7 +971,11 @@ impl EventCache {
             .state
             .read()
             .ok()
-            .and_then(|state| (!state.needs_reconcile).then(|| state.state.clone()))
+            .and_then(|state| (!state.needs_reconcile).then(|| Arc::clone(&state.state)))
+    }
+
+    pub fn fresh_snapshot(&self) -> Option<Value> {
+        self.fresh_snapshot_arc().map(Arc::unwrap_or_clone)
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -1549,6 +1576,57 @@ mod tests {
 
         publish_cursor(&cache.shared);
         assert!(!receiver.has_changed().unwrap());
+    }
+
+    /// user keeps a consistent snapshot | Given a reader holding an `Arc`
+    /// snapshot taken before an event | When the cache applies an event that
+    /// mutates the same pane and topology | Then the held snapshot is unchanged
+    /// (no shared-tree mutation) and a fresh snapshot shows the new state.
+    #[test]
+    fn held_snapshot_is_not_mutated_by_a_later_apply_event() {
+        let cache = EventCache::from_snapshot_for_test(fixture());
+        let held = cache.snapshot_arc();
+        let before = held.as_ref().clone();
+
+        cache.shared.state.write().unwrap().apply_event(
+            json!({
+                "event": "pane_updated",
+                "type": "pane_updated",
+                "pane": {
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                    "cwd": "/tmp/demo",
+                    "agent_status": "working",
+                    "state_change_seq": 42
+                }
+            }),
+            "2026-08-25T05:00:00Z".to_owned(),
+        );
+        // A second event mutates a different section, covering add/remove paths.
+        cache.shared.state.write().unwrap().apply_event(
+            json!({
+                "event": "workspace_updated",
+                "type": "workspace_updated",
+                "workspace": {
+                    "workspace_id": "w1",
+                    "label": "renamed-after-snapshot",
+                    "state_change_seq": 43
+                }
+            }),
+            "2026-08-25T05:00:01Z".to_owned(),
+        );
+
+        assert_eq!(
+            held.as_ref(),
+            &before,
+            "a snapshot held by an in-flight tool must never be mutated in place"
+        );
+        let fresh = cache.snapshot_arc();
+        assert_ne!(fresh.as_ref(), &before, "a fresh snapshot sees the events");
+        assert!(
+            !std::sync::Arc::ptr_eq(&held, &fresh),
+            "the writer must have produced a new allocation after copy-on-write"
+        );
     }
 
     #[test]
