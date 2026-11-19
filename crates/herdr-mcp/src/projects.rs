@@ -26,9 +26,13 @@ thread_local! {
     static CACHE_CLOCK_OFFSET_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
-/// The caches' shared clock. Tests shift their own thread's offset forward
-/// instead of sleeping so TTL expiry is deterministic and cannot flake on a
-/// busy runner. Shared by the git-status, routing-topology, and
+/// The caches' shared logical clock, used ONLY for read-side freshness
+/// checks: `entry.expires_at > cache_now()`. Tests shift their own thread's
+/// offset forward instead of sleeping so TTL expiry is deterministic.
+/// Stored deadlines and eviction sweeps use the real `Instant::now()` —
+/// entries are comparable across threads that way, so a test whose clock is
+/// far ahead can never sweep entries another test just wrote into the
+/// shared maps. Shared by the git-status, routing-topology, and
 /// validated-roots caches.
 pub(crate) fn cache_now() -> Instant {
     #[cfg(test)]
@@ -249,6 +253,36 @@ struct RoutingCacheEntry {
     topology: Arc<ProjectTopology>,
 }
 
+/// Entries that carry an expiry so [`routing_cache_insert_bounded`] can
+/// evict them. Implemented by the topology and validated-roots caches.
+pub(crate) trait TimedCacheEntry {
+    fn expires_at(&self) -> Instant;
+}
+
+impl TimedCacheEntry for RoutingCacheEntry {
+    fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+}
+
+/// Bounded insert shared by the routing caches: evict expired entries
+/// first, then apply the full-cap flush, so accumulated stale fingerprints
+/// cannot wipe entries that are still live for other callers. The sweep
+/// compares real deadlines (`Instant::now()`), never the test-shifted
+/// logical clock — see [`cache_now`].
+pub(crate) fn routing_cache_insert_bounded<K, V>(map: &mut HashMap<K, V>, key: K, value: V)
+where
+    K: Eq + std::hash::Hash,
+    V: TimedCacheEntry,
+{
+    let now = Instant::now();
+    map.retain(|_, entry| entry.expires_at() > now);
+    if map.len() >= ROUTING_CACHE_CAP {
+        map.clear();
+    }
+    map.insert(key, value);
+}
+
 static ROUTING_TOPOLOGY_CACHE: OnceLock<Mutex<HashMap<RoutingFingerprint, RoutingCacheEntry>>> =
     OnceLock::new();
 
@@ -292,17 +326,14 @@ pub fn derive_routing_cached(snapshot: &Value) -> Arc<ProjectTopology> {
     {
         return Arc::clone(&entry.topology);
     }
-    // Evict only expired entries before considering a full-cap flush, so
-    // accumulated historical fingerprints cannot wipe entries that are
-    // still live for other callers.
-    guard.retain(|_, entry| entry.expires_at > now);
-    if guard.len() >= ROUTING_CACHE_CAP {
-        guard.clear();
-    }
-    guard.insert(
+    // Deadlines are stored on the real clock so entries stay comparable
+    // across threads (see `cache_now`); the read-side checks above use the
+    // logical clock so tests can force a miss by advancing it.
+    routing_cache_insert_bounded(
+        &mut guard,
         fingerprint,
         RoutingCacheEntry {
-            expires_at: now + ROUTING_CACHE_TTL,
+            expires_at: Instant::now() + ROUTING_CACHE_TTL,
             topology: Arc::clone(&topology),
         },
     );
@@ -625,9 +656,11 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             .invalidated
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let now = cache_now();
-            // Evict expired entries for other roots opportunistically so the
-            // map stays bounded by live roots rather than every root seen.
+            // Deadlines are stored on the real clock so entries stay
+            // comparable across threads (see `cache_now`); evict expired
+            // entries opportunistically so the map stays bounded by live
+            // roots rather than every root seen.
+            let now = Instant::now();
             state.entries.retain(|_, entry| entry.expires_at > now);
             let expires_at = now + GIT_STATUS_CACHE_TTL;
             state.entries.insert(
@@ -884,12 +917,21 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static NEXT_TEMP_DIR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
+        // Timestamp alone collides at microsecond-granularity clocks when
+        // two calls land in the same tick; the atomic sequence + pid keep
+        // every call unique regardless of clock granularity.
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-mcp-projects-{unique}"))
+        let sequence = NEXT_TEMP_DIR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "herdr-mcp-projects-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1116,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_entries_are_evicted_on_the_next_probe() {
+    fn stale_entries_are_reprobed_instead_of_reused() {
         let root_a = temp_dir();
         let root_b = temp_dir();
         for root in [&root_a, &root_b] {
@@ -1139,10 +1181,11 @@ mod tests {
         advance_cache_clock(GIT_STATUS_CACHE_TTL + Duration::from_millis(1));
         derive(&snapshot_b);
         assert_eq!(git_status_probe_count(&root_b), 2);
-        assert!(
-            !git_status_cache_has(&root_a),
-            "the stale A entry must be swept by B's publish"
-        );
+        // A's entry is equally stale: its next read re-probes rather than
+        // reusing the cached value. (The publish sweep itself is internal
+        // memory hygiene; the externally visible contract is the re-probe.)
+        derive(&snapshot_a);
+        assert_eq!(git_status_probe_count(&root_a), 2);
         assert!(git_status_cache_has(&root_b));
         fs::remove_dir_all(root_a).unwrap();
         fs::remove_dir_all(root_b).unwrap();
@@ -1352,52 +1395,82 @@ mod tests {
     }
 
     #[test]
-    fn derive_routing_cached_retains_fresh_entries_when_cap_is_full() {
-        let root = temp_dir();
-        fs::create_dir_all(&root).unwrap();
-        let snapshot = json!({
-            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
-            "agents": []
-        });
+    fn bounded_insert_evicts_expired_before_cap_flush() {
+        // Private map + probe entries: the flush semantics are pinned
+        // without touching the shared caches, so parallel tests writing
+        // fresh entries cannot interfere.
+        struct ProbeEntry {
+            expires_at: Instant,
+            payload: Arc<()>,
+        }
+        impl TimedCacheEntry for ProbeEntry {
+            fn expires_at(&self) -> Instant {
+                self.expires_at
+            }
+        }
 
-        let live = derive_routing_cached(&snapshot);
-        // Fill the map past capacity with already-expired fingerprints.
-        let mut guard = ROUTING_TOPOLOGY_CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for index in 0..(ROUTING_CACHE_CAP + 8) {
-            let stale_fingerprint = RoutingFingerprint {
-                workspaces: Vec::new(),
-                pane_workspaces: vec![(format!("w{index}"), format!("w{index}"))],
-                pane_cwds: Vec::new(),
-            };
-            guard.insert(
-                stale_fingerprint,
-                RoutingCacheEntry {
-                    expires_at: Instant::now(),
-                    topology: Arc::clone(&live),
+        let now = Instant::now();
+        let live_expiry = now + Duration::from_secs(60);
+        let mut map: HashMap<u32, ProbeEntry> = HashMap::new();
+        let live_payload = Arc::new(());
+        map.insert(
+            0,
+            ProbeEntry {
+                expires_at: live_expiry,
+                payload: Arc::clone(&live_payload),
+            },
+        );
+        for index in 1..=(ROUTING_CACHE_CAP + 8) {
+            map.insert(
+                index as u32,
+                ProbeEntry {
+                    expires_at: now,
+                    payload: Arc::new(()),
                 },
             );
         }
-        drop(guard);
 
-        // A miss must evict expired entries first; the live one survives and
-        // still serves the same Arc instead of being flushed with the cap.
-        let other = temp_dir();
-        fs::create_dir_all(&other).unwrap();
-        let other_snapshot = json!({
-            "panes": [{"pane_id": "w1:p9", "workspace_id": "w1", "cwd": other}],
-            "agents": []
-        });
-        derive_routing_cached(&other_snapshot);
-        let still = derive_routing_cached(&snapshot);
+        routing_cache_insert_bounded(
+            &mut map,
+            u32::MAX,
+            ProbeEntry {
+                expires_at: live_expiry,
+                payload: Arc::new(()),
+            },
+        );
+        assert_eq!(
+            map.len(),
+            2,
+            "expired backfill must be evicted, not flushed"
+        );
         assert!(
-            Arc::ptr_eq(&live, &still),
-            "expired backfill must not flush still-live entries"
+            Arc::ptr_eq(&live_payload, &map.get(&0).unwrap().payload),
+            "still-live entries survive an expired-only overflow"
         );
 
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(other).unwrap();
+        // A map that is genuinely full of fresh entries still flushes.
+        map.clear();
+        for index in 0..ROUTING_CACHE_CAP {
+            map.insert(
+                index as u32,
+                ProbeEntry {
+                    expires_at: live_expiry,
+                    payload: Arc::new(()),
+                },
+            );
+        }
+        routing_cache_insert_bounded(
+            &mut map,
+            u32::MAX,
+            ProbeEntry {
+                expires_at: live_expiry,
+                payload: Arc::new(()),
+            },
+        );
+        assert_eq!(
+            map.len(),
+            1,
+            "full-cap flush still applies when nothing expired"
+        );
     }
 }

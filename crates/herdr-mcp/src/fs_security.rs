@@ -391,6 +391,12 @@ struct ValidatedRootsCacheEntry {
     roots: Arc<Vec<PathBuf>>,
 }
 
+impl projects::TimedCacheEntry for ValidatedRootsCacheEntry {
+    fn expires_at(&self) -> std::time::Instant {
+        self.expires_at
+    }
+}
+
 static VALIDATED_ROOTS_CACHE: std::sync::OnceLock<
     Mutex<std::collections::HashMap<projects::RoutingFingerprint, ValidatedRootsCacheEntry>>,
 > = std::sync::OnceLock::new();
@@ -432,17 +438,13 @@ fn validated_roots_cached(snapshot: &Value) -> Arc<Vec<PathBuf>> {
     {
         return Arc::clone(&entry.roots);
     }
-    // Evict only expired entries before considering a full-cap flush, so
-    // accumulated historical fingerprints cannot wipe entries that are
-    // still live for other callers.
-    guard.retain(|_, entry| entry.expires_at > now);
-    if guard.len() >= projects::ROUTING_CACHE_CAP {
-        guard.clear();
-    }
-    guard.insert(
+    // Deadlines are stored on the real clock so entries stay comparable
+    // across threads (see `projects::cache_now`).
+    projects::routing_cache_insert_bounded(
+        &mut guard,
         fingerprint,
         ValidatedRootsCacheEntry {
-            expires_at: now + projects::ROUTING_CACHE_TTL,
+            expires_at: std::time::Instant::now() + projects::ROUTING_CACHE_TTL,
             roots: Arc::clone(&roots),
         },
     );
