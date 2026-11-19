@@ -226,7 +226,19 @@ pub fn read(registry: &ExecRegistry, args: &Value) -> Value {
 
 const EXEC_WAIT_DEFAULT_TIMEOUT_MS: usize = 10_000;
 const EXEC_WAIT_MAX_TIMEOUT_MS: usize = 20_000;
-const EXEC_WAIT_POLL_MS: u64 = 200;
+/// Front-loaded micro-backoff for `exec.wait` polling: sessions that finish
+/// within the first few hundred milliseconds surface on the early steps
+/// instead of always paying the fixed 200ms poll, while long-running sessions
+/// settle at the same 5 Hz steady-state cadence as before.
+const EXEC_WAIT_POLL_BACKOFF_MS: [u64; 5] = [10, 20, 50, 100, 200];
+
+/// Sleep duration for the Nth `exec.wait` poll (0-based). The caller still
+/// truncates it to the remaining timeout, so timeout semantics are unchanged.
+fn exec_wait_poll_delay(attempt: usize) -> Duration {
+    Duration::from_millis(
+        EXEC_WAIT_POLL_BACKOFF_MS[attempt.min(EXEC_WAIT_POLL_BACKOFF_MS.len() - 1)],
+    )
+}
 
 pub fn wait(registry: &ExecRegistry, args: &Value) -> Value {
     let id = match required_str(args, "session_id") {
@@ -251,6 +263,7 @@ pub fn wait(registry: &ExecRegistry, args: &Value) -> Value {
     };
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms as u64);
+    let mut attempt = 0usize;
 
     loop {
         let mut view = registry.read(id, stream, offset, limit);
@@ -263,7 +276,8 @@ pub fn wait(registry: &ExecRegistry, args: &Value) -> Value {
             annotate_wait(&mut view, elapsed, true);
             return view;
         }
-        thread::sleep(Duration::from_millis(EXEC_WAIT_POLL_MS).min(timeout - elapsed));
+        thread::sleep(exec_wait_poll_delay(attempt).min(timeout - elapsed));
+        attempt = attempt.saturating_add(1);
     }
 }
 
@@ -343,7 +357,10 @@ fn invalid(message: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{StartInvocation, resolve_start_invocation, start, wait, wait_view_ready};
+    use super::{
+        StartInvocation, exec_wait_poll_delay, resolve_start_invocation, start, wait,
+        wait_view_ready,
+    };
     use crate::exec_sessions::ExecRegistry;
     use crate::herdr::HerdrClient;
     use serde_json::json;
@@ -467,6 +484,51 @@ mod tests {
                 "invalid_params"
             );
         }
+    }
+
+    #[test]
+    fn exec_wait_poll_backoff_ramps_then_caps_at_200ms() {
+        use std::time::Duration;
+        let steps: Vec<Duration> = (0..8).map(exec_wait_poll_delay).collect();
+        assert_eq!(
+            steps,
+            [
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+                Duration::from_millis(200),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_wait_catches_short_session_well_before_200ms() {
+        let registry = registry("wait-backoff");
+        let started = start(
+            &HerdrClient::new(PathBuf::from("/nonexistent-herdr.sock")),
+            &json!({"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/tmp"}], "agents": []}),
+            &registry,
+            &json!({"root": "/tmp", "command": "sleep 0.05; printf done"}),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        let session_id = started["session_id"].as_str().unwrap().to_owned();
+
+        let view = wait(
+            &registry,
+            &json!({"session_id": session_id, "timeout_ms": 10_000}),
+        );
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["wait_timed_out"], false);
+        // With the fixed 200ms poll this session would always pay ~200ms of
+        // dead time; the backoff ladder must land it well under that bound.
+        assert!(
+            view["waited_ms"].as_u64().unwrap() < 190,
+            "wait should catch the short session early: {view}"
+        );
     }
 
     #[test]
