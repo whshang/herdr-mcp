@@ -2048,6 +2048,78 @@ fn read_stream_reply(reader: &std::fs::File, timeout: Duration) -> Result<Option
     }
 }
 
+/// Write one request frame with a deadline shared with the reply read. The
+/// frame can reach MAX_REQUEST_BYTES (8 MiB), far beyond the pipe buffer: a
+/// worker that keeps its read end open but stops draining would otherwise pin
+/// the calling thread in `write_all` forever, never run the timeout, kill or
+/// slot-return path, and exhaust all STREAM_POOL_MAX_WORKERS leases behind
+/// `ready` (P1, review 7003833175). The fd is switched to `O_NONBLOCK` here —
+/// the flag lives on the open file description and persists for later
+/// requests on the same worker — and `poll(POLLOUT)` bounds every partial
+/// write. EINTR and WouldBlock retry against the recomputed remaining
+/// deadline; any other failure or an exhausted deadline is a dead worker.
+#[cfg(target_os = "macos")]
+fn write_stream_request(
+    writer: &std::fs::File,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    let fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!(
+            "stream stdin nonblocking setup failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("stream request write deadline exceeded".to_owned());
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("stream request poll failed: {error}"));
+        }
+        if ready == 0 {
+            return Err("stream request write deadline exceeded".to_owned());
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err("stream worker stdin closed".to_owned());
+        }
+        let count =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return Err(format!("stream request write failed: {error}"));
+        }
+        if count == 0 {
+            return Err("stream worker stdin closed".to_owned());
+        }
+        written += count as usize;
+    }
+    Ok(())
+}
+
 /// One resident broker worker process and its pipes.
 #[cfg(target_os = "macos")]
 struct StreamWorker {
@@ -2386,14 +2458,18 @@ impl PoolLease {
         if bytes.len() > MAX_REQUEST_BYTES {
             return Err(format!("broker request exceeds {MAX_REQUEST_BYTES} bytes"));
         }
-        if worker.stdin.write_all(&bytes).is_err()
-            || worker.stdin.write_all(b"\n").is_err()
-            || worker.stdin.flush().is_err()
-        {
+        // One deadline covers the write AND the reply: a stuck read end used
+        // to pin this thread in write_all forever with no kill and no slot
+        // return (P1, review 7003833175).
+        let deadline = std::time::Instant::now() + self.pool.request_timeout;
+        let mut payload = bytes;
+        payload.push(b'\n');
+        if let Err(error) = write_stream_request(&worker.stdin, &payload, deadline) {
             worker.kill();
-            return Err("broker stream worker write failed".to_owned());
+            return Err(format!("broker stream worker write failed: {error}"));
         }
-        match read_stream_reply(&worker.stdout, self.pool.request_timeout) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match read_stream_reply(&worker.stdout, remaining) {
             Ok(Some(line)) => {
                 let reply: Value = serde_json::from_slice(&line).map_err(|error| {
                     worker.kill();
@@ -3343,6 +3419,80 @@ mod tests {
         let state = pool.state.lock().unwrap();
         assert_eq!(state.live, 1);
         assert_eq!(state.idle.len(), 1, "returned worker rejoins idle");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_request_write_deadline_kills_stuck_worker_and_frees_slot() {
+        // A worker that keeps its read end open but stops draining must not
+        // pin the caller in an unbounded write_all: the request frame (up to
+        // MAX_REQUEST_BYTES) far exceeds the pipe buffer, so the write must
+        // hit the shared deadline, kill the worker, and return its pool slot
+        // (P1, review 7003833175).
+        let (stdin_read, stdin_write) = stream_pipe_pair().unwrap();
+        let (stdout_read, _stdout_write) = stream_pipe_pair().unwrap();
+        // Fill the pipe buffer so the request write cannot complete: the read
+        // end stays open (worker alive but wedged), matching the review's
+        // reproduction.
+        unsafe {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&stdin_write);
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let filler = vec![b'x'; 1 << 20];
+        let mut filled = 0;
+        loop {
+            let count = unsafe {
+                libc::write(
+                    std::os::fd::AsRawFd::as_raw_fd(&stdin_write),
+                    filler.as_ptr().cast(),
+                    filler.len(),
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+            filled += count as usize;
+        }
+        assert!(filled > 0, "pipe buffer must be full before the request");
+        let worker = StreamWorker {
+            // Nonexistent pid: kill/terminate fails fast and never touches a
+            // real process.
+            pid: i32::MAX - 8,
+            stdin: stdin_write,
+            stdout: stdout_read,
+            _registration: crate::child_process::register_owned_pid("test", 0),
+            last_used: std::time::Instant::now(),
+            fingerprint: 0,
+            next_seq: 0,
+            healthy: true,
+        };
+        let mut pool = StreamPool::new(Path::new("/bin/cat"), None);
+        pool.request_timeout = Duration::from_millis(200);
+        let pool = std::sync::Arc::new(pool);
+        {
+            let mut state = pool.state.lock().unwrap();
+            state.live = 1;
+        }
+        let mut lease = PoolLease {
+            pool: pool.clone(),
+            worker: Some(worker),
+        };
+        let start = std::time::Instant::now();
+        let result = lease.request("exec", &json!({}), &json!({"text": "x".repeat(1 << 20)}));
+        assert!(result.is_err(), "a wedged worker must fail the request");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "write must return bounded by the shared deadline: {:?}",
+            start.elapsed()
+        );
+        drop(lease);
+        drop(stdin_read);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(
+            state.live, 0,
+            "the killed worker's concurrency slot must be freed"
+        );
     }
 
     #[test]
