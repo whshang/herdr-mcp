@@ -75,13 +75,32 @@ pub fn is_operational_root(topology: &ProjectTopology, root: &Path) -> bool {
 /// Deterministic fail-closed guard for mutations whose safety depends on
 /// Git-dirty confirmation. Returns the error value when `root` is an
 /// operational root, otherwise `None`.
+///
+/// The topology may be a cached projection, so a root classified Git-backed
+/// is re-verified at this write boundary: if its `.git` marker (a directory
+/// for a plain clone, a file for a linked worktree) has been removed or
+/// renamed inside the cache TTL, the root is effectively vcs-less and the
+/// mutation is refused instead of trusting the stale classification.
 pub fn reject_operational_root_mutation(topology: &ProjectTopology, root: &Path) -> Option<Value> {
-    is_operational_root(topology, root).then(|| {
-        json!({
+    if is_operational_root(topology, root) {
+        return Some(json!({
             "ok": false,
             "reason": "operational_root_mutation_unsupported",
             "root": root.to_string_lossy(),
             "hint": "this vcs-less operational root has no Git dirty state to confirm against; write inside a Git-backed project root, or restrict this change to reading it",
+        }));
+    }
+    let git_backed = topology
+        .projects
+        .get(root)
+        .and_then(root_kind_of)
+        .is_some_and(|(git_root, kind)| kind == RootKind::Git && !git_root.join(".git").exists());
+    git_backed.then(|| {
+        json!({
+            "ok": false,
+            "reason": "git_root_vcs_disappeared",
+            "root": root.to_string_lossy(),
+            "hint": "this root was Git-managed when the routing topology was derived but .git is no longer present; write confirmation cannot be trusted — retry after refreshing herdr_inspect",
         })
     })
 }
@@ -1313,6 +1332,28 @@ mod tests {
         assert_eq!(denied["ok"], false);
         assert_eq!(denied["reason"], "operational_root_mutation_unsupported");
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn git_root_whose_vcs_marker_vanished_fails_closed_at_the_write_boundary() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        assert!(reject_operational_root_mutation(&topology, &root).is_none());
+
+        // Simulates `.git` being removed/renamed inside the routing-cache
+        // TTL: the topology still says Git, but the write boundary must not
+        // trust the stale classification.
+        fs::rename(root.join(".git"), root.join(".git-moved")).unwrap();
+        let denied = reject_operational_root_mutation(&topology, &root)
+            .expect("a Git root whose .git disappeared must fail closed");
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["reason"], "git_root_vcs_disappeared");
+
+        // A linked-worktree style .git file also counts as a VCS marker.
+        fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(reject_operational_root_mutation(&topology, &root).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
