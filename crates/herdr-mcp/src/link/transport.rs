@@ -159,6 +159,139 @@ fn oversized_outbound_validation_code(code: &str) -> bool {
     )
 }
 
+/// Bulk-payload string fields eligible for transport degradation. Identity
+/// fields (`session_id`, `request_id`, `path`, `command`, codes) are never
+/// touched so the caller keeps the session resumption token and can page
+/// the remainder through the durable read path instead of receiving an
+/// unretryable `response_too_large`.
+const DEGRADABLE_PAYLOAD_FIELDS: [&str; 5] =
+    ["output", "partial_output", "content", "text", "diff"];
+
+#[derive(Clone)]
+enum PathSeg {
+    Key(String),
+    Index(usize),
+}
+
+fn find_largest_payload(
+    value: &Value,
+    path: &mut Vec<PathSeg>,
+    best: &mut Option<Vec<PathSeg>>,
+    best_len: &mut usize,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                match item {
+                    Value::String(text)
+                        if DEGRADABLE_PAYLOAD_FIELDS.contains(&key.as_str())
+                            && text.len() > *best_len =>
+                    {
+                        *best_len = text.len();
+                        let mut candidate = path.clone();
+                        candidate.push(PathSeg::Key(key.clone()));
+                        *best = Some(candidate);
+                    }
+                    Value::Object(_) | Value::Array(_) => {
+                        path.push(PathSeg::Key(key.clone()));
+                        find_largest_payload(item, path, best, best_len);
+                        path.pop();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(index));
+                find_largest_payload(item, path, best, best_len);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Halve the largest degradable payload field inside `payload` on a UTF-8
+/// boundary and mark the owning object `truncated` (+ `bytes_total` hint
+/// when absent). Returns false when nothing shrinkable remains.
+fn truncate_largest_payload(payload: &mut Value) -> bool {
+    let mut best: Option<Vec<PathSeg>> = None;
+    // 256-byte floor: small strings are never bulk output, and shrinking a
+    // field yields at most a few bytes per round below this — the compact
+    // error is the better answer there.
+    let mut best_len = 256usize;
+    find_largest_payload(payload, &mut Vec::new(), &mut best, &mut best_len);
+    let Some(target) = best else {
+        return false;
+    };
+    let (last, parents) = match target.split_last() {
+        Some((PathSeg::Key(key), parents)) => (key, parents),
+        _ => return false,
+    };
+    let mut node = payload;
+    for seg in parents {
+        node = match seg {
+            PathSeg::Key(key) => match node.get_mut(key) {
+                Some(child) => child,
+                None => return false,
+            },
+            PathSeg::Index(index) => match node.get_mut(index) {
+                Some(child) => child,
+                None => return false,
+            },
+        };
+    }
+    let Some(object) = node.as_object_mut() else {
+        return false;
+    };
+    let total = match object.get(last).and_then(Value::as_str) {
+        Some(text) => text.len(),
+        None => return false,
+    };
+    let Some(Value::String(field)) = object.get_mut(last) else {
+        return false;
+    };
+    let mut cut = field.len() / 2;
+    while !field.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    field.truncate(cut);
+    object.insert("truncated".to_owned(), Value::Bool(true));
+    if !object.contains_key("bytes_total") {
+        object.insert("bytes_total".to_owned(), Value::from(total as u64));
+    }
+    true
+}
+
+/// Re-encode `message` after degrading its largest bulk-payload fields until
+/// the frame fits `options`' budget. Returns the encoded frame, or `None`
+/// when degradation cannot make it fit (caller falls back to the compact
+/// correlated error).
+fn encode_tool_result_degraded(
+    message: &RelayMessage,
+    options: &RelayValidationOptions,
+) -> Option<String> {
+    let RelayMessage::ToolResult(result) = message else {
+        return None;
+    };
+    let mut result = result.clone();
+    for _ in 0..16 {
+        let candidate = RelayMessage::ToolResult(result.clone());
+        match encode_relay_message(&candidate, Some(options)) {
+            Ok(frame) => return Some(frame),
+            Err(error) if oversized_outbound_validation_code(error.code.as_str()) => {
+                let payload = result.result.as_mut()?;
+                if !truncate_largest_payload(payload) {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkTransportCore {
     workstation_id: String,
@@ -562,6 +695,16 @@ impl LinkTransportCore {
         let frame = match encode_relay_message(&message, Some(&self.validation_options())) {
             Ok(frame) => frame,
             Err(error) if oversized_outbound_validation_code(error.code.as_str()) => {
+                // Degrade first: a bulk result whose payload exceeds the
+                // frame budget (e.g. exec `max_output_bytes` up to 4 MiB, or
+                // a large `reads[]` batch) keeps `session_id` and friends by
+                // truncating payload fields rather than falling back to an
+                // unretryable `response_too_large` that drops the session.
+                if let Some(frame) =
+                    encode_tool_result_degraded(&message, &self.validation_options())
+                {
+                    return Ok(vec![TransportAction::SendFrame { attempt_id, frame }]);
+                }
                 let compact = match &message {
                     RelayMessage::ToolResult(result) => {
                         let runtime_generation = match &result.runtime_generation {
@@ -725,7 +868,7 @@ mod tests {
         ToolResultMessage,
     };
     use crate::relay::wire::{build_hello_message, decode_relay_frame, encode_relay_message};
-    use serde_json::{Number, json};
+    use serde_json::{Number, Value, json};
 
     fn runtime() -> RuntimeContractInfo {
         RuntimeContractInfo {
@@ -1056,6 +1199,141 @@ mod tests {
             error.runtime_generation,
             OptionalNullable::Value("g1".to_owned())
         );
+    }
+
+    #[test]
+    fn oversized_outbound_result_degrades_payload_and_preserves_session_id() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 512,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r1".to_owned(),
+            result: Some(json!({
+                "ok": true,
+                "session_id": "exec-session-1",
+                "output": "x".repeat(2_000),
+            })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded result");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result, not compact tool_error");
+        };
+        assert_eq!(result.request_id, "r1");
+        let payload = result.result.expect("result payload");
+        assert_eq!(payload["session_id"], "exec-session-1");
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["bytes_total"], 2_000);
+        let output = payload["output"].as_str().expect("output");
+        assert!(output.len() < 2_000);
+    }
+
+    #[test]
+    fn oversized_outbound_reads_batch_degrades_nested_content() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 2_048,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-reads".to_owned(),
+            result: Some(json!({
+                "ok": true,
+                "reads": [
+                    {"path": "/a/one.txt", "content": "y".repeat(3_000)},
+                    {"path": "/a/two.txt", "content": "z".repeat(3_000)},
+                ],
+            })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("degraded reads");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("degraded frame");
+        let RelayMessage::ToolResult(result) = decoded else {
+            panic!("expected degraded tool_result");
+        };
+        let reads = result
+            .result
+            .expect("result payload")
+            .get("reads")
+            .and_then(Value::as_array)
+            .expect("reads array")
+            .clone();
+        assert_eq!(reads.len(), 2);
+        // Paths must survive intact for the caller to page each file.
+        assert_eq!(reads[0]["path"], "/a/one.txt");
+        assert_eq!(reads[1]["path"], "/a/two.txt");
+        assert!(reads.iter().any(|entry| entry["truncated"] == true));
+    }
+
+    #[test]
+    fn oversized_outbound_result_without_payload_fields_keeps_compact_error() {
+        let mut core = LinkTransportCore::new(
+            "ws1",
+            Some(3),
+            ExponentialBackoff::default(),
+            TransportConfig {
+                max_frame_bytes: 512,
+                ..TransportConfig::default()
+            },
+        );
+        let attempt = open_and_handshake(&mut core);
+        core.frame_received(attempt, &success_ack(), 2_000, 0.5)
+            .unwrap();
+
+        // No degradable payload field: identity-only objects still fall
+        // back to the compact correlated error.
+        let result = RelayMessage::ToolResult(ToolResultMessage {
+            envelope: RelayEnvelope::new("ws1"),
+            request_id: "r-idonly".to_owned(),
+            result: Some(json!({ "marker": "x".repeat(2_000) })),
+            served_at_ms: Number::from(2_500),
+            runtime_generation: OptionalNullable::Value("g1".to_owned()),
+            transport_name: OptionalNullable::Value("local".to_owned()),
+        });
+        let actions = core.send_outbound(result).expect("compact fallback");
+        let frame = match actions.as_slice() {
+            [TransportAction::SendFrame { frame, .. }] => frame,
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        let decoded = decode_relay_frame(frame, None).expect("compact frame");
+        let RelayMessage::ToolError(error) = decoded else {
+            panic!("expected compact tool_error");
+        };
+        assert_eq!(error.code, "response_too_large");
+        assert!(!error.retryable);
     }
 
     #[test]
