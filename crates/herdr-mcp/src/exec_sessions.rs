@@ -173,6 +173,10 @@ struct SessionStatus {
     /// corrupt) keep this false forever; their output is genuinely lost, not
     /// merely unloaded.
     evidence_persisted: bool,
+    /// The bounded spool/SQLite retries are exhausted. The resident cap may
+    /// evict this closed session; a later read rebuilds it from the durable
+    /// row as incomplete evidence instead of pinning the failed close forever.
+    persist_abandoned: bool,
     /// `Some(true)`/`Some(false)` once a close-on-complete pane's reclaim was
     /// attempted; `None` when no reclaim was attempted (still open or not
     /// pane-owned).
@@ -219,8 +223,11 @@ struct Session {
     /// Set when a durable `exec_sessions` row is loaded but its `.spool`
     /// output artifact is absent or corrupt. Such a session must never be
     /// reported as `completed` with empty output: reads refuse with
-    /// `session_evidence_incomplete` instead.
+    /// `session_evidence_incomplete` instead. A present but unreadable spool
+    /// uses `session_spool_corrupt` so it is not confused with a missing
+    /// artifact or with a committed spool that really captured zero bytes.
     evidence_missing: bool,
+    spool_corrupt: bool,
 }
 
 #[derive(Debug)]
@@ -469,34 +476,38 @@ fn load_session_from_spool_or_record(
     let mut stderr_bytes = 0;
     let mut truncated = false;
     let mut evidence_loaded = false;
+    let mut spool_corrupt = false;
 
-    if let Ok(bytes) = fs::read(&spool_path)
-        && let Ok(artifact) = serde_json::from_slice::<SavedCompletionEvidence>(&bytes)
-        && artifact.version == 1
-        && artifact.session_id == record.session_id
-    {
-        let stdout_data = BASE64.decode(&artifact.stdout_tail).unwrap_or_default();
-        let stderr_data = BASE64.decode(&artifact.stderr_tail).unwrap_or_default();
-        stdout_bytes = stdout_data.len();
-        stderr_bytes = stderr_data.len();
-        let mut next_seq = 0u64;
-        if !stdout_data.is_empty() {
-            chunks.push(Chunk {
-                seq: next_seq,
-                stream: StreamKind::Stdout,
-                data: stdout_data,
-            });
-            next_seq = next_seq.saturating_add(1);
-        }
-        if !stderr_data.is_empty() {
-            chunks.push(Chunk {
-                seq: next_seq,
-                stream: StreamKind::Stderr,
-                data: stderr_data,
-            });
-        }
-        truncated = artifact.truncated;
-        evidence_loaded = true;
+    match fs::read(&spool_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => spool_corrupt = true,
+        Ok(bytes) => match serde_json::from_slice::<SavedCompletionEvidence>(&bytes) {
+            Ok(artifact) if artifact.version == 1 && artifact.session_id == record.session_id => {
+                let stdout_data = BASE64.decode(&artifact.stdout_tail).unwrap_or_default();
+                let stderr_data = BASE64.decode(&artifact.stderr_tail).unwrap_or_default();
+                stdout_bytes = stdout_data.len();
+                stderr_bytes = stderr_data.len();
+                let mut next_seq = 0u64;
+                if !stdout_data.is_empty() {
+                    chunks.push(Chunk {
+                        seq: next_seq,
+                        stream: StreamKind::Stdout,
+                        data: stdout_data,
+                    });
+                    next_seq = next_seq.saturating_add(1);
+                }
+                if !stderr_data.is_empty() {
+                    chunks.push(Chunk {
+                        seq: next_seq,
+                        stream: StreamKind::Stderr,
+                        data: stderr_data,
+                    });
+                }
+                truncated = artifact.truncated;
+                evidence_loaded = true;
+            }
+            _ => spool_corrupt = true,
+        },
     }
 
     let next_seq = chunks.last().map_or(0, |c| c.seq.saturating_add(1));
@@ -515,6 +526,7 @@ fn load_session_from_spool_or_record(
         // A row-only recovery has no durable output anywhere; it must not be
         // reported as a completed session with empty output.
         evidence_persisted: evidence_loaded,
+        persist_abandoned: false,
         pane_reclaimed: None,
         pane_reclaim_error: None,
     };
@@ -528,6 +540,7 @@ fn load_session_from_spool_or_record(
         buffers: Mutex::new(buffers),
         status: Mutex::new(status),
         evidence_missing: !evidence_loaded,
+        spool_corrupt,
     })
 }
 
@@ -704,6 +717,7 @@ impl ExecRegistry {
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
             evidence_missing: false,
+            spool_corrupt: false,
         });
         if let Some(stdout) = stdout {
             spawn_reader(Arc::clone(&session), StreamKind::Stdout, stdout);
@@ -821,6 +835,7 @@ impl ExecRegistry {
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
             evidence_missing: false,
+            spool_corrupt: false,
         });
         let launch_line = format!(
             "{} {}",
@@ -953,13 +968,28 @@ impl ExecRegistry {
             // output evidence, not an empty completion: refuse rather than
             // report `ok` with an empty buffer.
             let status = session.status.lock();
-            if session.evidence_missing && status.map(|s| s.closed).unwrap_or(true) {
+            let closed = status.as_ref().map(|status| status.closed).unwrap_or(true);
+            let abandoned = status
+                .as_ref()
+                .is_ok_and(|status| status.persist_abandoned && !status.evidence_persisted);
+            if closed && (session.evidence_missing || abandoned) {
+                let corrupt = session.spool_corrupt;
+                let reason = if corrupt {
+                    "session_spool_corrupt"
+                } else {
+                    "session_evidence_incomplete"
+                };
+                let message = if corrupt {
+                    "the durable exec session row exists but its output spool is unreadable; captured output is unavailable"
+                } else {
+                    "the durable exec session row exists but its output spool never committed; captured output is unavailable"
+                };
                 return json!({
                     "ok": false,
-                    "reason": "session_evidence_incomplete",
+                    "reason": reason,
                     "session_id": id,
                     "recovered": true,
-                    "message": "the durable exec session row exists but its output spool never committed or is unreadable; captured output is unavailable",
+                    "message": message,
                 });
             }
         }
@@ -1301,11 +1331,13 @@ fn prune_loaded_closed_sessions(sessions: &mut HashMap<String, Arc<Session>>, ma
         .iter()
         .filter_map(|(id, session)| {
             let status = session_status(session);
-            // Only a closed session whose durable evidence fully committed is
-            // eligible for the resident cap: evicting an unpersisted session
-            // would drop the only remaining copy of its output while
-            // `running=false` is already visible to callers.
-            (status.closed && status.evidence_persisted).then(|| {
+            // A closed session whose durable evidence fully committed can
+            // leave memory: the spool and row remain. A close whose bounded
+            // persist retries are exhausted can leave too, marked incomplete,
+            // so permanent failures cannot pin an unbounded resident set. An
+            // in-flight close (not yet abandoned) stays: its buffers are still
+            // the only copy of the output.
+            (status.closed && (status.evidence_persisted || status.persist_abandoned)).then(|| {
                 (
                     status.ended_at_ms.unwrap_or(session.started_at_ms),
                     session.started_at_ms,
@@ -1376,6 +1408,7 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             // Poisoned status: keep the session resident rather than risking
             // eviction of evidence we cannot inspect.
             evidence_persisted: false,
+            persist_abandoned: false,
             pane_reclaimed: None,
             pane_reclaim_error: None,
         },
@@ -1385,6 +1418,7 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             signal: status.signal.clone(),
             ended_at_ms: status.ended_at_ms,
             evidence_persisted: status.evidence_persisted,
+            persist_abandoned: status.persist_abandoned,
             pane_reclaimed: status.pane_reclaimed,
             pane_reclaim_error: status.pane_reclaim_error.clone(),
         },
@@ -2074,11 +2108,16 @@ fn persist_closed_evidence(
     if settle_result.is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
     }
-    if spool_result.is_ok()
-        && settle_result.is_ok()
-        && let Ok(mut status) = session.status.lock()
-    {
-        status.evidence_persisted = true;
+    if let Ok(mut status) = session.status.lock() {
+        if spool_result.is_ok() && settle_result.is_ok() {
+            status.evidence_persisted = true;
+            status.persist_abandoned = false;
+        } else {
+            // `persist_session_spool` / `settle_closed_evidence` already spent
+            // PERSIST_RETRY_ATTEMPTS. Further closes of this resident session
+            // must not keep it immune to the cap.
+            status.persist_abandoned = true;
+        }
     }
 }
 
@@ -2436,6 +2475,7 @@ mod tests {
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
             evidence_missing: false,
+            spool_corrupt: false,
         });
         (session, socket)
     }
@@ -2887,6 +2927,7 @@ mod tests {
             buffers: Mutex::new(Buffers::default()),
             status: Mutex::new(SessionStatus::default()),
             evidence_missing: false,
+            spool_corrupt: false,
         });
         if let Some(stdout) = stdout {
             spawn_reader(Arc::clone(&session), StreamKind::Stdout, stdout);
@@ -3472,6 +3513,7 @@ mod tests {
                     ..SessionStatus::default()
                 }),
                 evidence_missing: false,
+                spool_corrupt: false,
             };
             write_session_spool(&path, &spool_session).unwrap();
         }
@@ -3525,6 +3567,7 @@ mod tests {
                 ..SessionStatus::default()
             }),
             evidence_missing: false,
+            spool_corrupt: false,
         })
     }
 
@@ -3597,6 +3640,7 @@ mod tests {
                 buffers: Mutex::new(Buffers::default()),
                 status: Mutex::new(SessionStatus::default()),
                 evidence_missing: false,
+                spool_corrupt: false,
             }),
         );
 
@@ -3849,6 +3893,7 @@ mod tests {
                 ..SessionStatus::default()
             }),
             evidence_missing: false,
+            spool_corrupt: false,
         })
     }
 
@@ -3905,6 +3950,125 @@ mod tests {
         // Once the spool commits, a recovery read must not leave a stale empty
         // projection behind: reading after `write_session_spool` sees output.
         drop(in_flight);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given a closed session whose bounded persist retries are
+    /// exhausted | When the resident cap prunes | Then that session is evicted
+    /// and a later read rebuilds the durable row as incomplete evidence.
+    #[test]
+    fn abandoned_persist_session_is_evicted_and_rebuilt_incomplete() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-abandoned-cap-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_exec_running("es_abandoned", 7_000, None, now)
+            .unwrap();
+        let abandoned = unpersisted_closed_session("es_abandoned", "only-in-memory\n");
+        let spool_dir = exec_spool_dir(&path);
+        fs::remove_dir_all(&spool_dir).unwrap();
+        fs::write(&spool_dir, "not-a-directory").unwrap();
+        persist_closed_evidence(&registry.inner, &abandoned, now, Some(1), None);
+        assert!(
+            abandoned.status.lock().unwrap().persist_abandoned,
+            "exhausted persist retries must abandon the resident pin"
+        );
+        assert!(!abandoned.status.lock().unwrap().evidence_persisted);
+        fs::remove_file(&spool_dir).unwrap();
+        fs::create_dir_all(&spool_dir).unwrap();
+
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("es_abandoned".to_owned(), Arc::clone(&abandoned));
+        for i in 0..RECOVERY_MAX_ENTRIES + 2 {
+            let session_id = format!("es_keep_{i:03}");
+            let session = loaded_completed_session(
+                &session_id,
+                now + 1_000 + i as u64,
+                now + 1_000 + i as u64,
+                &format!("kept-{i}\n"),
+            );
+            registry
+                .inner
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(session_id, session);
+        }
+        registry.prune();
+        assert!(
+            !registry
+                .list_views()
+                .iter()
+                .any(|view| view["session_id"] == "es_abandoned"),
+            "an abandoned close must be eligible for the resident cap"
+        );
+        let view = registry.read("es_abandoned", "stdout", 0, 64);
+        assert_eq!(view["ok"], false, "{view}");
+        assert_eq!(view["reason"], "session_evidence_incomplete");
+        assert_eq!(view["recovered"], true);
+
+        drop(abandoned);
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given a closed row with a corrupt spool and another with
+    /// a committed empty spool | When each is read | Then corruption is
+    /// `session_spool_corrupt` and a real zero-byte capture stays successful.
+    #[test]
+    fn corrupt_spool_is_not_reported_as_empty_output() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-spool-corrupt-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+        for id in ["es_corrupt", "es_empty"] {
+            store.record_exec_running(id, 9_000, None, now).unwrap();
+            store
+                .settle_exec_session(
+                    id,
+                    "closed",
+                    Some(now + 5),
+                    Some(0),
+                    None,
+                    now + SESSION_TTL_MS,
+                )
+                .unwrap();
+        }
+        drop(store);
+
+        fs::create_dir_all(exec_spool_dir(&path)).unwrap();
+        fs::write(exec_spool_path(&path, "es_corrupt"), b"{not-json").unwrap();
+        let empty = unpersisted_closed_session("es_empty", "");
+        empty.buffers.lock().unwrap().chunks.clear();
+        empty.buffers.lock().unwrap().stdout_bytes = 0;
+        empty.buffers.lock().unwrap().next_seq = 0;
+        write_session_spool(&path, &empty).unwrap();
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let corrupt = registry.read("es_corrupt", "both", 0, 64);
+        assert_eq!(corrupt["ok"], false, "{corrupt}");
+        assert_eq!(corrupt["reason"], "session_spool_corrupt");
+        let empty_view = registry.read("es_empty", "both", 0, 64);
+        assert_eq!(empty_view["ok"], true, "{empty_view}");
+        assert_eq!(empty_view["text"], "");
+        assert_eq!(empty_view["phase"], "completed");
+
+        drop(registry);
         let _ = fs::remove_dir_all(&path);
     }
 
