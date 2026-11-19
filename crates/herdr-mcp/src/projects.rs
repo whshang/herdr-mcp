@@ -48,15 +48,20 @@ pub(crate) fn advance_git_status_clock(by: Duration) {
 struct GitStatusCacheEntry {
     expires_at: Instant,
     value: Option<GitStatus>,
+    /// Canonical path of the probed repository. Entries keyed under different
+    /// aliases (symlinked checkouts, `/var` vs `/private/var`) share one
+    /// identity so a write through any alias invalidates all of them.
+    repo_identity: Option<PathBuf>,
 }
 
 /// A probe currently running for one root. `invalidated` is set when a write
-/// under that root lands while the probe is in flight, so the stale result is
-/// never published to the cache.
+/// under that root — or under any alias sharing its repo identity — lands
+/// while the probe is in flight, so the stale result is never published.
 struct GitStatusInFlight {
     done: Mutex<bool>,
     ready: Condvar,
     invalidated: std::sync::atomic::AtomicBool,
+    repo_identity: Option<PathBuf>,
 }
 
 /// Prober-side cleanup: dropping removes the in-flight marker and wakes all
@@ -117,6 +122,33 @@ pub(crate) fn reset_git_status_probe_count(root: &Path) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(root);
     }
+}
+
+/// Count live cache entries whose key shares a path prefix with `root`,
+/// regardless of expiry. Tests assert broker write invalidation
+/// deterministically: expired-but-kept entries keep counting, so a retained
+/// entry stays `>= 1` even when a route call outlasts the TTL, while a
+/// dropped entry reads `0`. Scoping by prefix keeps parallel tests' roots
+/// from polluting the count.
+#[cfg(test)]
+pub(crate) fn git_status_cache_entry_count_for(root: &Path) -> usize {
+    let identity = std::fs::canonicalize(root).ok();
+    GIT_STATUS_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .iter()
+                .filter(|(key, entry)| {
+                    root.starts_with(key.as_path())
+                        || key.starts_with(root)
+                        || (identity.is_some() && entry.repo_identity == identity)
+                })
+                .count()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -483,6 +515,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
+            repo_identity: std::fs::canonicalize(&key).ok(),
         });
         state.in_flight.insert(key.clone(), waiter.clone());
         drop(state);
@@ -511,6 +544,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                 GitStatusCacheEntry {
                     expires_at,
                     value: value.clone(),
+                    repo_identity: waiter.repo_identity.clone(),
                 },
             );
             if let Some(status) = &value {
@@ -519,6 +553,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                     GitStatusCacheEntry {
                         expires_at,
                         value: Some(status.clone()),
+                        repo_identity: waiter.repo_identity.clone(),
                     },
                 );
             }
@@ -544,6 +579,38 @@ pub fn invalidate_git_status_cache_for_path(path: &Path) {
         .retain(|key, _| !(path.starts_with(key) || key.starts_with(path)));
     for (key, in_flight) in &state.in_flight {
         if path.starts_with(key) || key.starts_with(path) {
+            in_flight
+                .invalidated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Drop cached status evidence after a write when the caller knows the
+/// touched repository's caller-visible `root` and, when available, its
+/// canonical `repo_identity`. A key or in-flight probe is dropped when it
+/// shares a path prefix with `root` OR shares `repo_identity`, so a write
+/// through one alias (symlinked checkout, `/var` vs `/private/var`) also
+/// clears entries filed under another alias of the same repository.
+/// Entries recorded without an identity keep the prefix-only behavior.
+pub fn invalidate_git_status_cache_matching(root: &Path, repo_identity: Option<&Path>) {
+    let Some(cache) = GIT_STATUS_CACHE.get() else {
+        return;
+    };
+    let identity = repo_identity.map(PathBuf::from);
+    let matches = |key: &Path, entry_identity: Option<&PathBuf>| {
+        root.starts_with(key)
+            || key.starts_with(root)
+            || (identity.is_some() && entry_identity == identity.as_ref())
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state
+        .entries
+        .retain(|key, entry| !matches(key, entry.repo_identity.as_ref()));
+    for (key, in_flight) in &state.in_flight {
+        if matches(key, in_flight.repo_identity.as_ref()) {
             in_flight
                 .invalidated
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1044,6 +1111,7 @@ mod tests {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
+            repo_identity: None,
         });
         GIT_STATUS_CACHE
             .get_or_init(|| Mutex::new(GitStatusCacheState::default()))

@@ -16250,22 +16250,33 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
 /// git-status cache only — the parent's `projects` cache still holds the
 /// pre-write status (#1023 comment 6976715344 item 2). Drop the parent entry
 /// for the touched root after a broker success so the next inspect re-probes.
+/// `git` is excluded: `git_tools::run` only serves read-only actions, so a
+/// successful herdr_git must keep the cache. `fs_patch` `dry_run: true`
+/// returns ok with `root` but writes nothing, so it keeps the cache too.
 /// Read ops and broker failures leave the cache untouched. The result's
 /// `root` is the caller-facing alias; `repo_identity`, when the broker
 /// validated one, lets alias keys that share a canonical repository drop
 /// together without the parent resolving a protected path itself.
 fn invalidate_git_status_after_broker_write(op: &str, value: &Value) {
-    const MUTATING_OPS: [&str; 4] = ["fs_edit", "fs_write", "fs_patch", "git"];
+    const MUTATING_OPS: [&str; 3] = ["fs_edit", "fs_write", "fs_patch"];
     if !MUTATING_OPS.contains(&op) {
         return;
     }
-    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+    if value.get("ok").and_then(Value::as_bool) != Some(true)
+        || value.get("dry_run").and_then(Value::as_bool) == Some(true)
+    {
         return;
     }
-    for key in ["repo_identity", "root"] {
-        if let Some(path) = value.get(key).and_then(Value::as_str) {
-            crate::projects::invalidate_git_status_cache_for_path(std::path::Path::new(path));
-        }
+    let root = value
+        .get("root")
+        .or_else(|| value.get("repo_identity"))
+        .and_then(Value::as_str);
+    if let Some(root) = root {
+        let identity = value
+            .get("repo_identity")
+            .and_then(Value::as_str)
+            .map(std::path::Path::new);
+        crate::projects::invalidate_git_status_cache_matching(std::path::Path::new(root), identity);
     }
 }
 
@@ -17924,6 +17935,337 @@ mod tests {
         assert_eq!(crate::projects::git_status_probe_count(&root), 2);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Build a fake broker installation under a temp config dir: a `#!/bin/sh`
+    /// script that echoes a canned result line. `route_fs_git` only requires
+    /// the broker path to be a regular non-symlink file, so a script exercises
+    /// the real spawn + response parse path without a compiled broker.
+    #[cfg(unix)]
+    fn fake_broker_config(fixture: &std::path::Path, result_line: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let broker_dir = fixture.join("tcc-broker");
+        std::fs::create_dir_all(&broker_dir).unwrap();
+        let broker = broker_dir.join("herdr-mcp-broker");
+        std::fs::write(
+            &broker,
+            format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{result_line}'\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&broker).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&broker, permissions).unwrap();
+        fixture.to_path_buf()
+    }
+
+    /// user operator | Given herdr_fs_write routes through the broker | When
+    /// the child reports success | Then the parent's cached git status drops
+    /// and the next inspect re-probes — proven through route_fs_git itself.
+    #[cfg(unix)]
+    #[test]
+    fn user_broker_routed_fs_write_drops_parent_cache_via_route_fs_git() {
+        use std::process::Command;
+
+        let _env_guard = crate::test_env::lock();
+        let previous_broker = std::env::var_os("HERDR_MCP_TCC_BROKER");
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let fixture = std::env::temp_dir().join(format!(
+            "herdr-mcp-broker-e2e-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = fixture.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": root.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+            }],
+        });
+        crate::projects::invalidate_git_status_cache(&root);
+        crate::projects::reset_git_status_probe_count(&root);
+        let clean = crate::projects::derive(&snapshot);
+        assert!(!clean.projects[&root].dirty);
+        let entries_before = crate::projects::git_status_cache_entry_count_for(&fixture);
+        assert!(entries_before >= 1, "{entries_before}");
+
+        // The child "wrote" the file in its own process; the canned reply
+        // mirrors a successful fs_write result including the canonical
+        // repo_identity the broker now supplies.
+        std::fs::write(root.join("written-by-broker.txt"), "dirty\n").unwrap();
+        let identity = std::fs::canonicalize(&root).unwrap();
+        let result_line = json!({
+            "ok": true,
+            "path": root.join("written-by-broker.txt").to_string_lossy(),
+            "root": root.to_string_lossy(),
+            "repo_identity": identity.to_string_lossy(),
+        })
+        .to_string();
+        let config_dir = fake_broker_config(&fixture, &result_line);
+        unsafe {
+            std::env::set_var("HERDR_MCP_TCC_BROKER", "1");
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let outcome = route_fs_git("fs_write", &snapshot, &json!({}));
+        unsafe {
+            match previous_broker {
+                Some(value) => std::env::set_var("HERDR_MCP_TCC_BROKER", value),
+                None => std::env::remove_var("HERDR_MCP_TCC_BROKER"),
+            }
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        drop(_env_guard);
+        assert_eq!(outcome["ok"], true, "{outcome}");
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&fixture),
+            0,
+            "a broker-routed fs_write must drop the parent's cache entries"
+        );
+        let refreshed = crate::projects::derive(&snapshot);
+        let project = &refreshed.projects[&root];
+        assert!(project.dirty, "{project:?}");
+        assert_eq!(crate::projects::git_status_probe_count(&root), 2);
+
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    /// user operator | Given a cached dirty status in the parent | When
+    /// broker-routed git status or a dry-run fs_patch succeeds | Then the
+    /// cache entry survives — read outcomes never churn probes.
+    #[cfg(unix)]
+    #[test]
+    fn user_read_only_broker_results_keep_the_parent_cache() {
+        use std::process::Command;
+
+        let _env_guard = crate::test_env::lock();
+        let previous_broker = std::env::var_os("HERDR_MCP_TCC_BROKER");
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let fixture = std::env::temp_dir().join(format!(
+            "herdr-mcp-broker-ro-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = fixture.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(root.join("tracked.txt"), "dirty\n").unwrap();
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": root.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": root.to_string_lossy(),
+            }],
+        });
+        crate::projects::invalidate_git_status_cache(&root);
+        crate::projects::reset_git_status_probe_count(&root);
+        let dirty = crate::projects::derive(&snapshot);
+        assert!(dirty.projects[&root].dirty);
+        let entries_before = crate::projects::git_status_cache_entry_count_for(&fixture);
+        assert!(entries_before >= 1, "{entries_before}");
+
+        let identity = std::fs::canonicalize(&root).unwrap();
+        // One fake broker script serves a successful read-only git status,
+        // then a successful fs_patch dry_run; neither may drop the entry.
+        let config_dir = fake_broker_config(
+            &fixture,
+            &json!({
+                "ok": true,
+                "root": root.to_string_lossy(),
+                "repo_identity": identity.to_string_lossy(),
+                "action": "status",
+                "exit_code": 0,
+                "truncated": false
+            })
+            .to_string(),
+        );
+        unsafe {
+            std::env::set_var("HERDR_MCP_TCC_BROKER", "1");
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let git_result = route_fs_git("git", &snapshot, &json!({"root": root.to_string_lossy()}));
+        assert_eq!(git_result["ok"], true, "{git_result}");
+        // A read-only broker result never drops parent evidence — count live
+        // entries, not probes, so a route call outlasting the TTL can't flake.
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&fixture),
+            entries_before,
+            "a broker git read must keep the parent's cache entry"
+        );
+        let config_dir = fake_broker_config(
+            &fixture,
+            &json!({
+                "ok": true,
+                "dry_run": true,
+                "root": root.to_string_lossy(),
+                "repo_identity": identity.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        unsafe {
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let patch_result = route_fs_git(
+            "fs_patch",
+            &snapshot,
+            &json!({"root": root.to_string_lossy()}),
+        );
+        assert_eq!(patch_result["ok"], true, "{patch_result}");
+        let cached = crate::projects::derive(&snapshot);
+        assert!(cached.projects[&root].dirty);
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&fixture),
+            entries_before,
+            "an fs_patch dry_run must keep the parent's cache entry"
+        );
+        unsafe {
+            match previous_broker {
+                Some(value) => std::env::set_var("HERDR_MCP_TCC_BROKER", value),
+                None => std::env::remove_var("HERDR_MCP_TCC_BROKER"),
+            }
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        drop(_env_guard);
+
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    /// user operator | Given two symlink aliases of one managed repo | When a
+    /// broker write lands through alias A | Then alias B's cached status
+    /// drops via the shared repo_identity — the canonical identity the broker
+    /// process, not the parent, is privileged to resolve.
+    #[cfg(unix)]
+    #[test]
+    fn user_alias_b_cache_drops_after_a_broker_write_through_alias_a() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let _env_guard = crate::test_env::lock();
+        let previous_broker = std::env::var_os("HERDR_MCP_TCC_BROKER");
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let fixture = std::env::temp_dir().join(format!(
+            "herdr-mcp-broker-alias-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = fixture.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let alias_a = fixture.join("alias-a");
+        let alias_b = fixture.join("alias-b");
+        symlink(&real, &alias_a).unwrap();
+        symlink(&real, &alias_b).unwrap();
+
+        let snapshot_b = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": alias_b.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": alias_b.to_string_lossy(),
+            }],
+        });
+        crate::projects::invalidate_git_status_cache(&alias_b);
+        crate::projects::invalidate_git_status_cache(&real);
+        crate::projects::reset_git_status_probe_count(&alias_b);
+        let clean = crate::projects::derive(&snapshot_b);
+        let cached_root = alias_b.clone();
+        assert!(clean.projects[&cached_root].vcs == Some("git"), "{clean:?}");
+        assert!(!clean.projects[&cached_root].dirty, "{clean:?}");
+        assert!(
+            crate::projects::git_status_cache_entry_count_for(&fixture) >= 1,
+            "alias B must seed a cache entry"
+        );
+        // The broker writes through alias A and returns its canonical
+        // identity; the parent must drop alias B's entry for the same repo.
+        std::fs::write(real.join("written-by-broker.txt"), "dirty\n").unwrap();
+        let identity = std::fs::canonicalize(&real).unwrap();
+        let config_dir = fake_broker_config(
+            &fixture,
+            &json!({
+                "ok": true,
+                "path": alias_a.join("written-by-broker.txt").to_string_lossy(),
+                "root": alias_a.to_string_lossy(),
+                "repo_identity": identity.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        unsafe {
+            std::env::set_var("HERDR_MCP_TCC_BROKER", "1");
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let outcome = route_fs_git("fs_write", &snapshot_b, &json!({}));
+        unsafe {
+            match previous_broker {
+                Some(value) => std::env::set_var("HERDR_MCP_TCC_BROKER", value),
+                None => std::env::remove_var("HERDR_MCP_TCC_BROKER"),
+            }
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        drop(_env_guard);
+        assert_eq!(outcome["ok"], true, "{outcome}");
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&fixture),
+            0,
+            "a broker write through alias A must drop alias B's cache entry"
+        );
+        let refreshed = crate::projects::derive(&snapshot_b);
+        assert!(
+            refreshed.projects[&cached_root].dirty,
+            "alias B must not keep the clean cache after a broker write through alias A: {refreshed:?}"
+        );
+
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
