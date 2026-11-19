@@ -261,10 +261,35 @@ mod tests {
         );
         assert!(clean_helper.is_empty(), "{clean_helper:?}");
 
+        // A same-file path helper + direct bind: the caller's body carries
+        // neither `temp_dir()` nor `.sock`, so the helper itself must be
+        // recognised (unguarded -> flagged, guarded -> clean).
+        let helper_path_source = |guard: &str| {
+            format!(
+                "mod tests {{\n    fn peer_socket_path(tag: &str) -> PathBuf {{\n        std::env::temp_dir().join(format!(\"herdr-peer-{{tag}}-{{}}.sock\", 1))\n    }}\n\n    #[test]\n    fn fixture() {{\n        let s = peer_socket_path(\"x\");\n        {guard}UnixListener::bind(&s).unwrap();\n    }}\n}}\n"
+            )
+        };
+        let flagged_path_helper = audit_source("path-helper.rs", &helper_path_source(""));
+        assert_eq!(flagged_path_helper.len(), 1, "{flagged_path_helper:?}");
+        let clean_path_helper = audit_source(
+            "path-helper-guarded.rs",
+            &helper_path_source(
+                "let _g = crate::test_env::TempUnixSocketGuard::file(&s);\n        ",
+            ),
+        );
+        assert!(clean_path_helper.is_empty(), "{clean_path_helper:?}");
+
+        // The opt-out must not silence a function that really binds.
+        let marker_with_bind = audit_source(
+            "marker-and-bind.rs",
+            "mod tests {\n    #[test]\n    fn fixture() {\n        // temp-socket-path-only: documented, but this body still binds.\n        let s = std::env::temp_dir().join(format!(\"herdr-mb-{}.sock\", 1));\n        UnixListener::bind(&s).unwrap();\n    }\n}\n",
+        );
+        assert_eq!(marker_with_bind.len(), 1, "{marker_with_bind:?}");
+
         // A path that is only used in an assertion/message may opt out.
         let opted_out = audit_source(
             "path-only.rs",
-            "mod tests {\n    #[test]\n    fn fixture() {\n        // temp-socket-path-only: no listener is bound here.\n        let s = PathBuf::from(format!(\"/tmp/herdr-p-{}.sock\", 1));\n        let _ = UnixListener::bind(Path::new(\"/nowhere\"));\n        assert!(s.display().to_string().contains(\".sock\"));\n    }\n}\n",
+            "mod tests {\n    #[test]\n    fn fixture() {\n        // temp-socket-path-only: the path only appears in the assertion.\n        let s = PathBuf::from(format!(\"/tmp/herdr-p-{}.sock\", 1));\n        assert!(s.display().to_string().contains(\".sock\"));\n    }\n}\n",
         );
         assert!(opted_out.is_empty(), "{opted_out:?}");
     }
@@ -311,26 +336,61 @@ mod tests {
     /// delete-someone-else's-socket bug the guard must not encourage.
     fn audit_source(label: &str, source: &str) -> Vec<String> {
         let functions = functions(source);
-        let binder_helpers: Vec<&str> = functions
+        let body_of = |wanted: &str| {
+            functions
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, body)| body.as_str())
+        };
+        // `body` starts at the signature line, so a function containing its own
+        // name (`fn spawn_fixture`) must not count as calling itself.
+        let calls = |body: &str, helper: &str| {
+            body.lines()
+                .skip(1)
+                .any(|line| line.contains(&format!("{helper}(")))
+        };
+        let binders: Vec<&str> = functions
             .iter()
             .filter(|(_, body)| binds_unix_listener(body))
             .map(|(name, _)| name.as_str())
             .collect();
+        let path_helpers: Vec<&str> = functions
+            .iter()
+            .filter(|(_, body)| constructs_tmp_socket_path(body))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        // A helper that already owns the cleanup (`TempUnixSocketGuard` in its
+        // own body, usually returned to the caller) makes its callers safe.
+        let guarded_helper =
+            |name: &str| body_of(name).is_some_and(|body| body.contains("TempUnixSocketGuard"));
         let mut unguarded = Vec::new();
         for (name, body) in &functions {
-            if body.contains("temp-socket-path-only") {
+            let binds_here =
+                binds_unix_listener(body) || binders.iter().any(|binder| calls(body, binder));
+            // The opt-out only covers a function that really does not create
+            // anything: a marker next to a live bind must not silence it.
+            if !binds_here && body.contains("temp-socket-path-only") {
                 continue;
             }
-            let binds_here = binds_unix_listener(body)
-                || binder_helpers
-                    .iter()
-                    .any(|helper| body.contains(&format!("{helper}(")));
-            if !binds_here || !constructs_tmp_socket_path(body) {
+            let constructs_here = constructs_tmp_socket_path(body)
+                || path_helpers.iter().any(|helper| calls(body, helper));
+            if !binds_here || !constructs_here {
                 continue;
             }
-            if !body.contains("TempUnixSocketGuard") {
-                unguarded.push(format!("{label}::{name}"));
+            if body.contains("TempUnixSocketGuard") {
+                continue;
             }
+            // A caller whose socket is created and cleaned by a guarded helper
+            // (the helper returns the guard to the caller) needs no guard of its
+            // own.
+            let binding_helper_is_guarded = binders
+                .iter()
+                .filter(|binder| calls(body, binder))
+                .all(|binder| guarded_helper(binder));
+            if !binds_unix_listener(body) && binding_helper_is_guarded {
+                continue;
+            }
+            unguarded.push(format!("{label}::{name}"));
         }
         unguarded
     }
