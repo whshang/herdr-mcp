@@ -63,7 +63,7 @@ Adding `exec` creates the following amplification surfaces:
 | --- | --- | --- |
 | Remote/Edge caller sends arbitrary command to a TCC-holding process | Impossible — allowlist rejects unknown ops; no op accepts a shell string | **New surface**: the broker's child inherits the broker's TCC grants. A command string reaching the broker would run with FDA-level rights. This is the single largest amplification and the reason the op must be constrained to a command *template allowlist* or a flag-restricted program, not raw argv. |
 | Compromised broker binary | Signed binary + `inspect_code_identity` / `installed_compat_state` checks | Unchanged, but impact grows: a tampered broker that can exec is a full FDA backdoor. Signing/identity verification becomes mandatory, not advisory. |
-| Local same-user process tries to borrow the runtime's authority | **No broker socket exists today.** The runtime spawns the installed broker as a one-shot child and hands it the request over stdin; a same-user process that executes the broker binary itself is indistinguishable from that child and gets exactly the *current* fs/git allowlist — no runtime authority, no `exec`, and the `HERDR_TCC_BROKER_EXEC` fence still applies | **New surface**: once `exec` exists and a broker daemon socket is considered, caller identity must be authenticated by the future layers in §3 (0700 socket dir + peer credentials + peer image + `runtime_owner_token` binding). None of that exists today. |
+| Local same-user process tries to borrow the runtime's authority | **No broker socket exists today.** The runtime spawns the installed broker as a one-shot child and hands it the request over stdin; a same-user process that executes the broker binary itself is indistinguishable from that child and gets exactly the *current* fs/git allowlist — no runtime authority, no `exec`, and the `HERDR_MCP_TCC_BROKER_CHILD=1` fence still applies | **New surface**: once `exec` exists and a broker daemon socket is considered, caller identity must be authenticated by the future layers in §3 (0700 socket dir + peer credentials + peer image + `runtime_owner_token` binding). None of that exists today. |
 | Request bypasses workspace scoping | fs ops are path-validated under managed roots | An exec op must bind the working directory to the managed roots set and reject `cwd` escapes, `..`, symlinks out of the root. |
 | Environment variable injection (`DYLD_INSERT_LIBRARIES`, `PATH`, `SHELL`, `HOME` redirection) | N/A today | Broker child env must be a fixed minimal set (§4). `DYLD_*` on the broker's *own* process is already neutralized by signing + SIP; the child env is a fresh attack vector. |
 | Shell metacharacter / argv smuggling | N/A | If templates are allowed, template argv must be literal-token-only; no second-shell expansion. Prefer fixed-program + flag-subset over free argv. |
@@ -99,8 +99,10 @@ request to the child's stdin and reads one JSON response from stdout
    `installed_compat_revision` verify signature/TeamID and protocol revision
    *before* the runtime delegates. This answers "did we spawn the binary we
    expect", not "who called".
-2. **Recursion fence.** `is_broker_child_process` (`HERDR_TCC_BROKER_EXEC=1`)
-   stops a broker child from re-entering protected-path routing.
+2. **Recursion fence.** `is_broker_child_process` checks
+   `HERDR_MCP_TCC_BROKER_CHILD == "1"` (`tcc_broker.rs:94`, set for the child by
+   `macos_permissions.rs:1791`) and stops a broker child from re-entering
+   protected-path routing.
 3. **Request-shape allowlist.** Exact top-level keys, one allowlisted `op`, and
    fs ops still path-validate under managed roots (unchanged behaviour).
 
@@ -186,7 +188,7 @@ PATH=<fixed runtime-managed path list>   # never caller-provided
 HOME=<requester's $HOME>
 LANG / LC_ALL / TZ                       # locale only
 TMPDIR=<broker-created 0700 dir>
-HERDR_TCC_BROKER_EXEC=1                  # marker for children to detect broker context
+HERDR_MCP_TCC_BROKER_CHILD=1             # marker for children to detect broker context
 ```
 
 Explicitly dropped: `DYLD_*`, `PATH`/`SHELL`/`BASH_ENV`/`ENV`/`CDPATH`/`IFS`/
