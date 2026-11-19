@@ -426,18 +426,23 @@ fn validated_roots_cached(snapshot: &Value) -> Arc<Vec<PathBuf>> {
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = projects::cache_now();
     if let Some(entry) = guard.get(&fingerprint)
-        && entry.expires_at > projects::cache_now()
+        && entry.expires_at > now
     {
         return Arc::clone(&entry.roots);
     }
+    // Evict only expired entries before considering a full-cap flush, so
+    // accumulated historical fingerprints cannot wipe entries that are
+    // still live for other callers.
+    guard.retain(|_, entry| entry.expires_at > now);
     if guard.len() >= projects::ROUTING_CACHE_CAP {
         guard.clear();
     }
     guard.insert(
         fingerprint,
         ValidatedRootsCacheEntry {
-            expires_at: projects::cache_now() + projects::ROUTING_CACHE_TTL,
+            expires_at: now + projects::ROUTING_CACHE_TTL,
             roots: Arc::clone(&roots),
         },
     );
@@ -1583,12 +1588,6 @@ mod tests {
         let mut churned = snap.clone();
         churned["panes"][0]["scrollback_offset"] = json!(42_000);
 
-        VALIDATED_ROOTS_CACHE
-            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-
         let first = validated_roots_cached(&snap);
         let second = validated_roots_cached(&churned);
         assert!(
@@ -1612,12 +1611,6 @@ mod tests {
     fn validated_roots_cached_recomputes_after_ttl_expiry() {
         let parent = plain_parent("cached-roots-ttl", &["project"]);
         let snap = snapshot(&parent.join("project"));
-
-        VALIDATED_ROOTS_CACHE
-            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
 
         let first = validated_roots_cached(&snap);
         projects::advance_cache_clock(

@@ -20,19 +20,21 @@ const GIT_STATUS_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 const GIT_STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-static GIT_STATUS_CLOCK_OFFSET_MS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
+thread_local! {
+    /// Per-test-thread offset: advancing the clock in one test must not
+    /// expire cache entries another concurrently running test just wrote.
+    static CACHE_CLOCK_OFFSET_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
 
-/// The caches' shared clock. Tests shift it forward instead of sleeping so
-/// TTL expiry is deterministic and cannot flake on a busy runner. Shared by
-/// the git-status, routing-topology, and validated-roots caches.
+/// The caches' shared clock. Tests shift their own thread's offset forward
+/// instead of sleeping so TTL expiry is deterministic and cannot flake on a
+/// busy runner. Shared by the git-status, routing-topology, and
+/// validated-roots caches.
 pub(crate) fn cache_now() -> Instant {
     #[cfg(test)]
     {
         Instant::now()
-            + Duration::from_millis(
-                GIT_STATUS_CLOCK_OFFSET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64,
-            )
+            + Duration::from_millis(CACHE_CLOCK_OFFSET_MS.with(|offset| offset.get()) as u64)
     }
     #[cfg(not(test))]
     {
@@ -42,8 +44,20 @@ pub(crate) fn cache_now() -> Instant {
 
 #[cfg(test)]
 pub(crate) fn advance_cache_clock(by: Duration) {
-    GIT_STATUS_CLOCK_OFFSET_MS
-        .fetch_add(by.as_millis() as i64, std::sync::atomic::Ordering::Relaxed);
+    CACHE_CLOCK_OFFSET_MS.with(|offset| offset.set(offset.get() + by.as_millis() as i64));
+}
+
+/// The calling test thread's clock offset. `git_statuses` propagates it
+/// into its scoped worker threads so a shifted clock stays consistent
+/// across one test's own probe fan-out.
+#[cfg(test)]
+fn cache_clock_offset() -> i64 {
+    CACHE_CLOCK_OFFSET_MS.with(|offset| offset.get())
+}
+
+#[cfg(test)]
+fn set_cache_clock_offset(offset: i64) {
+    CACHE_CLOCK_OFFSET_MS.with(|slot| slot.set(offset));
 }
 
 struct GitStatusCacheEntry {
@@ -272,18 +286,23 @@ pub fn derive_routing_cached(snapshot: &Value) -> Arc<ProjectTopology> {
     let mut guard = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = cache_now();
     if let Some(entry) = guard.get(&fingerprint)
-        && entry.expires_at > cache_now()
+        && entry.expires_at > now
     {
         return Arc::clone(&entry.topology);
     }
+    // Evict only expired entries before considering a full-cap flush, so
+    // accumulated historical fingerprints cannot wipe entries that are
+    // still live for other callers.
+    guard.retain(|_, entry| entry.expires_at > now);
     if guard.len() >= ROUTING_CACHE_CAP {
         guard.clear();
     }
     guard.insert(
         fingerprint,
         RoutingCacheEntry {
-            expires_at: cache_now() + ROUTING_CACHE_TTL,
+            expires_at: now + ROUTING_CACHE_TTL,
             topology: Arc::clone(&topology),
         },
     );
@@ -510,11 +529,15 @@ struct GitStatus {
 
 fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStatus> {
     thread::scope(|scope| {
+        #[cfg(test)]
+        let clock_offset = cache_clock_offset();
         let jobs = roots
             .iter()
             .map(|root| {
                 let root = root.clone();
                 scope.spawn(move || {
+                    #[cfg(test)]
+                    set_cache_clock_offset(clock_offset);
                     let status = cached_git_status(snapshot, &root);
                     (root, status)
                 })
@@ -1268,18 +1291,19 @@ mod tests {
 
     #[test]
     fn derive_routing_cached_reuses_topology_across_churn_and_misses_on_change() {
+        // Unique cwds give this test a private fingerprint, so no cache
+        // clear is needed and concurrent tests cannot disturb it.
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let other = temp_dir();
+        fs::create_dir_all(&other).unwrap();
         let snapshot = json!({
-            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/tmp"}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
             "agents": []
         });
         let mut churned = snapshot.clone();
         churned["panes"][0]["scrollback_offset"] = json!(12_345);
 
-        ROUTING_TOPOLOGY_CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
         reset_derive_routing_call_count();
 
         let first = derive_routing_cached(&snapshot);
@@ -1295,9 +1319,85 @@ mod tests {
         );
 
         let mut moved = snapshot.clone();
-        moved["panes"][0]["cwd"] = json!("/var");
+        moved["panes"][0]["cwd"] = json!(other.to_string_lossy());
         let third = derive_routing_cached(&moved);
         assert!(!Arc::ptr_eq(&first, &third), "a cwd change must re-derive");
         assert_eq!(derive_routing_call_count(), 2);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn derive_routing_cached_re_derives_after_ttl_expiry() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+
+        reset_derive_routing_call_count();
+
+        let first = derive_routing_cached(&snapshot);
+        advance_cache_clock(ROUTING_CACHE_TTL + Duration::from_millis(1));
+        let second = derive_routing_cached(&snapshot);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an expired entry must re-derive so fingerprint-invisible fs changes surface"
+        );
+        assert_eq!(derive_routing_call_count(), 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_routing_cached_retains_fresh_entries_when_cap_is_full() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": []
+        });
+
+        let live = derive_routing_cached(&snapshot);
+        // Fill the map past capacity with already-expired fingerprints.
+        let mut guard = ROUTING_TOPOLOGY_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for index in 0..(ROUTING_CACHE_CAP + 8) {
+            let stale_fingerprint = RoutingFingerprint {
+                workspaces: Vec::new(),
+                pane_workspaces: vec![(format!("w{index}"), format!("w{index}"))],
+                pane_cwds: Vec::new(),
+            };
+            guard.insert(
+                stale_fingerprint,
+                RoutingCacheEntry {
+                    expires_at: Instant::now(),
+                    topology: Arc::clone(&live),
+                },
+            );
+        }
+        drop(guard);
+
+        // A miss must evict expired entries first; the live one survives and
+        // still serves the same Arc instead of being flushed with the cap.
+        let other = temp_dir();
+        fs::create_dir_all(&other).unwrap();
+        let other_snapshot = json!({
+            "panes": [{"pane_id": "w1:p9", "workspace_id": "w1", "cwd": other}],
+            "agents": []
+        });
+        derive_routing_cached(&other_snapshot);
+        let still = derive_routing_cached(&snapshot);
+        assert!(
+            Arc::ptr_eq(&live, &still),
+            "expired backfill must not flush still-live entries"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(other).unwrap();
     }
 }
