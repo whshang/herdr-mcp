@@ -22,7 +22,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_TTL_MS: u64 = 10 * 60_000;
-const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
 const PROMPT_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60_000;
@@ -506,19 +505,6 @@ impl PromptTaskRecord {
     }
 }
 
-#[derive(Debug, Clone)]
-enum RecordState {
-    Pending,
-    Complete(Value),
-}
-
-#[derive(Debug, Clone)]
-struct PromptRecord {
-    at_ms: u64,
-    fingerprint: String,
-    state: RecordState,
-}
-
 struct HandoffInjection {
     text: String,
     marked_now: bool,
@@ -551,7 +537,6 @@ fn dispatch_definitely_not_delivered(result: &Value) -> bool {
             || result.get("retryable").and_then(Value::as_bool) == Some(true))
 }
 
-#[derive(Default)]
 struct PromptRegistryInner {
     // Serialize durable task read/modify/write across report, lifecycle, ack and
     // parent notification so a stale snapshot cannot erase an accepted report.
@@ -566,14 +551,13 @@ struct PromptRegistryInner {
     spawn_early_exit_watch_disabled: AtomicBool,
     #[cfg(test)]
     clock: Option<Arc<AtomicU64>>,
-    records: Mutex<HashMap<String, PromptRecord>>,
     handoff_injected_panes: Mutex<HashSet<String>>,
     store: Option<Arc<Mutex<StateStore>>>,
     cache: Option<Arc<EventCache>>,
     client: Option<HerdrClient>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
 }
@@ -607,11 +591,6 @@ impl PromptRegistry {
         now_ms()
     }
 
-    #[cfg(test)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Disable the S5 post-readiness early-exit watch for this registry.
     ///
     /// Test-only: a scripted Herdr fake answers one fixed sequence regardless of
@@ -634,7 +613,6 @@ impl PromptRegistry {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -656,7 +634,6 @@ impl PromptRegistry {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -685,7 +662,6 @@ impl PromptRegistry {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
@@ -710,85 +686,31 @@ impl PromptRegistry {
         })
     }
 
+    /// B2: idempotency reservations are always durable. A registry built
+    /// without a store cannot reserve or replay — fail closed rather than
+    /// falling back to a process-local state machine (#980).
     fn begin(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
-        if let Some(store) = &self.inner.store {
-            return begin_persisted(store, key, fingerprint);
-        }
-        self.begin_memory(key, fingerprint)
-    }
-
-    fn begin_memory(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
-        let now = self.now_ms();
-        let mut records = self
-            .inner
-            .records
-            .lock()
-            .map_err(|_| json!({"ok": false, "code": "idempotency_registry_unavailable"}))?;
-        records.retain(|_, record| now.saturating_sub(record.at_ms) < RECORD_TTL_MS);
-        if let Some(record) = records.get(key) {
-            if record.fingerprint != fingerprint {
-                return Err(json!({
-                    "ok": false,
-                    "code": "idempotency_key_conflict",
-                    "message": "idempotency_key is already bound to a different prompt request",
-                    "retryable": false,
-                }));
-            }
-            return match &record.state {
-                RecordState::Pending => Err(json!({
-                    "ok": false,
-                    "code": "idempotency_in_flight",
-                    "message": "a prompt with this idempotency_key is already in flight",
-                    "submitted": "unknown",
-                    "retryable": false,
-                    "hint": "A matching submission is already in progress; repeating it can duplicate work. The existing result or live agent state identifies the outcome.",
-                })),
-                RecordState::Complete(result) => {
-                    let mut replay = result.clone();
-                    if let Some(object) = replay.as_object_mut() {
-                        object.insert("idempotent_replay".to_owned(), json!(true));
-                    }
-                    Ok(BeginPrompt::Replay(replay))
-                }
-            };
-        }
-        records.insert(
-            key.to_owned(),
-            PromptRecord {
-                at_ms: now,
-                fingerprint: fingerprint.to_owned(),
-                state: RecordState::Pending,
-            },
-        );
-        if records.len() > RECORD_LIMIT {
-            let mut oldest = records
-                .iter()
-                .filter(|(candidate, _)| candidate.as_str() != key)
-                .map(|(candidate, record)| (candidate.clone(), record.at_ms))
-                .collect::<Vec<_>>();
-            oldest.sort_by_key(|(_, at)| *at);
-            for (candidate, _) in oldest.into_iter().take(records.len() - RECORD_LIMIT) {
-                records.remove(&candidate);
-            }
-        }
-        Ok(BeginPrompt::Reserved(None))
+        let Some(store) = &self.inner.store else {
+            return Err(json!({
+                "ok": false,
+                "code": "idempotency_store_unavailable",
+                "message": "prompt registry has no durable idempotency store; prompt was not submitted",
+                "retryable": false,
+            }));
+        };
+        begin_persisted(store, key, fingerprint)
     }
 
     fn complete(&self, key: &str, fingerprint: &str, result: &Value) -> Result<(), Value> {
-        if let Some(store) = &self.inner.store {
-            return complete_persisted(store, key, fingerprint, result);
-        }
-        if let Ok(mut records) = self.inner.records.lock() {
-            records.insert(
-                key.to_owned(),
-                PromptRecord {
-                    at_ms: now_ms(),
-                    fingerprint: fingerprint.to_owned(),
-                    state: RecordState::Complete(result.clone()),
-                },
-            );
-        }
-        Ok(())
+        let Some(store) = &self.inner.store else {
+            return Err(json!({
+                "ok": false,
+                "code": "idempotency_store_unavailable",
+                "message": "prompt registry has no durable idempotency store; result could not be journaled",
+                "retryable": false,
+            }));
+        };
+        complete_persisted(store, key, fingerprint, result)
     }
 
     /// Outcome of a first-dispatch handoff injection attempt. `marked_now` is
@@ -1345,12 +1267,8 @@ impl PromptRegistry {
         let key_hash = stable_digest(&[b"herdr_prompt/idempotency", idempotency_key.as_bytes()]);
         let op_id = format!("op:prompt:{}", &key_hash[..32]);
         let Some(store) = self.inner.store.as_ref() else {
-            return self
-                .inner
-                .records
-                .lock()
-                .map(|records| records.contains_key(idempotency_key))
-                .unwrap_or(false);
+            // B2: no store means no durable idempotency knowledge at all.
+            return false;
         };
         let Ok(store) = store.lock() else {
             return false;
@@ -4180,8 +4098,20 @@ fn begin_persisted(
                 .task_operation_ids_by_key_digest(PROMPT_TASK_OPERATION_KIND, &digest, now_i64)
                 .and_then(|mut ids| {
                     if ids.is_empty() {
-                        // Before this release, task rows were not indexed by key.
-                        // Their deterministic task_id still guards exact retries.
+                        // #665 legacy fallback: task rows written before the
+                        // key-digest index existed are not returned by
+                        // `task_operation_ids_by_key_digest`. Their
+                        // deterministic `task_id` still guards exact retries,
+                        // so we probe `dispatch_id(key, fingerprint)` directly.
+                        //
+                        // TTL淘汰条件（此分支自身即为淘汰边界）：
+                        // - `record.expires_at` 为 None 的旧行永不视为已淘汰
+                        //   （旧写入路径不记录 TTL，保守视为仍拥有该 key）；
+                        // - `expires_at <= now_i64` 的行已过期，不推入
+                        //   `ids`，key 可重新保留；
+                        // - `expires_at > now_i64` 的行仍然有效，阻止重放。
+                        // 该分支在 #980 B2 下保留：只要存在 `expires_at` 为
+                        // None 或未过期的旧行，删除它会放开对旧 key 的防护。
                         let old_id = dispatch_id(Some(key), fingerprint);
                         if let Some(record) = store.operation_ledger(&old_id)?
                             && record.kind == PROMPT_TASK_OPERATION_KIND
@@ -8666,10 +8596,11 @@ mod tests {
 
     #[test]
     fn idempotency_registry_prevents_parallel_and_conflicting_reuse() {
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         assert!(matches!(
             registry.begin("k", "fp-1").unwrap(),
-            BeginPrompt::Reserved(None)
+            BeginPrompt::Reserved(Some(_))
         ));
         assert_eq!(
             registry.begin("k", "fp-1").unwrap_err()["code"],
@@ -11061,7 +10992,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
@@ -11204,7 +11134,8 @@ mod tests {
             }
         });
         let client = HerdrClient::new(&socket);
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         let args = json!({
             "target": "pi",
             "text": "do work",
@@ -11707,7 +11638,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(Arc::clone(&store)),
                 cache: Some(Arc::clone(&cache)),
@@ -13064,7 +12994,8 @@ mod tests {
     /// read | Then the call is rejected with the existing invalid-params style.
     #[test]
     fn inbox_rejects_wait_ms_outside_the_bounded_range() {
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         for wait_ms in [
             json!(0),
             json!(60_001),
@@ -13217,7 +13148,8 @@ mod tests {
     /// Then the call is rejected with the existing invalid-params style.
     #[test]
     fn inbox_rejects_an_unknown_view() {
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         let inbox = task_call_with_parent_session(
             &registry,
             AGENT_TASK_INBOX_METHOD,
@@ -13426,7 +13358,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -14579,7 +14510,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -14765,7 +14695,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -15724,7 +15653,7 @@ mod tests {
             "a rejected dispatch must not write a task row"
         );
         assert!(
-            registry.inner.records.lock().unwrap().is_empty(),
+            !registry.dispatch_key_already_known("guard-self-1"),
             "a rejected dispatch must not reserve idempotency state"
         );
 
@@ -15781,7 +15710,7 @@ mod tests {
             2,
             "a rejected dispatch must not write a task row"
         );
-        assert!(registry.inner.records.lock().unwrap().is_empty());
+        assert!(!registry.dispatch_key_already_known("guard-depth-1"));
 
         // Web planner → supervisor → worker is the allowed depth: the planner is
         // a browser session, not another active task in the ledger.
@@ -15936,7 +15865,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
@@ -16886,7 +16814,8 @@ mod tests {
         let socket = temp_socket();
         let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         let client = HerdrClient::new(&socket);
         for (key, value) in [
             ("max_runtime_ms", json!(1000)),

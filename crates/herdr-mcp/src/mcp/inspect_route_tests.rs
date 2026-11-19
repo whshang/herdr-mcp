@@ -184,7 +184,9 @@ fn selection_drift_uses_admitted_backend_and_socket() {
         ]
     }));
     let exec = ExecRegistry::new(root.join("exec")).unwrap();
-    let prompt = PromptRegistry::new();
+    let prompt = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+        StateStore::open(":memory:").unwrap(),
+    )));
     let skill = SkillService::new();
     let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
     // #936: a started runtime admits one backend for its process lifetime. This

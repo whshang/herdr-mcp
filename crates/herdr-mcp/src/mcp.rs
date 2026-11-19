@@ -28902,9 +28902,9 @@ mod tests {
         let client = HerdrClient::new(temp_root.join("missing-herdr.sock"));
         let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
         let exec = ExecRegistry::new(temp_root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
 
         let context = RuntimeContext {
             client: &client,
@@ -32467,9 +32467,9 @@ mod client_request_shape_matrix_tests {
         let client = HerdrClient::new(temp_root.join("missing-herdr.sock"));
         let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
         let exec = ExecRegistry::new(temp_root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         state_store
             .lock()
             .unwrap()
@@ -32861,10 +32861,10 @@ mod client_request_shape_matrix_tests {
             "agents": []
         }));
         let exec = ExecRegistry::new(temp_root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store =
             std::sync::Arc::new(std::sync::Mutex::new(StateStore::open(":memory:").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let _env = crate::test_env::lock();
         let _config = crate::test_env::TuiConfigGuard::install(&temp_root);
         let backend = crate::test_env::tui_backend_selection();
@@ -34047,9 +34047,9 @@ mod text_transfer_safety_tests {
         let client = HerdrClient::new(home.join("missing.sock"));
         let cache = EventCache::from_snapshot_for_test(json!({"panes": [], "agents": []}));
         let exec = ExecRegistry::new(home.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let backend = crate::test_env::admitted_backend_selection();
         let context = RuntimeContext {
             client: &client,
@@ -34535,9 +34535,9 @@ mod durable_client_request_tests {
             "workspaces": [], "tabs": [], "panes": [], "agents": []
         }));
         let exec = ExecRegistry::new(root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let backend = crate::test_env::tui_backend_selection();
         let context = durable_context(
             &client,
@@ -34613,9 +34613,9 @@ mod durable_client_request_tests {
             "workspaces": [], "tabs": [], "panes": [], "agents": []
         }));
         let exec = ExecRegistry::new(root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let backend = crate::test_env::tui_backend_selection();
         let context = durable_context(
             &client,
@@ -34686,9 +34686,9 @@ mod durable_client_request_tests {
             "workspaces": [], "tabs": [], "panes": [], "agents": []
         }));
         let exec = ExecRegistry::new(root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let backend = crate::test_env::tui_backend_selection();
         let context = durable_context(
             &client,
@@ -34764,9 +34764,9 @@ mod durable_client_request_tests {
             "workspaces": [], "tabs": [], "panes": [], "agents": []
         }));
         let exec = ExecRegistry::new(root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let backend = crate::test_env::tui_backend_selection();
         let context_a = durable_context(
             &client,
@@ -34827,9 +34827,9 @@ mod durable_client_request_tests {
             "workspaces": [], "tabs": [], "panes": [], "agents": []
         }));
         let exec = ExecRegistry::new(root.join("exec")).unwrap();
-        let prompt = PromptRegistry::new();
         let skill = SkillService::new();
         let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(std::sync::Arc::clone(&state_store));
         let backend = crate::test_env::tui_backend_selection();
         let context = durable_context(
             &client,
