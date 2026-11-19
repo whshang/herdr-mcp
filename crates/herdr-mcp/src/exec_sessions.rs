@@ -1302,31 +1302,40 @@ impl ExecRegistry {
     /// and every native backend's `output_readers` has drained. Sessions
     /// recovered row-only (`evidence_missing`) never persist and are skipped:
     /// they perform no writes to drain.
+    ///
+    /// Both the map and the per-session status probes use `try_lock`: a blocked
+    /// `lock()` could sit past `timeout` (Codex review P2 on #1086), so lock
+    /// contention is treated as "still busy" and the same deadline applies
+    /// uniformly. Evicted sessions are outside `inner.sessions` by definition;
+    /// their in-flight writes are not observable here — the drain covers only
+    /// sessions still resident, which is every session a short-lived test
+    /// registry can still be persisting for.
     #[cfg(test)]
     pub(crate) fn wait_for_writes_quiescent(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            let quiescent = self
-                .inner
-                .sessions
-                .lock()
-                .map(|sessions| {
-                    sessions.values().all(|session| {
-                        if session.evidence_missing {
-                            return true;
-                        }
-                        let status = session_status(session);
-                        if !status.closed || !status.evidence_persisted {
-                            return false;
-                        }
-                        !matches!(
-                            &session.backend,
-                            SessionBackend::Native { output_readers, .. }
-                                if output_readers.load(Ordering::Acquire) > 0
-                        )
-                    })
-                })
-                .unwrap_or(false);
+            let quiescent = match self.inner.sessions.try_lock() {
+                Ok(sessions) => sessions.values().all(|session| {
+                    if session.evidence_missing {
+                        return true;
+                    }
+                    let Ok(status) = session.status.try_lock() else {
+                        // A held status lock means a close/persist transition is
+                        // mid-flight: not quiescent yet, but no evidence the
+                        // deadline should be ignored.
+                        return false;
+                    };
+                    if !status.closed || !status.evidence_persisted {
+                        return false;
+                    }
+                    !matches!(
+                        &session.backend,
+                        SessionBackend::Native { output_readers, .. }
+                            if output_readers.load(Ordering::Acquire) > 0
+                    )
+                }),
+                Err(_) => false,
+            };
             if quiescent {
                 return true;
             }
@@ -4043,5 +4052,62 @@ mod tests {
 
         drop(restarted);
         let _ = fs::remove_dir_all(&path);
+    }
+
+    /// #1086 review: the drain must honor its deadline even while another
+    /// thread holds the sessions-map lock, i.e. probes are `try_lock` and the
+    /// wait never parks inside `lock()` past `timeout`.
+    #[test]
+    fn wait_for_writes_quiescent_respects_deadline_under_map_lock() {
+        let registry = registry();
+        let held = registry.inner.sessions.lock().unwrap();
+        let started = Instant::now();
+        let quiescent = registry.wait_for_writes_quiescent(Duration::from_millis(80));
+        assert!(!quiescent);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drain must not block on a held sessions lock past its deadline"
+        );
+        drop(held);
+        // Empty registry quiesces immediately once the lock is free.
+        assert!(registry.wait_for_writes_quiescent(Duration::from_secs(2)));
+    }
+
+    /// Same bound while a single session's `status` lock is held: contention
+    /// counts as busy, never as a blocking acquisition.
+    #[test]
+    fn wait_for_writes_quiescent_respects_deadline_under_status_lock() {
+        let registry = registry();
+        let session = Arc::new(Session {
+            id: "es_drain_lock_test".to_owned(),
+            cwd: PathBuf::new(),
+            command: String::new(),
+            started_at_ms: now_ms(),
+            pid: None,
+            backend: SessionBackend::Completed,
+            buffers: Mutex::new(Buffers::default()),
+            status: Mutex::new(SessionStatus {
+                closed: true,
+                evidence_persisted: true,
+                ..SessionStatus::default()
+            }),
+            evidence_missing: false,
+        });
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), Arc::clone(&session));
+        let held = session.status.lock().unwrap();
+        let started = Instant::now();
+        let quiescent = registry.wait_for_writes_quiescent(Duration::from_millis(80));
+        assert!(!quiescent);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drain must not block on a held status lock past its deadline"
+        );
+        drop(held);
+        assert!(registry.wait_for_writes_quiescent(Duration::from_secs(2)));
     }
 }
