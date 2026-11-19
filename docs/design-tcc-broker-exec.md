@@ -219,6 +219,14 @@ mcp herdr_exec {workspace, project_root, command:"printf ok", timeout_ms:30000, 
 
 ### 6.2 Raw samples
 
+**Collection environment and time.** Samples were taken on two macOS
+workstations (TCC-protected vs. home root) with the `herdr-mcp` runtime built
+from the 1.2 line and the pinned Herdr TUI `0.9.5`; each row is 10 consecutive
+runs of the same command after one warmup. Re-measure before treating these
+numbers as a current baseline — runtime and Herdr versions both affect the
+utility-pane overhead, and this table is evidence for the design trade-off, not
+a release gate.
+
 **Protected path — `backend:"utility_pane"`**, macOS device A
 (`dev_<device-A>`), workspace `<ws-A>`,
 root `~/Documents/herdr-mcp`:
@@ -275,6 +283,15 @@ protected roots (each pane is a real terminal tab the user sees), not in
 per-command latency, which is Edge-dominated anyway.
 
 ## 7. Proposed request/response contract (v1, tier 1)
+
+**Implementation precondition.** This contract is a proposal. Before any code
+lands, the acceptance side must be reconciled with the existing
+`runtime_owner_token` rotation semantics (§9): the broker verifies the token
+against the runtime owner record on every request, so v1 has to state what
+happens when the token rotates mid-connection (rejected request must fail
+closed, never fall back to a weaker check) and how a broker restart picks up the
+new token without accepting a stale one. Until that is written down, tier-1
+exec mediation stays unimplemented.
 
 ```jsonc
 // request

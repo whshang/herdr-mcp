@@ -22,6 +22,12 @@ const POLL_BACKOFF: [Duration; 6] = [
 ];
 /// A child reaped by its spawning call within this window cannot outlive a
 /// daemon restart, so it is never written to the on-disk orphan registry.
+///
+/// Trade-off (#1050 review): if the daemon dies inside this window, the child
+/// was never recorded, so boot-time orphan reaping cannot find it. The window
+/// is deliberately tiny (25 ms) and only covers commands that finish almost
+/// immediately; anything longer is registered before the daemon could next
+/// crash on a request path.
 const REGISTRATION_GRACE: Duration = Duration::from_millis(25);
 
 #[cfg(target_os = "macos")]
@@ -248,6 +254,12 @@ fn wait_with_deferred_registration<S, T, R>(
     }
     if clock.now() >= deadline {
         return Ok((None, None));
+    }
+    // The grace boundary can land on a child that just exited: poll once more
+    // before writing the registry entry, so a dead pid is never recorded and
+    // later "reaped" on boot (#1050 review).
+    if let Some(value) = poll(state)? {
+        return Ok((Some(value), None));
     }
     let registration = register(state);
     let value = poll_until(clock, deadline, &mut backoff, || poll(state))?;
@@ -1103,6 +1115,41 @@ mod poll_tests {
         assert!(registration.is_none());
         assert_eq!(registrations, 0);
         assert_eq!(clock.now(), started + Duration::from_millis(5));
+    }
+
+    /// user never gets a dead child registered | Given a child that exits right
+    /// at the registration grace boundary | When the waiter re-checks liveness
+    /// before writing the orphan registry | Then nothing is registered and the
+    /// exit status is returned (#1050 review).
+    #[test]
+    fn child_exiting_at_the_grace_boundary_is_not_registered() {
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let grace_deadline = started + REGISTRATION_GRACE;
+        let mut registrations = 0_u32;
+        let (status, registration) = wait_with_deferred_registration(
+            &clock,
+            &mut (),
+            started,
+            Duration::from_secs(5),
+            REGISTRATION_GRACE,
+            |_| {
+                if clock.now() < grace_deadline {
+                    Ok(None::<u8>)
+                } else {
+                    // The child finished exactly as the grace window closed.
+                    Ok(Some(7_u8))
+                }
+            },
+            |_| registrations += 1,
+        )
+        .expect("wait result");
+        assert_eq!(status, Some(7));
+        assert!(
+            registration.is_none(),
+            "a finished child must not be registered"
+        );
+        assert_eq!(registrations, 0);
     }
 
     #[test]
