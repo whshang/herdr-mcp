@@ -4,6 +4,7 @@
   "contract_epoch": 4,
   "contract_hash": "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135",
   "tool_count": 18,
+  "state_schema": 15,
   "shape": {
     "tool": "herdr_exec",
     "set": {

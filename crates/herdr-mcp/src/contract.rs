@@ -80,13 +80,31 @@ pub fn identity() -> Result<ContractIdentity, String> {
     identity_from_descriptor(&descriptor()?, tool_names().len())
 }
 
+#[cfg(test)]
+pub fn state_schema() -> Result<i64, String> {
+    state_schema_from_descriptor(&descriptor()?)
+}
+
 /// Identity of the immediately previous runtime execution contract (frozen
-/// epoch 4). The current binary never serves it; this accessor exists so the
+/// epoch 5). The current binary never serves it; this accessor exists so the
 /// frozen predecessor identity stays pinned by regression instead of drifting
 /// silently with the descriptor file.
 #[cfg(test)]
 pub fn previous_identity() -> Result<ContractIdentity, String> {
     identity_from_descriptor(&previous_descriptor()?, tool_names().len())
+}
+
+#[cfg(test)]
+pub fn previous_state_schema() -> Result<i64, String> {
+    state_schema_from_descriptor(&previous_descriptor()?)
+}
+
+#[cfg(test)]
+fn state_schema_from_descriptor(descriptor: &Value) -> Result<i64, String> {
+    i64::try_from(descriptor_u64(descriptor, "state_schema")?)
+        .ok()
+        .filter(|schema| *schema > 0)
+        .ok_or_else(|| format!("{DESCRIPTOR_NAME} descriptor state_schema is out of range"))
 }
 
 fn identity_from_descriptor(
@@ -245,6 +263,7 @@ mod tests {
         let identity = identity().unwrap();
         assert_eq!(identity.epoch, 6);
         assert_eq!(identity.tool_count, 18);
+        assert_eq!(state_schema().unwrap(), crate::state_store::SCHEMA_VERSION);
         // The exact hash is pinned below by the descriptor's contract_hash;
         // recomputing it here guards against the descriptor and the shaped
         // catalog drifting apart.
@@ -261,6 +280,7 @@ mod tests {
         let previous = previous_identity().unwrap();
         assert_eq!(previous.epoch, 5);
         assert_eq!(previous.tool_count, 18);
+        assert_eq!(previous_state_schema().unwrap(), 16);
         assert_eq!(
             previous.hash,
             "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030"
@@ -284,6 +304,7 @@ mod tests {
         );
         let frozen_v4: Value = serde_json::from_str(RUNTIME_EXEC_V4_JSON).unwrap();
         assert_eq!(frozen_v4["contract_epoch"], 4);
+        assert_eq!(frozen_v4["state_schema"], 15);
         assert_eq!(
             frozen_v4["contract_hash"],
             "sha256:1f4d272cedb3334b3e17e08080793f6ed81a03dccffba2f6434f149b10e2e135"
