@@ -483,28 +483,49 @@ fn load_session_from_spool_or_record(
         Err(_) => spool_corrupt = true,
         Ok(bytes) => match serde_json::from_slice::<SavedCompletionEvidence>(&bytes) {
             Ok(artifact) if artifact.version == 1 && artifact.session_id == record.session_id => {
-                let stdout_data = BASE64.decode(&artifact.stdout_tail).unwrap_or_default();
-                let stderr_data = BASE64.decode(&artifact.stderr_tail).unwrap_or_default();
-                stdout_bytes = stdout_data.len();
-                stderr_bytes = stderr_data.len();
-                let mut next_seq = 0u64;
-                if !stdout_data.is_empty() {
-                    chunks.push(Chunk {
-                        seq: next_seq,
-                        stream: StreamKind::Stdout,
-                        data: stdout_data,
-                    });
-                    next_seq = next_seq.saturating_add(1);
+                match decode_spool_stream(&artifact.stdout_tail, artifact.stdout_bytes).and_then(
+                    |stdout_data| {
+                        decode_spool_stream(&artifact.stderr_tail, artifact.stderr_bytes)
+                            .map(|stderr_data| (stdout_data, stderr_data))
+                    },
+                ) {
+                    Ok((stdout_data, stderr_data)) => {
+                        stdout_bytes = stdout_data.len();
+                        stderr_bytes = stderr_data.len();
+                        let mut next_seq = 0u64;
+                        if !stdout_data.is_empty() {
+                            chunks.push(Chunk {
+                                seq: next_seq,
+                                stream: StreamKind::Stdout,
+                                data: stdout_data,
+                            });
+                            next_seq = next_seq.saturating_add(1);
+                        }
+                        if !stderr_data.is_empty() {
+                            chunks.push(Chunk {
+                                seq: next_seq,
+                                stream: StreamKind::Stderr,
+                                data: stderr_data,
+                            });
+                        }
+                        truncated = artifact.truncated;
+                        // A declared byte count that the decoded tail cannot
+                        // carry is corrupt unless the artifact already says the
+                        // tail was truncated to the spool cap.
+                        if (!truncated)
+                            && (artifact.stdout_bytes != stdout_bytes
+                                || artifact.stderr_bytes != stderr_bytes)
+                        {
+                            chunks.clear();
+                            stdout_bytes = 0;
+                            stderr_bytes = 0;
+                            spool_corrupt = true;
+                        } else {
+                            evidence_loaded = true;
+                        }
+                    }
+                    Err(()) => spool_corrupt = true,
                 }
-                if !stderr_data.is_empty() {
-                    chunks.push(Chunk {
-                        seq: next_seq,
-                        stream: StreamKind::Stderr,
-                        data: stderr_data,
-                    });
-                }
-                truncated = artifact.truncated;
-                evidence_loaded = true;
             }
             _ => spool_corrupt = true,
         },
@@ -542,6 +563,20 @@ fn load_session_from_spool_or_record(
         evidence_missing: !evidence_loaded,
         spool_corrupt,
     })
+}
+
+/// Decode one base64 spool tail. A legal JSON document with a broken tail is
+/// corrupt evidence, never a successful empty capture. The decoded length must
+/// match the declared byte count, or be the bounded tail of a truncated stream.
+fn decode_spool_stream(encoded: &str, declared_bytes: usize) -> Result<Vec<u8>, ()> {
+    let decoded = BASE64.decode(encoded).map_err(|_| ())?;
+    if decoded.len() > RECOVERY_SPOOL_CAP || decoded.len() > declared_bytes {
+        return Err(());
+    }
+    if declared_bytes > RECOVERY_SPOOL_CAP && decoded.len() != RECOVERY_SPOOL_CAP {
+        return Err(());
+    }
+    Ok(decoded)
 }
 
 fn clean_expired_spools(state_dir: &Path, unexpired_session_ids: &HashSet<String>) {
@@ -964,15 +999,14 @@ impl ExecRegistry {
         };
         refresh_session_status(&session, Some(&self.inner));
         {
-            // A durable `closed` row without its `.spool` artifact is missing
-            // output evidence, not an empty completion: refuse rather than
-            // report `ok` with an empty buffer.
+            // A durable row whose output is not in this process is missing
+            // evidence, not an empty completion. A session that is still
+            // resident keeps serving its memory buffers even after persist
+            // retries are abandoned: the buffers are the remaining copy until
+            // `prune_loaded_closed_sessions` drops the session.
             let status = session.status.lock();
             let closed = status.as_ref().map(|status| status.closed).unwrap_or(true);
-            let abandoned = status
-                .as_ref()
-                .is_ok_and(|status| status.persist_abandoned && !status.evidence_persisted);
-            if closed && (session.evidence_missing || abandoned) {
+            if closed && session.evidence_missing {
                 let corrupt = session.spool_corrupt;
                 let reason = if corrupt {
                     "session_spool_corrupt"
@@ -1269,13 +1303,13 @@ impl ExecRegistry {
         {
             return Some(Arc::clone(session));
         }
-        let record = self
-            .inner
-            .state_store
-            .lock()
-            .ok()
-            .and_then(|store| store.get_closed_exec_session(id).ok())
-            .flatten()?;
+        let record = self.inner.state_store.lock().ok().and_then(|store| {
+            store
+                .get_closed_exec_session(id)
+                .ok()
+                .flatten()
+                .or_else(|| store.get_abandoned_exec_session(id).ok().flatten())
+        })?;
         let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
         // A row whose `.spool` has not committed yet is an in-flight close, a
         // crashed write, or lost output. Do not cache the empty projection:
@@ -2107,6 +2141,15 @@ fn persist_closed_evidence(
     let settle_result = settle_closed_evidence(inner, session, ended_at, exit_code, signal);
     if settle_result.is_err() {
         inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        // The row would otherwise stay `running` with a null `expires_at`.
+        // Mark it abandoned so eviction can still rebuild a non-replayable
+        // incomplete fact instead of reporting `session_not_found`.
+        let expires_at = ended_at.saturating_add(SESSION_TTL_MS);
+        if mark_exec_session_abandoned(inner, session, ended_at, exit_code, signal, expires_at)
+            .is_err()
+        {
+            inner.persistence_failures.fetch_add(1, Ordering::Relaxed);
+        }
     }
     if let Ok(mut status) = session.status.lock() {
         if spool_result.is_ok() && settle_result.is_ok() {
@@ -2119,6 +2162,21 @@ fn persist_closed_evidence(
             status.persist_abandoned = true;
         }
     }
+}
+
+fn mark_exec_session_abandoned(
+    inner: &RegistryInner,
+    session: &Arc<Session>,
+    ended_at: u64,
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+    expires_at: u64,
+) -> Result<(), String> {
+    let store = inner
+        .state_store
+        .lock()
+        .map_err(|_| "exec state store lock poisoned".to_owned())?;
+    store.mark_exec_session_abandoned(&session.id, ended_at, exit_code, signal, expires_at)
 }
 
 fn complete_session(
@@ -4020,6 +4078,222 @@ mod tests {
         assert_eq!(view["recovered"], true);
 
         drop(abandoned);
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given a completed session still resident after persist
+    /// retries fail | When it is read before the resident cap evicts it | Then
+    /// the caller still receives the completed phase, exit fact, and memory
+    /// output.
+    #[test]
+    fn user_operator_reads_completed_output_while_abandoned_session_stays_resident() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-resident-abandoned-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_exec_running("es_resident_abandoned", 8_000, None, now)
+            .unwrap();
+        let session = unpersisted_closed_session("es_resident_abandoned", "still-in-memory\n");
+        session.status.lock().unwrap().exit_code = Some(7);
+        session.status.lock().unwrap().signal = Some("SIGTERM".to_owned());
+        let spool_dir = exec_spool_dir(&path);
+        fs::remove_dir_all(&spool_dir).unwrap();
+        fs::write(&spool_dir, "not-a-directory").unwrap();
+        persist_closed_evidence(&registry.inner, &session, now, Some(7), Some("SIGTERM"));
+        fs::remove_file(&spool_dir).unwrap();
+        fs::create_dir_all(&spool_dir).unwrap();
+        assert!(session.status.lock().unwrap().persist_abandoned);
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), Arc::clone(&session));
+
+        let view = registry.read("es_resident_abandoned", "stdout", 0, 64);
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["phase"], "completed");
+        assert_eq!(view["exit_code"], 7);
+        assert_eq!(view["signal"], "SIGTERM");
+        assert_eq!(view["text"], "still-in-memory\n");
+        assert_eq!(view["running"], false);
+
+        drop(session);
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given a native command whose spool directory cannot be
+    /// written | When the durable exec path observes the exit | Then it reports
+    /// phase completed from the resident buffers instead of timing out as
+    /// running.
+    #[test]
+    fn user_operator_observes_completed_phase_when_native_persist_fails() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-native-persist-fail-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        let spool_dir = exec_spool_dir(&path);
+        fs::create_dir_all(&spool_dir).unwrap();
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        fs::remove_dir_all(&spool_dir).unwrap();
+        fs::write(&spool_dir, "not-a-directory").unwrap();
+        let cwd = path.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let started = registry.start(&cwd, "printf native-output").unwrap();
+        let session_id = started["session_id"].as_str().unwrap();
+        let mut view = Value::Null;
+        for _ in 0..100 {
+            view = registry.read(session_id, "stdout", 0, 64);
+            if view["phase"] == "completed" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["phase"], "completed", "{view}");
+        assert_eq!(view["text"], "native-output");
+        assert_ne!(view["phase"], "running");
+
+        drop(registry);
+        let _ = fs::remove_file(&spool_dir);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given settle_exec_session fails and the resident cap
+    /// then drops the session | When the session is read before and after a
+    /// restart | Then the row is abandoned with an expiry and the read stays
+    /// incomplete instead of session_not_found.
+    #[test]
+    fn user_operator_rebuilds_abandoned_row_after_settle_failure_and_restart() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-settle-abandoned-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let now = now_ms();
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .record_exec_running("es_settle_fail", 11_000, None, now)
+            .unwrap();
+        let session = unpersisted_closed_session("es_settle_fail", "committed-spool\n");
+        write_session_spool(&path, &session).unwrap();
+        // The durable row stays `running` with a null expiry. Settle is forced
+        // to fail, then the abandoned marker records the non-replayable fact.
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .fail_next_exec_settle_for_test();
+        persist_closed_evidence(&registry.inner, &session, now, Some(4), None);
+        assert!(session.status.lock().unwrap().persist_abandoned);
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), Arc::clone(&session));
+
+        let resident = registry.read("es_settle_fail", "stdout", 0, 64);
+        assert_eq!(resident["phase"], "completed", "{resident}");
+        assert_eq!(resident["text"], "committed-spool\n");
+
+        registry
+            .inner
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), Arc::clone(&session));
+        for i in 0..RECOVERY_MAX_ENTRIES + 1 {
+            let session_id = format!("es_fill_{i:03}");
+            registry.inner.sessions.lock().unwrap().insert(
+                session_id.clone(),
+                loaded_completed_session(&session_id, now + 2_000 + i as u64, now + 2_000, "x\n"),
+            );
+        }
+        registry.prune();
+        let evicted = registry.read("es_settle_fail", "stdout", 0, 64);
+        assert_eq!(evicted["ok"], true, "{evicted}");
+        assert_eq!(evicted["phase"], "completed");
+        assert_eq!(evicted["text"], "committed-spool\n");
+        assert_eq!(evicted["exit_code"], 4);
+
+        drop(session);
+        drop(registry);
+        let restarted = ExecRegistry::new(path.clone()).unwrap();
+        let booted = restarted.read("es_settle_fail", "stdout", 0, 64);
+        assert_eq!(booted["ok"], true, "{booted}");
+        assert_eq!(booted["phase"], "completed");
+        assert_eq!(booted["text"], "committed-spool\n");
+        assert_eq!(booted["exit_code"], 4);
+        assert_ne!(booted["reason"], "session_not_found");
+        drop(restarted);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given a committed spool whose JSON is legal but whose
+    /// base64 tail is not | When the closed row is read | Then the result is
+    /// session_spool_corrupt and a real empty tail stays successful.
+    #[test]
+    fn user_operator_rejects_legal_json_with_corrupt_base64_as_spool_corrupt() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-bad-base64-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let now = now_ms();
+        for id in ["es_bad_base64", "es_zero"] {
+            store.record_exec_running(id, 12_000, None, now).unwrap();
+            store
+                .settle_exec_session(
+                    id,
+                    "closed",
+                    Some(now + 3),
+                    Some(0),
+                    None,
+                    now + SESSION_TTL_MS,
+                )
+                .unwrap();
+        }
+        drop(store);
+        fs::create_dir_all(exec_spool_dir(&path)).unwrap();
+        fs::write(
+            exec_spool_path(&path, "es_bad_base64"),
+            br#"{"version":1,"session_id":"es_bad_base64","stdout_bytes":4,"stderr_bytes":0,"truncated":false,"stdout_tail":"!!!!","stderr_tail":""}"#,
+        )
+        .unwrap();
+        let empty = unpersisted_closed_session("es_zero", "");
+        empty.buffers.lock().unwrap().chunks.clear();
+        empty.buffers.lock().unwrap().stdout_bytes = 0;
+        write_session_spool(&path, &empty).unwrap();
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        let corrupt = registry.read("es_bad_base64", "both", 0, 64);
+        assert_eq!(corrupt["ok"], false, "{corrupt}");
+        assert_eq!(corrupt["reason"], "session_spool_corrupt");
+        let zero = registry.read("es_zero", "both", 0, 64);
+        assert_eq!(zero["ok"], true, "{zero}");
+        assert_eq!(zero["phase"], "completed");
+        assert_eq!(zero["text"], "");
+
         drop(registry);
         let _ = fs::remove_dir_all(&path);
     }

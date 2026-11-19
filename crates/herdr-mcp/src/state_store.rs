@@ -9257,6 +9257,96 @@ impl StateStore {
         }
     }
 
+    /// A close whose SQLite settle failed. The row is no longer `running`, so
+    /// restart recovery will not treat the command as a live process, and a
+    /// later read can rebuild incomplete evidence instead of `session_not_found`.
+    /// `expires_at` is required so the abandoned fact cannot outlive the
+    /// session TTL. Callers must not replay the command from this state.
+    #[cfg(test)]
+    pub fn fail_next_exec_settle_for_test(&self) {
+        let _ = self
+            .conn
+            .execute("CREATE TRIGGER fail_exec_settle BEFORE UPDATE OF state ON exec_sessions WHEN NEW.state = 'closed' BEGIN SELECT RAISE(ABORT, 'test settle failure'); END", []);
+    }
+
+    pub fn mark_exec_session_abandoned(
+        &self,
+        session_id: &str,
+        ended_at_ms: u64,
+        exit_code: Option<i32>,
+        signal: Option<&str>,
+        expires_at_ms: u64,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE exec_sessions SET
+                    ended_at = ?2,
+                    exit_code = ?3,
+                    signal = ?4,
+                    state = 'abandoned',
+                    expires_at = ?5
+                 WHERE session_id = ?1 AND state = 'running'",
+                rusqlite::params![
+                    session_id,
+                    i64::try_from(ended_at_ms).unwrap_or(i64::MAX),
+                    exit_code,
+                    signal,
+                    i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("cannot mark abandoned exec session: {error}"))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot mark abandoned exec session {session_id}: durable running row is missing"
+            ))
+        }
+    }
+
+    pub fn get_abandoned_exec_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1 AND state = 'abandoned'",
+            )
+            .map_err(|error| format!("cannot prepare abandoned exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query abandoned exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode abandoned exec session: {error}"))?;
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms: u64::try_from(started_at).unwrap_or(0),
+                    ended_at_ms: ended_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                    exit_code,
+                    signal,
+                    expires_at_ms: expires_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn closed_exec_sessions(
         &self,
         now_ms: u64,
