@@ -490,11 +490,18 @@ fn collect_untracked(
     root: &Path,
     filter: Option<&PathBuf>,
 ) -> Result<(Vec<UntrackedFile>, bool), String> {
+    // `--untracked-files=normal` keeps Git's native collapsing of fully
+    // untracked directories (they arrive as `?? dir/` records) instead of
+    // recursively flattening every file in large unignored output trees —
+    // see issue #1071. A caller-supplied `path` filter already scopes the
+    // query at a directory they explicitly asked about, so that targeted
+    // listing keeps full expansion (`all`).
+    let mode = if filter.is_some() { "all" } else { "normal" };
     let mut args = vec![
         "status".to_owned(),
         "--porcelain=v1".to_owned(),
         "-z".to_owned(),
-        "--untracked-files=all".to_owned(),
+        format!("--untracked-files={mode}"),
         "--no-renames".to_owned(),
     ];
     if let Some(filter) = filter {
@@ -535,6 +542,18 @@ fn collect_untracked(
         if files.len() >= UNTRACKED_MAX_FILES {
             listing_truncated = true;
             break;
+        }
+        if rel.ends_with('/') {
+            // A directory collapsed by `--untracked-files=normal`: the subtree
+            // is intentionally not enumerated or sampled; `kind: "directory"`
+            // plus `truncated: true` marks the folded contents.
+            files.push(UntrackedFile {
+                path: rel.to_owned(),
+                size: 0,
+                kind: "directory",
+                truncated: true,
+            });
+            continue;
         }
         files.push(classify_untracked_file(root, &rel_path));
     }
@@ -1218,6 +1237,96 @@ mod tests {
 
     fn snapshot_for(root: &Path) -> Value {
         json!({"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}], "agents": []})
+    }
+
+    #[test]
+    fn git_diff_collapses_fully_untracked_directories() {
+        let root = unique_temp_dir("git-diff-untracked-dir");
+        fs::create_dir_all(root.join("bigdir")).unwrap();
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git_init(&root);
+        git_commit(&root, "baseline");
+        for index in 0..50 {
+            fs::write(root.join("bigdir").join(format!("f{index}.txt")), "x\n").unwrap();
+        }
+        fs::write(root.join("loose.txt"), "loose\n").unwrap();
+
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        let untracked = result["untracked"].as_array().unwrap();
+        let bigdir = untracked
+            .iter()
+            .find(|entry| entry["path"].as_str() == Some("bigdir/"))
+            .unwrap_or_else(|| panic!("collapsed dir entry missing: {untracked:?}"));
+        assert_eq!(bigdir["kind"], "directory");
+        assert_eq!(bigdir["truncated"], true);
+        assert!(
+            !untracked.iter().any(|entry| entry["path"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("bigdir/f"))),
+            "collapsed dir must not list individual files: {untracked:?}"
+        );
+        let loose = untracked
+            .iter()
+            .find(|entry| entry["path"].as_str() == Some("loose.txt"))
+            .unwrap_or_else(|| panic!("scattered file entry missing: {untracked:?}"));
+        assert_eq!(loose["kind"], "text");
+        assert_eq!(loose["size"], 6);
+        assert_eq!(result["untracked_count"], 2);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn git_diff_clean_workspace_returns_empty_untracked() {
+        let root = unique_temp_dir("git-diff-clean");
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git_init(&root);
+        git_commit(&root, "baseline");
+
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["untracked"], json!([]));
+        assert_eq!(result["untracked_count"], 0);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn git_diff_untracked_partially_tracked_dir_still_lists_files() {
+        let root = unique_temp_dir("git-diff-partial-dir");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/tracked.txt"), "base\n").unwrap();
+        git_init(&root);
+        git_commit(&root, "baseline");
+        fs::write(root.join("src/new.rs"), "fn new() {}\n").unwrap();
+        fs::write(root.join("src/other.rs"), "fn other() {}\n").unwrap();
+
+        let result = run(
+            &snapshot_for(&root),
+            &json!({"root": root, "action": "diff"}),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        let paths: Vec<&str> = result["untracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect();
+        assert!(paths.contains(&"src/new.rs"), "{paths:?}");
+        assert!(paths.contains(&"src/other.rs"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|path| path == &"src/"),
+            "partially tracked dir must not collapse: {paths:?}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

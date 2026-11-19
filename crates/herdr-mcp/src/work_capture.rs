@@ -50,6 +50,43 @@ pub(crate) fn strip_handoff_context(text: &str) -> Option<String> {
     (!user.is_empty()).then_some(user)
 }
 
+/// Cheap pre-check for tool-call capture: can this call possibly resolve a
+/// work scope? `resolve_scope` only ever derives a scope from these keys (or a
+/// nested `params` JSON object), so a call without any of them can never produce
+/// an event. Callers use this to skip the snapshot clone and argument
+/// sanitization entirely on the hot path.
+///
+/// Kept exactly in sync with `resolve_scope`/`collect_path_candidates`/
+/// `workspace_argument`; `may_record_matches_event_builder` proves the
+/// equivalence for both the positive and the negative case.
+pub(crate) fn may_record_tool_call(tool_name: &str, arguments: &Value) -> bool {
+    if tool_name == "herdr_call"
+        && arguments.get("method").and_then(Value::as_str) == Some("work.pickup")
+    {
+        return false;
+    }
+    let Some(object) = arguments.as_object() else {
+        return false;
+    };
+    const SCOPE_KEYS: [&str; 12] = [
+        "project_root",
+        "root",
+        "cwd",
+        "path",
+        "paths",
+        "params",
+        "workspace",
+        "workspace_id",
+        "pane",
+        "pane_id",
+        "target",
+        "worktree",
+    ];
+    SCOPE_KEYS
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+}
+
 pub(crate) fn event_for_tool_call(
     tool_name: &str,
     arguments: &Value,
@@ -504,6 +541,114 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    /// user pays no capture cost for calls that cannot journal work | Given a
+    /// tool call whose arguments carry none of the scope keys | When the cheap
+    /// pre-check runs | Then it reports "no capture" and the full event builder
+    /// agrees for every tool name, while canonical scope arguments still pass
+    /// the pre-check (no false negatives).
+    #[test]
+    fn may_record_matches_the_event_builder_for_scope_free_calls() {
+        let topology = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"path": "/tmp/wt", "root": "/tmp/wt"}
+            }],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/tmp/wt"}]
+        });
+        let tool_names = [
+            "herdr_methods",
+            "herdr_inspect",
+            "herdr_fs_read",
+            "herdr_fs_grep",
+            "herdr_git",
+            "herdr_prompt",
+            "herdr_exec",
+            "herdr_call",
+            "herdr_since",
+            "herdr_skill",
+        ];
+        let scope_free = [
+            json!({}),
+            json!({"query": "flaky"}),
+            json!({"method": "session.list"}),
+            json!({"pane": null}),
+            json!({"options": {"deep": true}}),
+        ];
+        for name in tool_names {
+            for arguments in &scope_free {
+                assert!(
+                    !may_record_tool_call(name, arguments),
+                    "no scope key must short-circuit: {name} {arguments}"
+                );
+                assert!(
+                    event_for_tool_call(name, arguments, &topology).is_none(),
+                    "the event builder must agree there is nothing to record: {name} {arguments}"
+                );
+            }
+        }
+
+        // Canonical scope arguments keep the capture path enabled.
+        for arguments in [
+            json!({"path": "/tmp/wt/file"}),
+            json!({"cwd": "/tmp/wt"}),
+            json!({"workspace": "w1"}),
+            json!({"pane": "w1:p1"}),
+            json!({"target": "w1:p1"}),
+            json!({"params": "{\"path\":\"/tmp/wt\"}"}),
+        ] {
+            assert!(
+                may_record_tool_call("herdr_exec", &arguments),
+                "scope arguments must not be short-circuited: {arguments}"
+            );
+        }
+        assert!(
+            !may_record_tool_call(
+                "herdr_call",
+                &json!({"method": "work.pickup", "params": {"cwd": "/tmp/wt"}})
+            ),
+            "work.pickup stays excluded exactly like the event builder"
+        );
+    }
+
+    /// user keeps journaled work events for managed-project calls | Given a
+    /// managed root and a tool call that names it | When the capture pre-check
+    /// and the event builder both run | Then the pre-check allows the call and
+    /// the recorded event keeps the same scope, kind and provider as before the
+    /// hot-path short-circuit existed.
+    #[test]
+    fn managed_project_tool_calls_still_journal_the_same_event() {
+        let snapshot = test_snapshot();
+        for (tool, arguments, kind) in [
+            (
+                "herdr_fs_write",
+                json!({"path": "/repo/src/lib.rs", "content": "x"}),
+                "edit",
+            ),
+            (
+                "herdr_exec",
+                json!({"project_root": "/repo", "command": "cargo test"}),
+                "command",
+            ),
+            (
+                "herdr_git",
+                json!({"cwd": "/repo", "args": ["status"]}),
+                "git",
+            ),
+        ] {
+            assert!(
+                may_record_tool_call(tool, &arguments),
+                "managed call must stay on the capture path: {tool}"
+            );
+            let event = event_for_tool_call(tool, &arguments, &snapshot)
+                .unwrap_or_else(|| panic!("managed call must journal an event: {tool}"));
+            assert_eq!(event.worktree, "/repo", "{tool}");
+            assert_eq!(event.kind, kind, "{tool}");
+            assert_eq!(event.provider, "herdr-mcp", "{tool}");
+            assert!(event.project_ref.contains("repo"), "{tool}");
+            assert!(!event.summary.is_empty(), "{tool}");
+        }
+    }
 
     #[test]
     fn user_sees_tool_calls_classified_by_public_name_and_call_prefix() {
