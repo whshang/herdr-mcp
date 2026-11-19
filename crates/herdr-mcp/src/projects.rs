@@ -48,6 +48,10 @@ pub(crate) fn advance_git_status_clock(by: Duration) {
 struct GitStatusCacheEntry {
     expires_at: Instant,
     value: Option<GitStatus>,
+    /// Canonical repository identity captured while this entry was probed.
+    /// Alias cache keys for one repo share it so a later write through another
+    /// symlink can drop every alias without a fresh protected-path stat.
+    repo_identity: Option<PathBuf>,
 }
 
 /// A probe currently running for one root. `invalidated` is set when a write
@@ -57,6 +61,9 @@ struct GitStatusInFlight {
     done: Mutex<bool>,
     ready: Condvar,
     invalidated: std::sync::atomic::AtomicBool,
+    /// Set before the probe runs when a safe canonical identity is already
+    /// known, so an invalidation during the probe can still see this alias.
+    repo_identity: Mutex<Option<PathBuf>>,
 }
 
 /// Prober-side cleanup: dropping removes the in-flight marker and wakes all
@@ -483,6 +490,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
+            repo_identity: Mutex::new(None),
         });
         state.in_flight.insert(key.clone(), waiter.clone());
         drop(state);
@@ -493,7 +501,27 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             key: key.clone(),
             waiter: waiter.clone(),
         };
+        // Record a canonical identity only for a path this runtime is already
+        // allowed to inspect. Protected and broker-routed roots stay unresolved
+        // here; the broker result supplies their identity after the probe.
+        let mut repo_identity = safe_canonical_repo_identity(root);
+        if let Some(identity) = &repo_identity {
+            *waiter
+                .repo_identity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity.clone());
+        }
         let value = git_status_uncached(snapshot, root);
+        if let Some(status) = value
+            .as_ref()
+            .filter(|status| status.source == "tcc_broker")
+        {
+            repo_identity = Some(status.root.clone());
+            *waiter
+                .repo_identity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(status.root.clone());
+        }
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -511,6 +539,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                 GitStatusCacheEntry {
                     expires_at,
                     value: value.clone(),
+                    repo_identity: repo_identity.clone(),
                 },
             );
             if let Some(status) = &value {
@@ -519,6 +548,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                     GitStatusCacheEntry {
                         expires_at,
                         value: Some(status.clone()),
+                        repo_identity: repo_identity.clone(),
                     },
                 );
             }
@@ -532,18 +562,91 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
 /// Drop cached status evidence for every repository containing `path` (or
 /// nested under it) after a successful write. Used by write paths that know
 /// the touched filesystem path rather than the repository root.
+///
+/// Literal prefix matching is not enough when two snapshots name the same
+/// repository through different directory symlinks. Entries and in-flight
+/// probes that share a canonical repo identity recorded at probe time are
+/// dropped together. This does not stat a lexically protected path.
 pub fn invalidate_git_status_cache_for_path(path: &Path) {
+    invalidate_git_status_cache_matching(path, false);
+}
+
+/// Drop cached status evidence for one repository after a successful write.
+pub fn invalidate_git_status_cache(root: &Path) {
+    invalidate_git_status_cache_matching(root, true);
+}
+
+fn invalidate_git_status_cache_matching(path: &Path, exact_root: bool) {
     let Some(cache) = GIT_STATUS_CACHE.get() else {
         return;
     };
     let mut state = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state
-        .entries
-        .retain(|key, _| !(path.starts_with(key) || key.starts_with(path)));
+    let key_hit = |key: &Path| {
+        if exact_root {
+            key == path || key.starts_with(path)
+        } else {
+            path.starts_with(key) || key.starts_with(path)
+        }
+    };
+    let mut identities = Vec::new();
+    if let Some(identity) = safe_canonical_repo_identity(path) {
+        identities.push(identity);
+    }
+    for (key, entry) in &state.entries {
+        if key_hit(key) {
+            if let Some(identity) = &entry.repo_identity {
+                identities.push(identity.clone());
+            }
+        } else if let Some(identity) = &entry.repo_identity
+            && repo_identity_overlaps(path, identity)
+        {
+            identities.push(identity.clone());
+        }
+    }
     for (key, in_flight) in &state.in_flight {
-        if path.starts_with(key) || key.starts_with(path) {
+        let identity = in_flight
+            .repo_identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if key_hit(key) {
+            if let Some(identity) = identity {
+                identities.push(identity);
+            }
+        } else if let Some(identity) = identity
+            && repo_identity_overlaps(path, &identity)
+        {
+            identities.push(identity);
+        }
+    }
+    let matches_identity = |identity: &Path| {
+        identities
+            .iter()
+            .any(|known| repo_identity_overlaps(known, identity))
+            || repo_identity_overlaps(path, identity)
+    };
+    state.entries.retain(|key, entry| {
+        if key_hit(key) {
+            return false;
+        }
+        !entry
+            .repo_identity
+            .as_ref()
+            .is_some_and(|identity| matches_identity(identity))
+    });
+    for (key, in_flight) in &state.in_flight {
+        let identity = in_flight
+            .repo_identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let hit = key_hit(key)
+            || identity
+                .as_ref()
+                .is_some_and(|identity| matches_identity(identity));
+        if hit {
             in_flight
                 .invalidated
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -551,24 +654,21 @@ pub fn invalidate_git_status_cache_for_path(path: &Path) {
     }
 }
 
-/// Drop cached status evidence for one repository after a successful write.
-pub fn invalidate_git_status_cache(root: &Path) {
-    let Some(cache) = GIT_STATUS_CACHE.get() else {
-        return;
-    };
-    let mut state = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state
-        .entries
-        .retain(|key, _| key != root && !key.starts_with(root));
-    for (key, in_flight) in &state.in_flight {
-        if key == root || key.starts_with(root) {
-            in_flight
-                .invalidated
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+/// Canonical repository identity for a path this process may already inspect.
+/// Lexically protected paths and Herdr-managed worktrees are left unresolved:
+/// canonicalizing them is the syscall macOS gates behind a consent prompt.
+fn safe_canonical_repo_identity(path: &Path) -> Option<PathBuf> {
+    if crate::macos_permissions::is_protected_user_path_lexical(path)
+        || is_herdr_managed_worktree(path)
+        || crate::macos_permissions::is_protected_user_path(path)
+    {
+        return None;
     }
+    std::fs::canonicalize(path).ok()
+}
+
+fn repo_identity_overlaps(path: &Path, identity: &Path) -> bool {
+    path == identity || path.starts_with(identity) || identity.starts_with(path)
 }
 
 fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
@@ -1044,6 +1144,7 @@ mod tests {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
+            repo_identity: Mutex::new(None),
         });
         GIT_STATUS_CACHE
             .get_or_init(|| Mutex::new(GitStatusCacheState::default()))
