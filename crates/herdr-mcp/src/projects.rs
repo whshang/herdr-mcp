@@ -437,6 +437,10 @@ struct GitStatus {
     dirty: bool,
     changed_files: usize,
     source: &'static str,
+    /// Canonical repository identity when the probe source can prove it —
+    /// the broker supplies one for protected roots it can see and the
+    /// runtime cannot. `None` keeps invalidation on path prefixes only.
+    repo_identity: Option<PathBuf>,
 }
 
 fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStatus> {
@@ -515,7 +519,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
-            repo_identity: std::fs::canonicalize(&key).ok(),
+            repo_identity: repo_identity_for(&key),
         });
         state.in_flight.insert(key.clone(), waiter.clone());
         drop(state);
@@ -544,7 +548,14 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                 GitStatusCacheEntry {
                     expires_at,
                     value: value.clone(),
-                    repo_identity: waiter.repo_identity.clone(),
+                    // Prefer the status's repo identity (broker-supplied for
+                    // protected roots the runtime may not resolve); the cwd
+                    // identity is the fallback so a subdirectory probe keeps
+                    // its own alias identity for prefix overlap matching.
+                    repo_identity: value
+                        .as_ref()
+                        .and_then(|status| status.repo_identity.clone())
+                        .or_else(|| waiter.repo_identity.clone()),
                 },
             );
             if let Some(status) = &value {
@@ -553,7 +564,10 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                     GitStatusCacheEntry {
                         expires_at,
                         value: Some(status.clone()),
-                        repo_identity: waiter.repo_identity.clone(),
+                        repo_identity: status
+                            .repo_identity
+                            .clone()
+                            .or_else(|| waiter.repo_identity.clone()),
                     },
                 );
             }
@@ -589,19 +603,25 @@ pub fn invalidate_git_status_cache_for_path(path: &Path) {
 /// Drop cached status evidence after a write when the caller knows the
 /// touched repository's caller-visible `root` and, when available, its
 /// canonical `repo_identity`. A key or in-flight probe is dropped when it
-/// shares a path prefix with `root` OR shares `repo_identity`, so a write
-/// through one alias (symlinked checkout, `/var` vs `/private/var`) also
-/// clears entries filed under another alias of the same repository.
-/// Entries recorded without an identity keep the prefix-only behavior.
+/// shares a path prefix with `root` OR shares a canonical identity prefix
+/// with `repo_identity`. Identities overlap bidirectionally because a probe
+/// keyed on a subdirectory records that subdirectory's canonical path while
+/// a write reports the repository root — both spellings of the same repo
+/// must still match (#1023, Claude 7011094552). Entries recorded without an
+/// identity keep the prefix-only behavior.
 pub fn invalidate_git_status_cache_matching(root: &Path, repo_identity: Option<&Path>) {
     let Some(cache) = GIT_STATUS_CACHE.get() else {
         return;
     };
     let identity = repo_identity.map(PathBuf::from);
     let matches = |key: &Path, entry_identity: Option<&PathBuf>| {
-        root.starts_with(key)
-            || key.starts_with(root)
-            || (identity.is_some() && entry_identity == identity.as_ref())
+        if root.starts_with(key) || key.starts_with(root) {
+            return true;
+        }
+        let (Some(identity), Some(entry_identity)) = (&identity, entry_identity) else {
+            return false;
+        };
+        entry_identity.starts_with(identity) || identity.starts_with(entry_identity)
     };
     let mut state = cache
         .lock()
@@ -656,6 +676,7 @@ fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         dirty,
         changed_files,
         source: "local_git",
+        repo_identity: repo_identity_for(root),
     })
 }
 
@@ -673,6 +694,29 @@ fn git_status_direct(root: &Path) -> Option<(bool, usize)> {
         .filter(|line| !line.trim().is_empty())
         .count();
     Some((changed_files > 0, changed_files))
+}
+
+/// Canonical repository identity for a probed root, without letting a
+/// consent-gated path park the caller or probing what the runtime must not
+/// touch (#1023: the unconditional `std::fs::canonicalize` here violated
+/// `runtime_must_not_probe` on protected paths). Protected or unresolvable
+/// paths return `None`; the broker-supplied identity on the status covers
+/// them, and without one the entry keeps prefix-only matching.
+fn repo_identity_for(root: &Path) -> Option<PathBuf> {
+    if crate::macos_permissions::runtime_must_not_probe(root) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match crate::macos_permissions::bounded_real_path(root) {
+            crate::macos_permissions::BoundedRealPath::Resolved(path) => Some(path),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::canonicalize(root).ok()
+    }
 }
 
 fn should_use_stable_broker(snapshot: &Value, path: &Path) -> bool {
@@ -737,6 +781,13 @@ fn broker_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         dirty: changed_files > 0,
         changed_files,
         source: "tcc_broker",
+        // The broker child resolves the canonical root where the runtime may
+        // not probe; trust its `repo_identity` verbatim so a write through
+        // another alias of this repository can invalidate this entry.
+        repo_identity: value
+            .get("repo_identity")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
     })
 }
 

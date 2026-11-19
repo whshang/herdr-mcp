@@ -18268,6 +18268,114 @@ mod tests {
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
+    /// user operator | Given a project anchored on repo subdirectory whose
+    /// cached status records identity `real/sub` | When a broker write lands
+    /// through a sibling alias reporting identity `real` | Then the subdir
+    /// entry drops via bidirectional identity-prefix overlap — exact `==`
+    /// would leave it stale (Claude 7011094552).
+    #[cfg(unix)]
+    #[test]
+    fn user_subdir_cache_drops_after_a_broker_write_through_sibling_alias() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let _env_guard = crate::test_env::lock();
+        let previous_broker = std::env::var_os("HERDR_MCP_TCC_BROKER");
+        let previous_config = std::env::var_os("HERDR_MCP_CONFIG_DIR");
+        let fixture = std::env::temp_dir().join(format!(
+            "herdr-mcp-broker-subdir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = fixture.join("real");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let alias_a = fixture.join("alias-a");
+        symlink(&root, &alias_a).unwrap();
+
+        // The declared project root is the repo subdirectory itself, so the
+        // probe key — and its recorded identity — is the subdirectory's
+        // canonical spelling, not the repository root's.
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": sub.to_string_lossy()},
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": sub.to_string_lossy(),
+            }],
+        });
+        crate::projects::invalidate_git_status_cache(&sub);
+        crate::projects::reset_git_status_probe_count(&sub);
+        let clean = crate::projects::derive(&snapshot);
+        assert!(clean.projects[&sub].vcs == Some("git"), "{clean:?}");
+        assert!(!clean.projects[&sub].dirty, "{clean:?}");
+        assert!(
+            crate::projects::git_status_cache_entry_count_for(&fixture) >= 1,
+            "the subdir probe must seed a cache entry"
+        );
+
+        // The broker writes through alias A and reports the canonical
+        // REPOSITORY root as repo_identity. The subdir entry's identity is
+        // `real/sub`: only bidirectional prefix overlap connects the two.
+        std::fs::write(root.join("written-by-broker.txt"), "dirty\n").unwrap();
+        let identity = std::fs::canonicalize(&root).unwrap();
+        let config_dir = fake_broker_config(
+            &fixture,
+            &json!({
+                "ok": true,
+                "path": alias_a.join("written-by-broker.txt").to_string_lossy(),
+                "root": alias_a.to_string_lossy(),
+                "repo_identity": identity.to_string_lossy(),
+            })
+            .to_string(),
+        );
+        unsafe {
+            std::env::set_var("HERDR_MCP_TCC_BROKER", "1");
+            std::env::set_var("HERDR_MCP_CONFIG_DIR", &config_dir);
+        }
+        let outcome = route_fs_git("fs_write", &snapshot, &json!({}));
+        unsafe {
+            match previous_broker {
+                Some(value) => std::env::set_var("HERDR_MCP_TCC_BROKER", value),
+                None => std::env::remove_var("HERDR_MCP_TCC_BROKER"),
+            }
+            match previous_config {
+                Some(value) => std::env::set_var("HERDR_MCP_CONFIG_DIR", value),
+                None => std::env::remove_var("HERDR_MCP_CONFIG_DIR"),
+            }
+        }
+        drop(_env_guard);
+        assert_eq!(outcome["ok"], true, "{outcome}");
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&fixture),
+            0,
+            "a write under the canonical repo root must drop the \
+             subdirectory-keyed entry via identity prefix overlap"
+        );
+
+        let refreshed = crate::projects::derive(&snapshot);
+        assert!(
+            refreshed.projects[&sub].dirty,
+            "subdir project must re-probe dirty after the sibling-alias write: {refreshed:?}"
+        );
+
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
     #[test]
     fn explicit_tool_errors_preserve_mcp_is_error() {
         let result = tool_result(

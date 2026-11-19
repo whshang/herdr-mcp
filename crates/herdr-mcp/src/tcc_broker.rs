@@ -931,7 +931,7 @@ fn dispatch(request: &Request) -> Value {
         "fs_edit" => with_repo_identity(fs_mutation::edit(&request.snapshot, &request.args)),
         "fs_write" => with_repo_identity(fs_mutation::write(&request.snapshot, &request.args)),
         "fs_patch" => with_repo_identity(fs_patch::apply(&request.snapshot, &request.args)),
-        "git" => git_tools::run(&request.snapshot, &request.args),
+        "git" => with_repo_identity(git_tools::run(&request.snapshot, &request.args)),
 
         // Unreachable: parse_request enforces the allowlist.
         _ => broker_error("unknown_operation", &request.op),
