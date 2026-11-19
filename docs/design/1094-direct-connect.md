@@ -1,0 +1,276 @@
+# 1.3 Direct-connect fast path (#1094)
+
+Same-machine loopback and Tailscale-direct MCP access that bypasses the
+Cloudflare Edge relay, without weakening authentication, delivery semantics,
+or contract gates. This document lands the design that issue #1094 approved
+(decisions 1–10, 2026-11-19); it is a review artifact, not an implementation
+commitment beyond P0.
+
+Baseline: `main` @ `f58d6d96`. All file references cite code at that base.
+
+## 1. Scope and fixed decisions
+
+Fixed by Wenhuan (issue #1094, "已定决策"): stdio shim holds the runtime token
+(1); Edge Device Registry issues/revokes direct tokens (2); revocation must
+take effect within 5 minutes (3); platforms without tailscaled WhoIs get no
+direct listener, no mTLS fallback (4); direct paths use only the runtime's own
+dedupe — Edge's `idempotency_key` replay ledger is NOT ported (5);
+`herdr_devices` and fleet control always forward to Edge with no local
+caching (6); waiting calls cap at 20s on every path (7); P0 ships before #768
+Phase 2 and supports the TUI backend only — Core backend stays fail-closed
+(8); the four write tools get runtime-side durable dedupe before they may go
+direct (9); the shim reuses the Link device credential for its Edge calls,
+plus the small Edge change tracked as P0-b (10).
+
+Non-goals for this milestone: ChatGPT cloud traffic keeps going through Edge;
+no LAN/mTLS variant; no HTTP/2 commitment (decide from measurements); no
+relay-wire or contract-epoch changes inside the P0/P1 slices listed here —
+any contract change lands as its own PR through the contract process.
+
+## 2. Path model
+
+| Path | Hops | Who it serves |
+|---|---|---|
+| Edge (today, unchanged) | client → Cloudflare PoP → Worker auth → (oauth-v1 DO) → route → WorkstationDO → Link WSS → runtime | ChatGPT cloud, remote callers, fleet control, `herdr_devices`, WebChat/Page Assist grants |
+| Loopback (P0) | client → stdio shim → `127.0.0.1:<port>/mcp` → runtime | Local coordinators (Claude Code, Codex, first-party CLI) on the same machine |
+| Tailnet direct (P1) | client → shim/peer → `<tailscale-ip>:<port>/mcp` → runtime | Callers inside the same tailnet on another workstation |
+
+The shim is also the routing point in P2 (local > tailnet > Edge); P1/P2 are
+specified here for context but are explicitly out of the P0 PRs.
+
+## 3. Threat model
+
+| Threat | Control |
+|---|---|
+| Runtime token theft | P0 uses a resident shim: `service_manager::doctor_runtime_token()` never leaves the shim process — not in stdout, logs, error text, or generated client config. No new local token class is minted (decision 1). |
+| Link device-credential scope creep (P0-b) | The same credential today already reaches REST admin routes (`index.ts:1525-1540`). P0-b admits it on `/mcp` as principal `device:<id>` with `can_force_takeover: false`; see §5 for the explicit allow/deny list. Theft impact is bounded to what the credential already reaches on REST plus MCP tool dispatch, and revocation is Edge-central. |
+| Revocation lag on direct paths | Direct tokens (P1) are Edge-issued and Edge-revoked; the target runtime must observe revocation within ≤5 minutes (§7). Sync failure beyond 5 minutes fails closed. |
+| LAN/public exposure | The P1 listener binds only the machine's tailnet address (100.64.0.0/10 or tailnet IPv6 ULA); `0.0.0.0`/`::` is rejected at startup. Default off, explicit opt-in. WhoIs-unavailable platforms do not listen (decision 4). |
+| WebChat/Page Assist grant bypass | Bearer-authenticated transports can never carry the browser-grant headers; only the trusted Unix IPC can (`mcp_http.rs:3524-3532`). Direct paths inherit this — the grant calls keep routing Edge → Link → trusted IPC. |
+| Contract drift | Shim and P1 peers must complete `server/discover` and compare `herdr_contract_epoch`, `herdr_contract_hash`, and `herdr_device_id` before any tool call; mismatch refuses and falls back to Edge. |
+| Duplicate delivery | Direct paths do NOT get Edge's `idempotency_key` replay ledger (decision 5). Callers must use `client_request_id` (`herdr_call`, the four P0-a tools) or the tool's own key (`herdr_exec` `idempotency_key` + intent). Fallback to Edge is allowed only before any byte could have been written (1.2 global principle 3). |
+| Shim holds two credentials | The shim holds the runtime token AND the Link device credential. Disclosure surface equals today's first-party CLI (`worker.rs:3370-3390`): same install-path permissions, and crash dumps/logs must not contain either value. Documented as an accepted residual risk for P0. |
+
+## 4. P0-a — durable dedupe for the four write tools
+
+Scope: `herdr_fs_write`, `herdr_fs_edit`, `herdr_fs_patch` gain the same
+`client_request_id` durable idempotency `herdr_call` already has
+(`mcp.rs:1375-1480` → `durable_request_ledger.rs`); `herdr_prompt`'s existing
+`idempotency_key` is aligned to the same semantics.
+
+### 4.1 Schema/epoch choice — recommendation: accept the undeclared field
+
+Two options were weighed:
+
+- **(a) Declare `client_request_id` in the published schema.** Changes the
+  contract hash → requires a new runtime-exec epoch, Edge window admission,
+  and the full staged-deploy ordering used for #1077. Live v1.1.1/v1.2.x
+  workstations keep advertising the old epoch, so this also forces a fleet
+  upgrade before the field is legal anywhere.
+- **(b) Accept `client_request_id` as an undeclared top-level argument,**
+  exactly as `herdr_call` already does: it is read from `arguments` directly
+  (`mcp.rs:1396`) and is absent from `contracts/epoch2.json`
+  (`inputSchema.additionalProperties` is unset, and argument parsing reads
+  keys by name — unknown keys are ignored, `prompt.rs:14683`).
+
+**Recommendation: (b).** It keeps the contract hash and epoch unchanged,
+needs zero Edge changes, works on the Edge path today (Edge forwards
+arguments verbatim), and leaves a clean additive upgrade: a later epoch may
+*declare* the field for discoverability without changing behavior. Cost:
+schema-driven clients won't see the field until that epoch lands — mitigated
+by documenting it in the shim and in this doc. If review finds any of the
+four tools rejects unknown argument keys, the fix is a param-struct field
+that is still excluded from the published schema, not option (a).
+
+### 4.2 Keys, scope, fingerprints
+
+- One operation kind per tool (`herdr_fs_write.client_request.v1` etc.),
+  alongside `HERDR_CALL_CLIENT_REQUEST_KIND` (`durable_request_ledger.rs:39-48`).
+- Caller scope unchanged: `durable_caller_scope` yields
+  `local:<device_id>` / `browser:…` with lease suffix
+  (`durable_request_ledger.rs:216-253`). P1 adds `tailnet:<caller-device-id>`.
+- Fingerprint covers path/root, content-or-patch digest, and the
+  `overwrite`/`confirm_*` flags. Same key + different payload →
+  `idempotency_conflict` (D-2: never echo the stored record).
+- Same-boot pending → `request_in_flight`; foreign-boot pending →
+  `delivery_unknown` + `inspect_before_retry`, never auto-replayed.
+- Retention: intent rows keep `expires_at = NULL`; full summaries live 24h
+  (`CLIENT_REQUEST_SUMMARY_TTL_MS`) then collapse to hash-only tombstones;
+  row cap and eviction unchanged (`durable_request_ledger.rs:52-56`).
+- `herdr_prompt`: current records are global, unscoped, 10-minute TTL
+  (`prompt.rs:24`). Align: add caller scope to the key, extend TTL to the
+  same 24h, and on replay return the FIRST dispatch's
+  `task_id`/`receipt_id` (`prompt.rs:425-427`; task rows keep 7d);
+  `task_status_by_idempotency` keeps working; first-call submission state
+  unknown → `delivery_unknown`, no re-prompt.
+
+### 4.3 Capability gate and rollback
+
+Per `docs/design/332-durable-idempotency.md:184`: a runtime that predates
+these kinds must not receive direct-path writes — the shim negotiates
+capability (discover `_meta` advertises the dedupe kinds, or a documented
+version floor) and falls back to Edge when unsupported.
+
+Rollback: new kinds are append-only rows on schema 16 — no schema change, no
+contract change. Reverting leaves `pending`/`unknown` rows; the 332 rollback
+procedure (stop and wait for manual confirmation) applies.
+
+## 5. P0-b — Edge `/mcp` device-credential fallback
+
+`handleMcpRouter` (`index.ts:1127-1139`) falls back to the existing
+`authenticateFleetDevice` (`index.ts:1574-1598`) when
+`authenticateEdgeMcpRequest` fails; `x-herdr-workstation` is mandatory;
+principal is `device:<device_id>`; `fleetControllerAuthority`
+(`index.ts:1792-1797`) yields `can_force_takeover: false`.
+
+**Permission boundary — explicit recommendation** (final list is a review
+decision; REST today treats any registered device as admin,
+`index.ts:1525-1531`):
+
+| Capability | device credential on `/mcp` | Rationale |
+|---|---|---|
+| Ordinary tools (fs/exec/inspect/prompt/call…) | Allow | That is the shim's whole purpose |
+| Fleet control read/status (`planner_lease`, `work_chain`, `execution_lane`, `automation` status) | Allow | Shim forwards fleet control; reads are the common case |
+| Fleet control mutating ops EXCEPT force takeover | Allow, `can_force_takeover: false` still blocks `planner_lease.takeover` | Matches the credential's REST reach |
+| `device.pair` | **Deny at MCP** | Pairing mints device identity; keep it on the operator REST path only |
+| `device.revoke` | **Deny at MCP** | Self-revocation by a stolen credential would mask theft |
+| `connector.approve` | **Deny at MCP** | Approving OAuth grants widens blast radius beyond the credential's operational need |
+| `planner_lease.takeover` (force) | Deny (`can_force_takeover: false`) | Fixed |
+| Revoked/suspended device | Deny at auth (`device-directory.ts:144-152`) | Existing check |
+
+Tests required: device credential can call ordinary tools and fleet control;
+revoked/suspended rejected; missing `x-herdr-workstation` rejected; OAuth
+connector permissions unchanged.
+
+Deploy note: touches `edge/cloudflare/src/**` → Edge production deploy,
+sequenced against the #1077 epoch-window freeze; merging needs Wenhuan's
+explicit approval. Rollback: remove the fallback branch — shim returns to
+`edge_credential_unsupported` and tells callers to use an OAuth connector.
+
+## 6. P0 — same-machine stdio shim
+
+- New first-party subcommand (working name `herdr-mcp mcp-stdio`): resident
+  process, keep-alive connection pool to `127.0.0.1:<port>/mcp`, reusing
+  `link/local_mcp.rs`'s transport. No new network listener of any kind.
+- `server/discover` `_meta` gains `herdr_device_id`
+  (`AppState.local_device_id`, `mcp_http.rs:250`; discover builder at
+  `mcp.rs:1142-1160`). Shim compares `herdr_device_id` +
+  `herdr_contract_epoch`/`hash`; mismatch refuses, advises Edge.
+- Edge-exclusive capabilities always forward to Edge, never cached locally
+  (decision 6): `herdr_devices` → REST `GET /devices` (Link credential,
+  no Edge change); fleet control → `/mcp` once P0-b is live, else
+  `edge_credential_unsupported`.
+- Dedupe rules (decisions 5, 9): mutating `herdr_call` must carry
+  `client_request_id` — a `herdr_call` carrying `idempotency_key` is
+  rejected with an explicit "direct path has no Edge replay ledger" message;
+  `herdr_exec` keeps its own `idempotency_key` + intent; the four write
+  tools forward to Edge until P0-a is live AND capability-negotiated.
+- TUI backend only (decision 8): Core backend stays fail-closed via
+  `candidate_startup`; the shim does not attempt direct against it.
+- New "print client config" command emits connection details without the
+  token.
+- Rollback: delete the client config; callers return to Edge. The runtime
+  change is one additive `_meta` field.
+
+## 7. P1 — Tailscale direct (design context; not in the P0 PRs)
+
+- Listener binds ONLY the machine's tailnet address — `0.0.0.0`/`::` never;
+  absent tailnet address → does not start; default off, explicit opt-in;
+  separate port from 8772; separate `AppState` with
+  `trusted_extension_ipc=false`; workstation bearer rejected.
+- Two-factor admission: Edge-issued direct token (binds caller device,
+  target device, expiry, generation) AND tailscaled LocalAPI WhoIs identity
+  matched to the token's caller claim. WhoIs unavailable → no listener
+  (decision 4); no mTLS.
+- **Revocation ≤5 minutes (decision 3):** no revocation-sync mechanism
+  exists today — revocation currently lives only in the Edge DO
+  (`workstation-do.ts:518-560`). Design: the Link pulls the device's
+  revoked-token digest list on a ≤5-minute cadence (reusing the 30s
+  heartbeat channel is an acceptable carrier), and the runtime caches it.
+  Pull failure for >5 minutes → fail closed: all direct calls refused,
+  callers fall back to Edge. Token lifetime is capped at the acceptable
+  offline window.
+- Caller scope becomes `tailnet:<caller-device-id>` (not shared with
+  `local:`); audit records gain `transport: "tailnet"` alongside the
+  existing `local|relay` (`mcp_http.rs:3494-3510`).
+- Same contract/device handshake, 20s wait clamp, own concurrency and
+  request-body limits.
+
+## 8. The 20-second wait cap — two independent clamps
+
+`REMOTE_PANE_WAIT_TIMEOUT_MS=20_000` lives only at Edge
+(`mcp-handler.ts:303-334`); the runtime itself allows up to 60s waits. To
+keep behavior identical across paths, each direct entry point enforces the
+clamp itself:
+
+- **Shim:** clamps `timeout_ms` (and the `herdr_prompt`/`wait` equivalents)
+  to 20s before forwarding — same clamp expression as Edge.
+- **P1 tailnet listener:** applies the same clamp at admission.
+- The runtime's own ceiling is unchanged; Edge is unchanged.
+
+## 9. Delivery-semantics parity table
+
+| Semantic | Edge path | Direct path |
+|---|---|---|
+| `client_request_id` durable dedupe | runtime ledger (same code) | identical |
+| Edge `idempotency_key` replay ledger | WorkstationDO | **absent by decision 5 — documented to callers** |
+| Dispatch receipt (`task_id`/`receipt_id`) | runtime | identical |
+| Timeout-first settle, `not_delivered`/`delivery_uncertain` | WorkstationDO (`workstation-do.ts:1276-1352`) | shim reproduces the same classification |
+| Contract epoch/hash handshake | DO `isCompatibleRuntimeContract` | discover-time compare in shim / P1 peer |
+| Device identity + revocation | Device Registry | Edge-issued tokens, ≤5-min sync (P1) |
+| Runtime generation proof | `x-herdr-runtime-generation` | same header checked |
+| Caller scope | `local:`/`browser:` | + `tailnet:` (P1) |
+| Audit `transport` | `local`/`relay` | + `tailnet` (P1) |
+
+## 10. Fallback and routing rules (P2 context)
+
+Order: local (`device_id` equal) > tailnet (endpoint published + WhoIs
+available + last health probe ok) > Edge. Fleet control and `herdr_devices`
+are Edge-only, always. Re-routing is allowed only while zero bytes could
+have been written: connect failure, handshake failure, contract/device
+mismatch. Once a write may have landed, the caller gets a
+`request_id`/`client_request_id` receipt and must query — never
+auto-resubmit.
+
+## 11. Baseline measurement plan
+
+`scripts/perf/direct-connect-baseline.sh` is the reproducible harness:
+
+- Same machine, same window, alternating samples to cancel drift:
+  loopback (`http://127.0.0.1:<port>/mcp`) vs Edge (`https://<edge>/mcp`),
+  `herdr_inspect` ≥100 samples each, plus a reversible write tool run.
+- Outputs raw per-sample latencies (ms, one per line, labeled `loopback`
+  or `edge`) and a p50/p95/n summary per path; `-o <csv>` writes raw
+  samples for archival with the PR.
+- Credentials arrive only via environment (`HERDR_MCP_TOKEN`,
+  `HERDR_EDGE_TOKEN`); the script never prints, logs, or writes them —
+  `set +x` is forced and the token variables are unset before any output
+  section.
+- Server-side breakdown comes from `/push/mcp-activity` (`timing_ms`
+  queue/connect/execute, `transport=local|relay`) — fetched separately,
+  never containing credentials.
+- P1 adds `tailscale ping -c 20 <tailscale-ip>` to classify direct vs
+  DERP relay and repeats the loopback measurement against
+  `http://<tailscale-ip>:<port>/mcp`.
+
+## 12. Rollback per stage
+
+| Stage | Rollback |
+|---|---|
+| Design + baseline (this PR) | Docs/script only — nothing to roll back |
+| P0-a | Append-only ledger rows on schema 16; revert code, apply 332's pending-row procedure |
+| P0-b | Remove the `/mcp` fallback branch; shim returns `edge_credential_unsupported` |
+| P0 shim | Delete client config; runtime keeps one additive `_meta` field |
+| P1 | Disable opt-in (listener stops); Edge stops issuing direct tokens |
+| P2 | Registry stops publishing endpoints; callers stay on Edge |
+
+No stage mutates the Edge main path.
+
+## 13. Open questions for review
+
+1. P0-b allow/deny list in §5 — in particular whether `device.pair` /
+   `device.revoke` / `connector.approve` stay denied at MCP even though REST
+   allows them.
+2. Capability signal for P0-a: `_meta` field vs documented version floor.
+3. `herdr_prompt` TTL: align to 24h or keep 10min with a written reason.
+4. HTTP/2 on loopback: deferred until baseline numbers exist.
