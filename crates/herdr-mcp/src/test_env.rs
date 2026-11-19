@@ -207,41 +207,66 @@ mod tests {
         let _ = std::fs::remove_file(&foreign);
     }
 
-    /// user cannot add an unguarded /tmp socket fixture | Given every test
-    /// function in the crate that binds a socket under /tmp | When the fixture
-    /// audit runs | Then each one owns a `TempUnixSocketGuard` (#1007).
+    /// user cannot add an unguarded /tmp socket fixture | Given every function
+    /// in the crate that binds a Unix socket under `/tmp` or `temp_dir()` |
+    /// When the fixture audit runs | Then each one owns a `TempUnixSocketGuard`
+    /// (#1007).
     #[test]
     fn user_cannot_add_unguarded_tmp_socket_fixtures() {
         let unguarded = audit_tmp_socket_fixtures();
         assert!(
             unguarded.is_empty(),
-            "these test fixtures bind a /tmp socket without a TempUnixSocketGuard: {unguarded:?}"
+            "these fixtures bind a /tmp socket without a TempUnixSocketGuard: {unguarded:?}"
         );
     }
 
-    fn audit_tmp_socket_fixtures() -> Vec<String> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        collect_rust_files(&root, &mut files);
-        let mut unguarded = Vec::new();
-        for file in files {
-            // This audit itself names `/tmp/…sock` while describing the rule.
-            if file.file_name().and_then(|name| name.to_str()) == Some("test_env.rs") {
-                continue;
-            }
-            let Ok(source) = std::fs::read_to_string(&file) else {
-                continue;
-            };
-            for (name, body) in test_functions(&source) {
-                if !binds_tmp_socket(&body) {
-                    continue;
-                }
-                if !body.contains("TempUnixSocketGuard") {
-                    unguarded.push(format!("{}::{name}", file.display()));
-                }
-            }
-        }
-        unguarded
+    /// user cannot regress the audit itself | Given synthetic fixtures covering
+    /// the shapes the audit must catch | When the audit runs on each one | Then
+    /// direct binds, `temp_dir()`-built paths, helper-based binds, nested-module
+    /// indentation and the path-only opt-out all behave as documented (#1007).
+    #[test]
+    fn user_keeps_the_socket_fixture_audit_honest() {
+        // Literal /tmp path, direct bind, no guard -> flagged.
+        let flagged = audit_source(
+            "literal.rs",
+            "mod tests {\n    #[test]\n    fn fixture() {\n        let s = PathBuf::from(format!(\"/tmp/herdr-x-{}.sock\", 1));\n        UnixListener::bind(&s).unwrap();\n    }\n}\n",
+        );
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+
+        // temp_dir()-built path, direct bind, guarded -> clean.
+        let clean = audit_source(
+            "tempdir.rs",
+            "mod tests {\n    #[test]\n    fn fixture() {\n        let s = std::env::temp_dir().join(format!(\"herdr-y-{}.sock\", 1));\n        let _g = crate::test_env::TempUnixSocketGuard::file(&s);\n        UnixListener::bind(&s).unwrap();\n    }\n}\n",
+        );
+        assert!(clean.is_empty(), "{clean:?}");
+
+        // temp_dir()-built path, direct bind, unguarded -> flagged.
+        let flagged_tempdir = audit_source(
+            "tempdir-unguarded.rs",
+            "mod tests {\n    #[test]\n    fn fixture() {\n        let s = std::env::temp_dir().join(format!(\"herdr-z-{}.sock\", 1));\n        UnixListener::bind(&s).unwrap();\n    }\n}\n",
+        );
+        assert_eq!(flagged_tempdir.len(), 1, "{flagged_tempdir:?}");
+
+        // Bind through a same-file helper, unguarded caller -> flagged.
+        let flagged_helper = audit_source(
+            "helper.rs",
+            "mod tests {\n    fn spawn_fixture(path: &std::path::Path) {\n        std::os::unix::net::UnixListener::bind(path).unwrap();\n    }\n\n    #[test]\n    fn fixture() {\n        let s = PathBuf::from(format!(\"/tmp/herdr-h-{}.sock\", 1));\n        spawn_fixture(&s);\n    }\n}\n",
+        );
+        assert_eq!(flagged_helper.len(), 1, "{flagged_helper:?}");
+
+        // The same helper-based fixture with a guard -> clean.
+        let clean_helper = audit_source(
+            "helper-guarded.rs",
+            "mod tests {\n    fn spawn_fixture(path: &std::path::Path) {\n        std::os::unix::net::UnixListener::bind(path).unwrap();\n    }\n\n    #[test]\n    fn fixture() {\n        let s = PathBuf::from(format!(\"/tmp/herdr-hg-{}.sock\", 1));\n        let _g = crate::test_env::TempUnixSocketGuard::file(&s);\n        spawn_fixture(&s);\n    }\n}\n",
+        );
+        assert!(clean_helper.is_empty(), "{clean_helper:?}");
+
+        // A path that is only used in an assertion/message may opt out.
+        let opted_out = audit_source(
+            "path-only.rs",
+            "mod tests {\n    #[test]\n    fn fixture() {\n        // temp-socket-path-only: no listener is bound here.\n        let s = PathBuf::from(format!(\"/tmp/herdr-p-{}.sock\", 1));\n        let _ = UnixListener::bind(Path::new(\"/nowhere\"));\n        assert!(s.display().to_string().contains(\".sock\"));\n    }\n}\n",
+        );
+        assert!(opted_out.is_empty(), "{opted_out:?}");
     }
 
     fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -258,49 +283,127 @@ mod tests {
         }
     }
 
-    /// Split a source file into `fn` bodies so a guard in one test cannot be
-    /// credited to another test that shares the file.
-    fn test_functions(source: &str) -> Vec<(String, String)> {
-        let mut functions = Vec::new();
-        let mut current: Option<(String, String)> = None;
-        for line in source.lines() {
-            let trimmed = line.trim_start();
-            let starts_fn = line.starts_with("    fn ") || line.starts_with("    pub fn ");
-            if starts_fn {
-                if let Some(done) = current.take() {
-                    functions.push(done);
-                }
-                let name = trimmed
-                    .split("fn ")
-                    .nth(1)
-                    .and_then(|rest| rest.split('(').next())
-                    .unwrap_or("unknown")
-                    .to_owned();
-                current = Some((name, String::new()));
-            } else if line == "    }"
-                && let Some(done) = current.take()
-            {
-                functions.push(done);
+    fn audit_tmp_socket_fixtures() -> Vec<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_files(&root, &mut files);
+        let mut unguarded = Vec::new();
+        for file in files {
+            // The audit module itself names these shapes while describing them.
+            if file.file_name().and_then(|name| name.to_str()) == Some("test_env.rs") {
+                continue;
             }
-            if let Some((_, body)) = current.as_mut() {
-                body.push_str(line);
-                body.push('\n');
+            let Ok(source) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for name in audit_source(&file.display().to_string(), &source) {
+                unguarded.push(name);
             }
         }
-        functions.extend(current);
-        functions
+        unguarded
     }
 
-    /// Fixtures build their socket path with `format!("/tmp/…sock")` or
-    /// `PathBuf::from(format!("/tmp/…"))`. Config JSON strings and pure
-    /// resolution assertions that only *name* a socket are not bindings (and
-    /// must not be guarded: a guard on a foreign path would delete a socket
-    /// another test owns), so they stay out of scope. The audit needs both the
-    /// `/tmp/…sock` literal and a `format!`-built path in the same function.
-    fn binds_tmp_socket(body: &str) -> bool {
-        body.contains("format!(")
-            && body.lines().any(|line| {
-                line.contains("\"/tmp/") && line.contains(".sock") && !line.contains("br#\"")
-            })
+    /// Pure audit over one source file: a function that binds a Unix listener
+    /// (directly or through a helper defined in the same file) at a socket path
+    /// under `/tmp` or `temp_dir()` must own a `TempUnixSocketGuard`. Functions
+    /// that only *name* such a path opt out with `// temp-socket-path-only`,
+    /// because guarding a path this test does not create would be exactly the
+    /// delete-someone-else's-socket bug the guard must not encourage.
+    fn audit_source(label: &str, source: &str) -> Vec<String> {
+        let functions = functions(source);
+        let binder_helpers: Vec<&str> = functions
+            .iter()
+            .filter(|(_, body)| binds_unix_listener(body))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let mut unguarded = Vec::new();
+        for (name, body) in &functions {
+            if body.contains("temp-socket-path-only") {
+                continue;
+            }
+            let binds_here = binds_unix_listener(body)
+                || binder_helpers
+                    .iter()
+                    .any(|helper| body.contains(&format!("{helper}(")));
+            if !binds_here || !constructs_tmp_socket_path(body) {
+                continue;
+            }
+            if !body.contains("TempUnixSocketGuard") {
+                unguarded.push(format!("{label}::{name}"));
+            }
+        }
+        unguarded
+    }
+
+    fn binds_unix_listener(body: &str) -> bool {
+        body.contains("UnixListener::bind")
+    }
+
+    /// A socket path this fixture creates: a `/tmp/…sock` construction (not a
+    /// config JSON string, which only names one) or a `temp_dir()`-derived
+    /// `…sock` path. Multi-line `format!` calls are covered by the second arm.
+    fn constructs_tmp_socket_path(body: &str) -> bool {
+        let literal = body.lines().any(|line| {
+            line.contains(".sock")
+                && !line.contains("br#\"")
+                && !line.contains("Some(\"")
+                && (line.contains("/tmp/") && line.contains("format!(")
+                    || line.trim_start().starts_with("\"/tmp/")
+                    || (line.contains("/tmp/")
+                        && (line.contains("PathBuf::from") || line.contains(".join("))))
+        });
+        literal
+            || (body.contains("temp_dir()")
+                && body.contains(".sock")
+                && (body.contains("format!(") || body.contains(".join(")))
+    }
+
+    /// Split a source file into function bodies by indentation, which is
+    /// exactly what rustfmt guarantees for this crate. Brace-depth scanning was
+    /// fragile here: braces inside string literals (`"{"`) and char literals
+    /// drift the depth and silently mis-attribute a body, which would make the
+    /// audit claim coverage it does not have.
+    fn functions(source: &str) -> Vec<(String, String)> {
+        const PREFIXES: [&str; 5] = [
+            "fn ",
+            "pub fn ",
+            "pub(crate) fn ",
+            "pub(super) fn ",
+            "async fn ",
+        ];
+        let lines: Vec<&str> = source.lines().collect();
+        let mut functions = Vec::new();
+        let mut index = 0usize;
+        while index < lines.len() {
+            let line = lines[index];
+            let trimmed = line.trim_start();
+            let Some(rest) = PREFIXES
+                .iter()
+                .find_map(|prefix| trimmed.strip_prefix(prefix))
+            else {
+                index += 1;
+                continue;
+            };
+            let name = rest
+                .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let indent = line.len() - trimmed.len();
+            let mut end = index + 1;
+            while end < lines.len() {
+                let candidate = lines[end];
+                let candidate_trimmed = candidate.trim_start();
+                let candidate_indent = candidate.len() - candidate_trimmed.len();
+                if candidate_trimmed.starts_with('}') && candidate_indent <= indent {
+                    break;
+                }
+                end += 1;
+            }
+            let last = end.min(lines.len().saturating_sub(1));
+            functions.push((name, lines[index..=last].join("\n")));
+            index = last + 1;
+        }
+        functions
     }
 }
