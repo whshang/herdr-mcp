@@ -23,9 +23,10 @@ const GIT_STATUS_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 static GIT_STATUS_CLOCK_OFFSET_MS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
-/// The cache's clock. Tests shift it forward instead of sleeping so TTL
-/// expiry is deterministic and cannot flake on a busy runner.
-fn cache_now() -> Instant {
+/// The caches' shared clock. Tests shift it forward instead of sleeping so
+/// TTL expiry is deterministic and cannot flake on a busy runner. Shared by
+/// the git-status, routing-topology, and validated-roots caches.
+pub(crate) fn cache_now() -> Instant {
     #[cfg(test)]
     {
         Instant::now()
@@ -40,7 +41,7 @@ fn cache_now() -> Instant {
 }
 
 #[cfg(test)]
-pub(crate) fn advance_git_status_clock(by: Duration) {
+pub(crate) fn advance_cache_clock(by: Duration) {
     GIT_STATUS_CLOCK_OFFSET_MS
         .fetch_add(by.as_millis() as i64, std::sync::atomic::Ordering::Relaxed);
 }
@@ -221,32 +222,71 @@ pub(crate) fn routing_fingerprint(snapshot: &Value) -> RoutingFingerprint {
 /// Bounded so alternating snapshot shapes cannot grow memory without limit.
 pub(crate) const ROUTING_CACHE_CAP: usize = 32;
 
-static ROUTING_TOPOLOGY_CACHE: OnceLock<Mutex<HashMap<RoutingFingerprint, Arc<ProjectTopology>>>> =
+/// How long a cached routing topology or validated-roots entry stays fresh.
+/// Matches the git-status cache's order of magnitude: long enough to absorb
+/// scroll churn inside one request burst (validate + busy-check land
+/// microseconds apart), short enough that a `git init` in a pane cwd or a
+/// renamed worktree — neither of which changes the fingerprint — becomes
+/// visible well under a second.
+pub(crate) const ROUTING_CACHE_TTL: Duration = Duration::from_millis(250);
+
+struct RoutingCacheEntry {
+    expires_at: Instant,
+    topology: Arc<ProjectTopology>,
+}
+
+static ROUTING_TOPOLOGY_CACHE: OnceLock<Mutex<HashMap<RoutingFingerprint, RoutingCacheEntry>>> =
     OnceLock::new();
 
-/// [`derive_routing`] memoized on the routing fingerprint. High-frequency
-/// callers (exec/fs gates, worktree scans) hit this during scroll churn and
-/// skip the full topology walk — including the protected-cwd fallback into
-/// the stable-broker `git status` probe.
+/// [`derive_routing`] memoized on the routing fingerprint for
+/// [`ROUTING_CACHE_TTL`]. High-frequency callers (exec/fs gates, worktree
+/// scans) hit this during scroll churn and skip the full topology walk —
+/// including the protected-cwd fallback into the stable-broker `git status`
+/// probe.
 ///
 /// The fingerprint covers every input the derivation reads, so a new
-/// workspace or a changed pane/agent cwd misses immediately. Per-request
-/// target-path checks (canonicalize, secret-path denial, symlink escapes)
-/// are downstream of the topology and stay live on every call.
+/// workspace or a changed pane/agent cwd misses immediately. Changes the
+/// fingerprint cannot see (a `git init` inside an existing cwd, a renamed
+/// repo, a swapped symlink) surface after the TTL. Per-request target-path
+/// checks (canonicalize, secret-path denial, symlink escapes) are downstream
+/// of the topology and stay live on every call.
+///
+/// The derivation runs *outside* the cache mutex: a slow protected-cwd probe
+/// must not serialize callers of unrelated fingerprints behind the lock. Two
+/// racing missers may derive the same deterministic topology twice; the
+/// loser discards its copy when the winner's entry is still fresh.
 pub fn derive_routing_cached(snapshot: &Value) -> Arc<ProjectTopology> {
     let fingerprint = routing_fingerprint(snapshot);
-    let mut cache = ROUTING_TOPOLOGY_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(topology) = cache.get(&fingerprint) {
-        return Arc::clone(topology);
+    let cache = ROUTING_TOPOLOGY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = guard.get(&fingerprint)
+            && entry.expires_at > cache_now()
+        {
+            return Arc::clone(&entry.topology);
+        }
     }
     let topology = Arc::new(derive_routing(snapshot));
-    if cache.len() >= ROUTING_CACHE_CAP {
-        cache.clear();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.get(&fingerprint)
+        && entry.expires_at > cache_now()
+    {
+        return Arc::clone(&entry.topology);
     }
-    cache.insert(fingerprint, Arc::clone(&topology));
+    if guard.len() >= ROUTING_CACHE_CAP {
+        guard.clear();
+    }
+    guard.insert(
+        fingerprint,
+        RoutingCacheEntry {
+            expires_at: cache_now() + ROUTING_CACHE_TTL,
+            topology: Arc::clone(&topology),
+        },
+    );
     topology
 }
 
@@ -961,7 +1001,7 @@ mod tests {
         reset_git_status_probe_count(&root);
         let first = derive(&snapshot);
         assert!(!first.projects[&root].dirty);
-        advance_git_status_clock(GIT_STATUS_CACHE_TTL + Duration::from_millis(1));
+        advance_cache_clock(GIT_STATUS_CACHE_TTL + Duration::from_millis(1));
         let second = derive(&snapshot);
         assert!(!second.projects[&root].dirty);
         assert_eq!(git_status_probe_count(&root), 2);
@@ -1073,7 +1113,7 @@ mod tests {
         let snapshot_b = git_snapshot(&root_b);
         derive(&snapshot_a);
         derive(&snapshot_b);
-        advance_git_status_clock(GIT_STATUS_CACHE_TTL + Duration::from_millis(1));
+        advance_cache_clock(GIT_STATUS_CACHE_TTL + Duration::from_millis(1));
         derive(&snapshot_b);
         assert_eq!(git_status_probe_count(&root_b), 2);
         assert!(

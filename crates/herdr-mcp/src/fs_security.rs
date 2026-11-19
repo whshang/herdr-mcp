@@ -386,31 +386,61 @@ fn validate_existing_validated_with_worktrees_root(
     )
 }
 
+struct ValidatedRootsCacheEntry {
+    expires_at: std::time::Instant,
+    roots: Arc<Vec<PathBuf>>,
+}
+
 static VALIDATED_ROOTS_CACHE: std::sync::OnceLock<
-    Mutex<std::collections::HashMap<projects::RoutingFingerprint, Arc<Vec<PathBuf>>>>,
+    Mutex<std::collections::HashMap<projects::RoutingFingerprint, ValidatedRootsCacheEntry>>,
 > = std::sync::OnceLock::new();
 
-/// [`validated_roots_from`] memoized on the routing fingerprint. Skips the
-/// per-call root/cwd `canonicalize` and `HomeGuard` ancestor stats inside
-/// `operational_root_eligible` during scroll churn. Per-request target-path
+/// [`validated_roots_from`] memoized on the routing fingerprint for
+/// [`projects::ROUTING_CACHE_TTL`]. Skips the per-call root/cwd
+/// `canonicalize` and `HomeGuard` ancestor stats inside
+/// `operational_root_eligible` during scroll churn. Filesystem changes the
+/// fingerprint cannot see (`git init` inside an existing cwd, a renamed
+/// repo, a swapped symlink) surface after the TTL. Per-request target-path
 /// canonicalize, secret-path denial, and symlink-escape checks in
 /// `validate_existing_scoped` still run live on every call.
+///
+/// The recomputation runs *outside* the cache mutex so a slow topology
+/// derivation cannot serialize unrelated fingerprints behind the lock; a
+/// racing refill wins when still fresh.
 fn validated_roots_cached(snapshot: &Value) -> Arc<Vec<PathBuf>> {
     let fingerprint = projects::routing_fingerprint(snapshot);
-    let mut cache = VALIDATED_ROOTS_CACHE
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(roots) = cache.get(&fingerprint) {
-        return Arc::clone(roots);
+    let cache = VALIDATED_ROOTS_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = guard.get(&fingerprint)
+            && entry.expires_at > projects::cache_now()
+        {
+            return Arc::clone(&entry.roots);
+        }
     }
     let roots = Arc::new(validated_roots_from(&projects::derive_routing_cached(
         snapshot,
     )));
-    if cache.len() >= projects::ROUTING_CACHE_CAP {
-        cache.clear();
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.get(&fingerprint)
+        && entry.expires_at > projects::cache_now()
+    {
+        return Arc::clone(&entry.roots);
     }
-    cache.insert(fingerprint, Arc::clone(&roots));
+    if guard.len() >= projects::ROUTING_CACHE_CAP {
+        guard.clear();
+    }
+    guard.insert(
+        fingerprint,
+        ValidatedRootsCacheEntry {
+            expires_at: projects::cache_now() + projects::ROUTING_CACHE_TTL,
+            roots: Arc::clone(&roots),
+        },
+    );
     roots
 }
 
@@ -1576,5 +1606,29 @@ mod tests {
 
         fs::remove_dir_all(parent).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn validated_roots_cached_recomputes_after_ttl_expiry() {
+        let parent = plain_parent("cached-roots-ttl", &["project"]);
+        let snap = snapshot(&parent.join("project"));
+
+        VALIDATED_ROOTS_CACHE
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        let first = validated_roots_cached(&snap);
+        projects::advance_cache_clock(
+            projects::ROUTING_CACHE_TTL + std::time::Duration::from_millis(1),
+        );
+        let second = validated_roots_cached(&snap);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an expired entry must recompute so fingerprint-invisible fs changes surface"
+        );
+
+        fs::remove_dir_all(parent).unwrap();
     }
 }
