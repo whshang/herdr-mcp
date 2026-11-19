@@ -69,7 +69,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// path now runs it once so the upgrade installs the new subcommands before a
 /// request needs them. That costs one broker re-authorization on that upgrade,
 /// which is the same at-most-one-prompt-per-upgrade budget #844 targets.
-pub const BROKER_COMPAT_REVISION: u32 = 5;
+pub const BROKER_COMPAT_REVISION: u32 = 6; // 6: adds __tcc-broker-stream
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
@@ -526,14 +526,20 @@ const STREAM_PROTOCOL: &str = "herdr-tcc-broker-stream";
 const STREAM_PROTOCOL_VERSION: u32 = 1;
 
 /// Write one stream frame (single JSON line) respecting `MAX_RESPONSE_BYTES`.
+/// An oversized value is replaced by a bounded error frame that preserves the
+/// `{seq, result}` envelope — without `seq` the parent flags a protocol
+/// desync and kills a healthy worker (P2, review 6997783732).
 fn write_stream_frame(writer: &mut impl Write, value: &Value) -> Result<(), String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("cannot serialize stream frame: {error}"))?;
     if bytes.len() > MAX_RESPONSE_BYTES {
-        let fallback = serde_json::to_vec(&broker_error(
-            "response_too_large",
-            "broker response exceeds the bounded stream frame size",
-        ))
+        let fallback = serde_json::to_vec(&json!({
+            "seq": value.get("seq").cloned().unwrap_or(Value::Null),
+            "result": broker_error(
+                "response_too_large",
+                "broker response exceeds the bounded stream frame size",
+            ),
+        }))
         .map_err(|error| format!("cannot serialize fallback frame: {error}"))?;
         writer
             .write_all(&fallback)
@@ -1374,6 +1380,22 @@ pub(crate) fn is_broker_child_process() -> bool {
     std::env::var(BROKER_CHILD_ENV).ok().as_deref() == Some("1")
 }
 
+/// Fail closed: refuse a broker path that is not a regular file (symlinks
+/// included). Validated at the `run_stable_broker` entry so both the
+/// streaming-pool and one-shot paths share one boundary, and re-checked in
+/// `spawn_stream_worker` before each resident spawn.
+fn validate_broker_file(broker: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(broker)
+        .map_err(|error| format!("cannot inspect broker {}: {error}", broker.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "broker {} must be a regular file (not a symlink)",
+            broker.display()
+        ));
+    }
+    Ok(())
+}
+
 fn run_stable_broker(op: &str, snapshot: &Value, args: &Value) -> Result<Value, String> {
     let config_dir = crate::paths::RuntimePaths::discover()?.config_dir;
     let broker = broker_path(&config_dir);
@@ -1383,6 +1405,9 @@ fn run_stable_broker(op: &str, snapshot: &Value, args: &Value) -> Result<Value, 
             broker.display()
         ));
     }
+    // Regular-file (non-symlink) gate before either execution path: the
+    // streaming pool used to spawn past this check entirely.
+    validate_broker_file(&broker)?;
     #[cfg(target_os = "macos")]
     {
         // Prefer the resident streaming worker (#1068): zero spawn/env copies
@@ -1411,16 +1436,8 @@ fn run_stable_broker(op: &str, snapshot: &Value, args: &Value) -> Result<Value, 
 }
 
 fn run_broker_child(broker: &Path, request_bytes: &[u8]) -> Result<Value, String> {
-    // Fail closed: never spawn a broker path that is a symlink or not a
-    // regular file.
-    let metadata = std::fs::symlink_metadata(broker)
-        .map_err(|error| format!("cannot inspect broker {}: {error}", broker.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "broker {} must be a regular file (not a symlink)",
-            broker.display()
-        ));
-    }
+    // Re-check at the actual exec boundary (the entry already gated this).
+    validate_broker_file(broker)?;
 
     #[cfg(target_os = "macos")]
     {
@@ -1971,41 +1988,64 @@ fn topology_fingerprint(value: &Value) -> u64 {
 }
 
 /// Read one newline-delimited frame with a deadline. The frame is capped by
-/// `MAX_RESPONSE_BYTES`; an oversized, empty (EOF) or timed-out read returns
-/// `None`, which callers treat as a dead worker.
+/// `MAX_RESPONSE_BYTES`; an oversized or empty (EOF) read returns `None`, and
+/// an exhausted deadline returns `Err` — callers treat both as a dead worker.
 #[cfg(target_os = "macos")]
 fn read_stream_reply(reader: &std::fs::File, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
     use std::os::fd::AsRawFd;
-    let (sender, receiver) = std::sync::mpsc::channel();
+    // Wait and read on the calling thread via poll(2): no per-request thread
+    // spawn, and no raw descriptor borrowed into another thread whose lifetime
+    // could outlive the file or race a kill. `File` stays the sole fd owner;
+    // EINTR retries against the recomputed remaining deadline.
     let fd = reader.as_raw_fd();
-    std::thread::spawn(move || {
-        // Borrow the raw descriptor: `File` stays the sole owner, and the
-        // blocking libc read races harmlessly with `terminate_pid_group`
-        // closing the process side (kill → EIO/EOF).
-        let mut buf = Vec::with_capacity(4096);
-        let mut chunk = [0_u8; 8192];
-        loop {
-            let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-            if count <= 0 {
-                let _ = sender.send(None);
-                return;
-            }
-            let count = count as usize;
-            if let Some(newline) = chunk[..count].iter().position(|b| *b == b'\n') {
-                buf.extend_from_slice(&chunk[..newline]);
-                let _ = sender.send(Some(buf));
-                return;
-            }
-            buf.extend_from_slice(&chunk[..count]);
-            if buf.len() > MAX_RESPONSE_BYTES {
-                let _ = sender.send(None);
-                return;
-            }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("stream reply deadline exceeded".to_owned());
         }
-    });
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|error| format!("stream reply wait failed: {error}"))
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("stream reply poll failed: {error}"));
+        }
+        if ready == 0 {
+            return Err("stream reply deadline exceeded".to_owned());
+        }
+        // POLLIN guarantees the read below cannot block; POLLHUP/POLLERR still
+        // flow through it so EOF and errors resolve the same way.
+        let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("stream reply read failed: {error}"));
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        let count = count as usize;
+        if let Some(newline) = chunk[..count].iter().position(|b| *b == b'\n') {
+            buf.extend_from_slice(&chunk[..newline]);
+            return Ok(Some(buf));
+        }
+        buf.extend_from_slice(&chunk[..count]);
+        if buf.len() > MAX_RESPONSE_BYTES {
+            return Ok(None);
+        }
+    }
 }
 
 /// One resident broker worker process and its pipes.
@@ -2014,7 +2054,6 @@ struct StreamWorker {
     pid: libc::pid_t,
     stdin: std::fs::File,
     stdout: std::fs::File,
-    _stderr: std::fs::File,
     _registration: crate::child_process::OwnedChildRegistration,
     last_used: std::time::Instant,
     fingerprint: u64,
@@ -2044,21 +2083,32 @@ impl Drop for StreamWorker {
 fn spawn_stream_worker(broker: &Path) -> Result<Option<StreamWorker>, String> {
     use std::os::fd::AsRawFd;
 
+    // Every resident spawn re-checks the regular-file boundary: the installed
+    // broker can be replaced between requests, and the pool path must keep the
+    // same gate as the one-shot child.
+    validate_broker_file(broker)?;
+
     let (stdin_read, mut stdin_write) = stream_pipe_pair()?;
     let (stdout_read, stdout_write) = stream_pipe_pair()?;
-    let (stderr_read, stderr_write) = stream_pipe_pair()?;
+    // stderr goes to /dev/null, not a pipe: a resident worker that chatters
+    // past the 64 KiB pipe capacity would otherwise block its writes and stall
+    // every request (P2, review 6997783732).
+    let devnull = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .map_err(|error| format!("cannot open /dev/null for broker stream: {error}"))?;
     let pid = spawn_disclaimed_broker_mode(
         broker,
         "__tcc-broker-stream",
         stdin_read.as_raw_fd(),
         stdout_write.as_raw_fd(),
-        stderr_write.as_raw_fd(),
+        devnull.as_raw_fd(),
         true,
     )?;
     let registration = crate::child_process::register_owned_pid("tcc-broker-stream", pid as u32);
     drop(stdin_read);
     drop(stdout_write);
-    drop(stderr_write);
+    drop(devnull);
 
     let hello = serde_json::to_vec(&json!({
         "protocol": STREAM_PROTOCOL,
@@ -2072,7 +2122,6 @@ fn spawn_stream_worker(broker: &Path) -> Result<Option<StreamWorker>, String> {
         pid,
         stdin: worker_stdin,
         stdout: stdout_read,
-        _stderr: stderr_read,
         _registration: registration,
         last_used: std::time::Instant::now(),
         fingerprint: 0,
@@ -2153,13 +2202,43 @@ struct StreamPoolState {
     unsupported: bool,
 }
 
+/// `(dev, ino)` identity of the broker binary a pool was built against. A
+/// reinstalled, upgraded or uninstalled broker changes this identity; the
+/// running service must not keep serving from stale resident workers or a
+/// latched `unsupported` verdict (P2, review 6997783732).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrokerFileId {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn broker_file_id(broker: &Path) -> Result<BrokerFileId, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(broker)
+        .map_err(|error| format!("cannot stat broker {}: {error}", broker.display()))?;
+    Ok(BrokerFileId {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
 /// Bounded pool of resident broker workers. Requests run serially per worker
 /// (frame order is enforced by the per-worker `next_seq`), which is the
 /// isolation contract for concurrent callers: each in-flight request has a
 /// whole worker — and therefore a private seq lane — to itself.
+///
+/// The lock only ever covers state transitions. `terminate_pid_group` (up to
+/// ~500ms) and `spawn_stream_worker` (posix_spawn plus the up-to-10s hello
+/// handshake) always run unlocked so completed leases and concurrent
+/// requests are never queued behind a spawn or a reap (P1, review
+/// 6997783732).
 #[cfg(target_os = "macos")]
 struct StreamPool {
     broker: PathBuf,
+    /// `None` = unmanaged (tests); disk identity is not enforced.
+    broker_id: Option<BrokerFileId>,
     request_timeout: Duration,
     state: std::sync::Mutex<StreamPoolState>,
     ready: std::sync::Condvar,
@@ -2167,9 +2246,10 @@ struct StreamPool {
 
 #[cfg(target_os = "macos")]
 impl StreamPool {
-    fn new(broker: &Path) -> Self {
+    fn new(broker: &Path, broker_id: Option<BrokerFileId>) -> Self {
         Self {
             broker: broker.to_path_buf(),
+            broker_id,
             request_timeout: REQUEST_TIMEOUT,
             state: std::sync::Mutex::new(StreamPoolState {
                 idle: Vec::new(),
@@ -2180,60 +2260,104 @@ impl StreamPool {
         }
     }
 
-    /// Acquire a worker lease. `Ok(None)` means streaming is unsupported and
-    /// the caller must run the one-shot path.
-    fn acquire(&self) -> Result<Option<PoolLease<'_>>, String> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    /// Acquire a worker lease. `Ok(None)` means streaming is unsupported —
+    /// either the installed broker cannot stream or the binary on disk no
+    /// longer matches the one this pool was built for; the caller must run
+    /// the one-shot path.
+    fn acquire(self: std::sync::Arc<Self>) -> Result<Option<PoolLease>, String> {
+        // Disk-awareness: never serve a request from a pool whose broker
+        // binary was replaced or removed. The one-shot path re-validates and
+        // executes the current file, and the next call rebuilds the pool.
+        if let Some(expected) = self.broker_id
+            && broker_file_id(&self.broker).ok() != Some(expected)
+        {
+            return Ok(None);
+        }
+        enum Step {
+            Lease(StreamWorker),
+            Reap(Vec<StreamWorker>),
+            Spawn,
+            Wait,
+        }
         loop {
-            if state.unsupported {
-                return Ok(None);
-            }
-            while let Some(mut worker) = state.idle.pop() {
-                if worker.last_used.elapsed() > STREAM_WORKER_IDLE_TIMEOUT {
-                    worker.kill();
-                    state.live -= 1;
-                    continue;
+            let step = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.unsupported {
+                    return Ok(None);
                 }
-                return Ok(Some(PoolLease {
-                    pool: self,
-                    worker: Some(worker),
-                }));
-            }
-            if state.live < STREAM_POOL_MAX_WORKERS {
-                state.live += 1;
-                match spawn_stream_worker(&self.broker) {
+                let mut leased = None;
+                let mut stale = Vec::new();
+                while let Some(worker) = state.idle.pop() {
+                    if worker.last_used.elapsed() > STREAM_WORKER_IDLE_TIMEOUT {
+                        stale.push(worker);
+                    } else {
+                        leased = Some(worker);
+                        break;
+                    }
+                }
+                if let Some(worker) = leased {
+                    Step::Lease(worker)
+                } else if !stale.is_empty() {
+                    // Free the slots now; the blocking reap runs unlocked.
+                    state.live -= stale.len();
+                    Step::Reap(stale)
+                } else if state.live < STREAM_POOL_MAX_WORKERS {
+                    // Reserve the slot now; the expensive spawn runs unlocked.
+                    state.live += 1;
+                    Step::Spawn
+                } else {
+                    state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+                    Step::Wait
+                }
+            };
+            match step {
+                Step::Lease(worker) => {
+                    return Ok(Some(PoolLease {
+                        pool: self.clone(),
+                        worker: Some(worker),
+                    }));
+                }
+                Step::Reap(stale) => drop(stale),
+                Step::Spawn => match spawn_stream_worker(&self.broker) {
                     Ok(Some(worker)) => {
                         return Ok(Some(PoolLease {
-                            pool: self,
+                            pool: self.clone(),
                             worker: Some(worker),
                         }));
                     }
                     Ok(None) => {
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         state.live -= 1;
                         state.unsupported = true;
+                        drop(state);
+                        self.ready.notify_all();
                         return Ok(None);
                     }
                     Err(error) => {
+                        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         state.live -= 1;
+                        drop(state);
+                        self.ready.notify_all();
                         return Err(error);
                     }
-                }
+                },
+                Step::Wait => {}
             }
-            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
 
 /// Checked-out worker. Returning it to the pool releases concurrency capacity;
-/// dropping a dead worker frees a spawn slot.
+/// dropping a dead worker frees a spawn slot. The lease holds an `Arc` so a
+/// replaced pool stays alive until its last lease drains.
 #[cfg(target_os = "macos")]
-struct PoolLease<'a> {
-    pool: &'a StreamPool,
+struct PoolLease {
+    pool: std::sync::Arc<StreamPool>,
     worker: Option<StreamWorker>,
 }
 
 #[cfg(target_os = "macos")]
-impl PoolLease<'_> {
+impl PoolLease {
     /// Drive one request frame. On success the worker stays healthy and the
     /// reply carries the tool envelope; any transport failure marks the worker
     /// dead so `Drop` kills the process and frees its pool slot.
@@ -2297,25 +2421,55 @@ impl PoolLease<'_> {
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for PoolLease<'_> {
+impl Drop for PoolLease {
     fn drop(&mut self) {
         let Some(worker) = self.worker.take() else {
             return;
         };
-        let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
-        if worker.healthy {
-            state.idle.push(worker);
-        } else {
-            // Worker was killed or already dead: free its slot for a rebuild.
-            state.live = state.live.saturating_sub(1);
-            drop(worker);
-        }
+        let reaped = {
+            let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            if worker.healthy {
+                state.idle.push(worker);
+                None
+            } else {
+                // Worker was killed or already dead: free its slot for a
+                // rebuild, but terminate it after releasing the lock — the
+                // SIGTERM grace can take ~500ms and must not stall other
+                // leases (P1, review 6997783732).
+                state.live = state.live.saturating_sub(1);
+                Some(worker)
+            }
+        };
+        drop(reaped);
         self.pool.ready.notify_one();
     }
 }
 
+/// Process-resident pool slot. Kept inside a `Mutex` (never an immutable
+/// `OnceLock`) so a reinstalled or upgraded broker binary — detected by its
+/// `(dev, ino)` identity — swaps in a fresh pool instead of serving stale
+/// resident workers or a permanently latched `unsupported` verdict.
 #[cfg(target_os = "macos")]
-static STREAM_POOL: std::sync::OnceLock<StreamPool> = std::sync::OnceLock::new();
+static STREAM_POOL: std::sync::Mutex<Option<std::sync::Arc<StreamPool>>> =
+    std::sync::Mutex::new(None);
+
+/// The pool serving the current on-disk broker, rebuilding on identity drift.
+#[cfg(target_os = "macos")]
+fn current_stream_pool(broker: &Path) -> Result<std::sync::Arc<StreamPool>, String> {
+    let id = broker_file_id(broker)?;
+    let mut slot = STREAM_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = slot.as_ref()
+        && pool.broker == broker
+        && pool.broker_id == Some(id)
+    {
+        return Ok(pool.clone());
+    }
+    // Replacing the pool drops the old Arc; its resident workers keep running
+    // until outstanding leases drain, then `StreamWorker::drop` reaps them.
+    let pool = std::sync::Arc::new(StreamPool::new(broker, Some(id)));
+    *slot = Some(pool.clone());
+    Ok(pool)
+}
 
 /// Serve one fs/git call through the resident stream worker pool. `Ok(None)`
 /// means the installed broker cannot stream and the caller must use the
@@ -2327,7 +2481,7 @@ fn run_broker_stream_pool(
     snapshot: &Value,
     args: &Value,
 ) -> Result<Option<Value>, String> {
-    let pool = STREAM_POOL.get_or_init(|| StreamPool::new(broker));
+    let pool = current_stream_pool(broker)?;
     let Some(mut lease) = pool.acquire()? else {
         return Ok(None);
     };
@@ -3076,9 +3230,9 @@ mod tests {
         // /bin/cat echoes stdin but never emits hello_ok — the handshake must
         // classify it as an old broker and latch permanent fallback instead of
         // retry-spawning on every request.
-        let pool = StreamPool::new(Path::new("/bin/cat"));
-        assert!(pool.acquire().unwrap().is_none());
-        assert!(pool.acquire().unwrap().is_none());
+        let pool = std::sync::Arc::new(StreamPool::new(Path::new("/bin/cat"), None));
+        assert!(pool.clone().acquire().unwrap().is_none());
+        assert!(pool.clone().acquire().unwrap().is_none());
         let state = pool.state.lock().unwrap();
         assert!(state.unsupported);
         assert_eq!(state.live, 0);
@@ -3087,8 +3241,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn stream_reply_read_enforces_deadline_and_dead_worker_frees_slot() {
-        // A held-open write end that never sends: the reader thread blocks but
-        // recv_timeout must surface the deadline.
+        // A held-open write end that never sends: poll must surface the
+        // deadline without a per-request thread.
         let (read_end, write_end) = stream_pipe_pair().unwrap();
         let start = std::time::Instant::now();
         let reply = read_stream_reply(&read_end, Duration::from_millis(200));
@@ -3096,12 +3250,18 @@ mod tests {
             reply.is_err(),
             "a silent worker must hit the request deadline"
         );
-        assert!(start.elapsed() >= Duration::from_millis(200));
+        // Instant vs poll's deadline can disagree by the millisecond floor —
+        // assert the deadline fired, not an exact wall duration.
+        assert!(
+            start.elapsed() >= Duration::from_millis(190),
+            "returned far too early: {reply:?} elapsed={:?}",
+            start.elapsed()
+        );
         drop(write_end);
 
         // Dropping a lease whose worker was marked dead frees its spawn slot —
         // that is the rebuild path after a timeout kill.
-        let pool = StreamPool::new(Path::new("/bin/cat"));
+        let pool = std::sync::Arc::new(StreamPool::new(Path::new("/bin/cat"), None));
         {
             let mut state = pool.state.lock().unwrap();
             state.live = 1;
@@ -3112,7 +3272,6 @@ mod tests {
             pid: i32::MAX - 8,
             stdin: stream_pipe_pair().unwrap().1,
             stdout: stream_pipe_pair().unwrap().0,
-            _stderr: stream_pipe_pair().unwrap().0,
             _registration: crate::child_process::register_owned_pid("test", 0),
             last_used: std::time::Instant::now(),
             fingerprint: 0,
@@ -3120,10 +3279,80 @@ mod tests {
             healthy: false,
         };
         drop(PoolLease {
-            pool: &pool,
+            pool: pool.clone(),
             worker: Some(dead),
         });
         let state = pool.state.lock().unwrap();
         assert_eq!(state.live, 0, "dead worker lease frees its pool slot");
+    }
+
+    #[test]
+    fn stream_frame_too_large_fallback_keeps_seq_and_result() {
+        // A serialized reply above MAX_RESPONSE_BYTES must degrade to a
+        // bounded {seq, result} frame — the bare broker_error used to drop
+        // `seq`, which the parent reads as a protocol desync and kills the
+        // healthy worker over (P2, review 6997783732).
+        let huge = "x".repeat(MAX_RESPONSE_BYTES);
+        let oversized = json!({ "seq": 7, "result": { "ok": true, "content": huge } });
+        let mut out = Vec::new();
+        write_stream_frame(&mut out, &oversized).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(
+            text.len() < 4096,
+            "fallback must stay bounded: {}",
+            text.len()
+        );
+        let frame: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(frame["seq"], 7);
+        assert_eq!(frame["result"]["ok"], false);
+        assert_eq!(frame["result"]["code"], "response_too_large");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_pool_refuses_after_broker_binary_replaced() {
+        // The pool keys on (dev, ino): once the installed broker is swapped
+        // (upgrade, reinstall, uninstall), acquire must decline so the caller
+        // runs the one-shot path and the next call rebuilds the pool — never
+        // serve from workers resident on the stale binary.
+        let dir = temp_dir("pool-identity");
+        let broker = dir.join("broker");
+        fs::write(&broker, b"rev-a").unwrap();
+        let id = broker_file_id(&broker).unwrap();
+        let pool = std::sync::Arc::new(StreamPool::new(&broker, Some(id)));
+
+        fs::remove_file(&broker).unwrap();
+        fs::write(&broker, b"rev-b").unwrap();
+        let new_id = broker_file_id(&broker).unwrap();
+        assert_ne!(new_id, id, "replace must change the file identity");
+        assert!(
+            pool.acquire().unwrap().is_none(),
+            "pool built against the old binary must decline"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_stream_pool_rebuilds_on_disk_identity_change() {
+        let dir = temp_dir("pool-rebuild");
+        let broker = dir.join("broker");
+        fs::write(&broker, b"rev-a").unwrap();
+        let first = current_stream_pool(&broker).unwrap();
+        let again = current_stream_pool(&broker).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+
+        fs::remove_file(&broker).unwrap();
+        fs::write(&broker, b"rev-b").unwrap();
+        let rebuilt = current_stream_pool(&broker).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &rebuilt),
+            "disk replacement must swap in a fresh pool"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        // Leave the process slot clean for other tests.
+        let mut slot = STREAM_POOL.lock().unwrap();
+        *slot = None;
     }
 }
