@@ -504,7 +504,7 @@ pub fn run_durable(
             "workspace": workspace_target,
         }));
     };
-    let topology = projects::derive_routing(snapshot);
+    let topology = projects::derive_routing_cached(snapshot);
     let current_projects = projects::projects_for_workspace(&topology, &workspace.id);
     let roots = current_projects
         .iter()

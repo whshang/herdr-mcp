@@ -251,7 +251,7 @@ fn check_with_policy(
     confirm_busy: bool,
     policy: &MutationPolicy,
 ) -> Result<Vec<Value>, Value> {
-    let topology = crate::projects::derive_routing(snapshot);
+    let topology = crate::projects::derive_routing_cached(snapshot);
     check_with_policy_and_topology(snapshot, &topology, root, confirm_busy, policy)
 }
 
@@ -561,8 +561,8 @@ mod tests {
         let _ = check_with_policy(&snap, &root, false, &policy).unwrap();
         assert_eq!(
             crate::projects::derive_routing_call_count(),
-            2,
-            "separate validate+check still derives twice"
+            1,
+            "separate validate+check calls share the routing cache on the same snapshot"
         );
 
         crate::projects::reset_derive_routing_call_count();

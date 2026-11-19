@@ -38,7 +38,7 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
         Err(error) => return error,
     };
 
-    let topology = projects::derive_routing(snapshot);
+    let topology = projects::derive_routing_cached(snapshot);
     let root_path =
         match fs_security::validate_existing_validated_with_topology(&topology, root_input) {
             Ok(value) => value,

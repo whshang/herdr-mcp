@@ -1,6 +1,7 @@
 use crate::projects::{self, ProjectTopology};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct ManagedPath {
@@ -10,7 +11,7 @@ pub struct ManagedPath {
 }
 
 pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
-    managed_roots_from(&projects::derive_routing(snapshot))
+    managed_roots_from(&projects::derive_routing_cached(snapshot))
 }
 
 /// Unified validated-root access surface: managed Git roots plus vcs-less
@@ -380,9 +381,37 @@ fn validate_existing_validated_with_worktrees_root(
     validate_existing_scoped(
         snapshot,
         input,
-        &validated_roots_from(&projects::derive_routing(snapshot)),
+        &validated_roots_cached(snapshot),
         worktrees_root.as_deref(),
     )
+}
+
+static VALIDATED_ROOTS_CACHE: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<projects::RoutingFingerprint, Arc<Vec<PathBuf>>>>,
+> = std::sync::OnceLock::new();
+
+/// [`validated_roots_from`] memoized on the routing fingerprint. Skips the
+/// per-call root/cwd `canonicalize` and `HomeGuard` ancestor stats inside
+/// `operational_root_eligible` during scroll churn. Per-request target-path
+/// canonicalize, secret-path denial, and symlink-escape checks in
+/// `validate_existing_scoped` still run live on every call.
+fn validated_roots_cached(snapshot: &Value) -> Arc<Vec<PathBuf>> {
+    let fingerprint = projects::routing_fingerprint(snapshot);
+    let mut cache = VALIDATED_ROOTS_CACHE
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(roots) = cache.get(&fingerprint) {
+        return Arc::clone(roots);
+    }
+    let roots = Arc::new(validated_roots_from(&projects::derive_routing_cached(
+        snapshot,
+    )));
+    if cache.len() >= projects::ROUTING_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(fingerprint, Arc::clone(&roots));
+    roots
 }
 
 /// See [`validate_existing_validated`]. Reuses one routing topology per
@@ -1514,5 +1543,38 @@ mod tests {
         assert!(hint.contains("keep it available"));
         let _ = fs::remove_file(outside);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validated_roots_cached_reuses_roots_across_scroll_churn_and_misses_on_cwd_change() {
+        let parent = plain_parent("cached-roots", &["project"]);
+        let root = parent.join("project");
+        let snap = snapshot(&root);
+        let mut churned = snap.clone();
+        churned["panes"][0]["scrollback_offset"] = json!(42_000);
+
+        VALIDATED_ROOTS_CACHE
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+
+        let first = validated_roots_cached(&snap);
+        let second = validated_roots_cached(&churned);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "scroll churn must reuse the cached roots"
+        );
+
+        let other = plain_parent("cached-roots-moved", &["project"]);
+        let moved = snapshot(&other.join("project"));
+        let third = validated_roots_cached(&moved);
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a cwd change must recompute roots"
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+        fs::remove_dir_all(other).unwrap();
     }
 }

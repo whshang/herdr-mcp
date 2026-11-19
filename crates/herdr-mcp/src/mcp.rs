@@ -4245,7 +4245,7 @@ fn pickup_resolve_root(
     snapshot: Option<&Value>,
     candidates: &[String],
 ) -> Option<std::path::PathBuf> {
-    let topology = crate::projects::derive_routing(snapshot?);
+    let topology = crate::projects::derive_routing_cached(snapshot?);
     let roots = crate::fs_security::validated_roots_from(&topology);
     candidates.iter().find_map(|candidate| {
         let candidate = std::path::Path::new(candidate);

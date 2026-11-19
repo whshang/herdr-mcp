@@ -368,7 +368,7 @@ where
     let Some(workspace_id) = remove_params.get("workspace_id").and_then(Value::as_str) else {
         return original_error;
     };
-    let topology = crate::projects::derive_routing(snapshot);
+    let topology = crate::projects::derive_routing_cached(snapshot);
     let projects = crate::projects::projects_for_workspace(&topology, workspace_id);
     let [project] = projects.as_slice() else {
         return original_error;

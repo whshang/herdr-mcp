@@ -45,7 +45,7 @@ pub fn start(
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
-    let topology = projects::derive_routing(snapshot);
+    let topology = projects::derive_routing_cached(snapshot);
     let protected_root =
         crate::macos_permissions::project_path_needs_protected_transport(Path::new(root));
     let managed = match if protected_root {

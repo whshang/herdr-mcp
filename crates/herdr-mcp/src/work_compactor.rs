@@ -2567,7 +2567,7 @@ pub(crate) fn start_background(store: &StateStore, cache: Arc<EventCache>) {
                     // managed Git roots plus vcs-less operational roots proven
                     // by the live topology. Project key = the git root when
                     // any, else the operational folder itself.
-                    let topology = crate::projects::derive_routing(&snapshot);
+                    let topology = crate::projects::derive_routing_cached(&snapshot);
                     let roots = crate::fs_security::validated_roots_from(&topology);
                     let refs = roots
                         .iter()

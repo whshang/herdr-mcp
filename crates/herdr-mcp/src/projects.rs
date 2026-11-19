@@ -189,6 +189,67 @@ pub(crate) fn reset_derive_routing_call_count() {
     DERIVE_ROUTING_CALLS.with(|count| count.set(0));
 }
 
+/// Every snapshot input [`derive_routing`] reads, extracted cheaply. Two
+/// snapshots with the same fingerprint produce an identical routing
+/// topology, so hot callers can reuse one `Arc<ProjectTopology>` across
+/// scroll churn that only rewrites unrelated pane fields (scroll offsets,
+/// output text, cursor state).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RoutingFingerprint {
+    workspaces: Vec<(String, PathBuf)>,
+    pane_workspaces: Vec<(String, String)>,
+    pane_cwds: Vec<(String, PathBuf)>,
+}
+
+/// Extract the routing fingerprint: declared workspace roots plus every
+/// pane/agent's workspace binding and cwd, in sorted order.
+pub(crate) fn routing_fingerprint(snapshot: &Value) -> RoutingFingerprint {
+    let mut workspaces = declared_workspace_roots(snapshot)
+        .into_iter()
+        .collect::<Vec<_>>();
+    workspaces.sort();
+    let mut pane_workspaces = pane_workspaces(snapshot).into_iter().collect::<Vec<_>>();
+    pane_workspaces.sort();
+    let pane_cwds = pane_cwds(snapshot).into_iter().collect::<Vec<_>>();
+    RoutingFingerprint {
+        workspaces,
+        pane_workspaces,
+        pane_cwds,
+    }
+}
+
+/// Bounded so alternating snapshot shapes cannot grow memory without limit.
+pub(crate) const ROUTING_CACHE_CAP: usize = 32;
+
+static ROUTING_TOPOLOGY_CACHE: OnceLock<Mutex<HashMap<RoutingFingerprint, Arc<ProjectTopology>>>> =
+    OnceLock::new();
+
+/// [`derive_routing`] memoized on the routing fingerprint. High-frequency
+/// callers (exec/fs gates, worktree scans) hit this during scroll churn and
+/// skip the full topology walk — including the protected-cwd fallback into
+/// the stable-broker `git status` probe.
+///
+/// The fingerprint covers every input the derivation reads, so a new
+/// workspace or a changed pane/agent cwd misses immediately. Per-request
+/// target-path checks (canonicalize, secret-path denial, symlink escapes)
+/// are downstream of the topology and stay live on every call.
+pub fn derive_routing_cached(snapshot: &Value) -> Arc<ProjectTopology> {
+    let fingerprint = routing_fingerprint(snapshot);
+    let mut cache = ROUTING_TOPOLOGY_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(topology) = cache.get(&fingerprint) {
+        return Arc::clone(topology);
+    }
+    let topology = Arc::new(derive_routing(snapshot));
+    if cache.len() >= ROUTING_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(fingerprint, Arc::clone(&topology));
+    topology
+}
+
 fn derive_inner(snapshot: &Value, include_git_status: bool) -> ProjectTopology {
     let pane_to_workspace = pane_workspaces(snapshot);
     let pane_cwds = pane_cwds(snapshot);
@@ -1120,5 +1181,83 @@ mod tests {
             .join("feature-not-present");
         assert!(is_herdr_managed_worktree(&checkout));
         assert!(!should_use_broker_for_toplevel(&json!({}), &checkout));
+    }
+
+    #[test]
+    fn routing_fingerprint_ignores_scroll_churn() {
+        let base = json!({
+            "workspaces": [{"workspace_id": "w1", "worktree": {"checkout_path": "/repo"}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/repo/sub", "scrollback_offset": 0}],
+            "agents": [{"pane_id": "w1:p2", "workspace_id": "w1", "cwd": "/repo", "status": "busy"}]
+        });
+        let mut churned = base.clone();
+        churned["panes"][0]["scrollback_offset"] = json!(9000);
+        churned["panes"][0]["output_tail"] = json!("new terminal text");
+        churned["agents"][0]["status"] = json!("idle");
+        assert_eq!(routing_fingerprint(&base), routing_fingerprint(&churned));
+    }
+
+    #[test]
+    fn routing_fingerprint_changes_on_workspace_or_cwd_change() {
+        let base = json!({
+            "workspaces": [{"workspace_id": "w1", "worktree": {"checkout_path": "/repo"}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/repo/sub"}],
+            "agents": []
+        });
+        let mut new_workspace = base.clone();
+        new_workspace["workspaces"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"workspace_id": "w2", "worktree": {"path": "/other"}}));
+        assert_ne!(
+            routing_fingerprint(&base),
+            routing_fingerprint(&new_workspace)
+        );
+
+        let mut moved_pane = base.clone();
+        moved_pane["panes"][0]["cwd"] = json!("/elsewhere");
+        assert_ne!(routing_fingerprint(&base), routing_fingerprint(&moved_pane));
+
+        let mut rebound_pane = base.clone();
+        rebound_pane["panes"][0]["workspace_id"] = json!("w2");
+        assert_ne!(
+            routing_fingerprint(&base),
+            routing_fingerprint(&rebound_pane)
+        );
+    }
+
+    #[test]
+    fn derive_routing_cached_reuses_topology_across_churn_and_misses_on_change() {
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/tmp"}],
+            "agents": []
+        });
+        let mut churned = snapshot.clone();
+        churned["panes"][0]["scrollback_offset"] = json!(12_345);
+
+        ROUTING_TOPOLOGY_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        reset_derive_routing_call_count();
+
+        let first = derive_routing_cached(&snapshot);
+        let second = derive_routing_cached(&churned);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "scroll churn must reuse the cached topology"
+        );
+        assert_eq!(
+            derive_routing_call_count(),
+            1,
+            "cached hits skip the full derivation"
+        );
+
+        let mut moved = snapshot.clone();
+        moved["panes"][0]["cwd"] = json!("/var");
+        let third = derive_routing_cached(&moved);
+        assert!(!Arc::ptr_eq(&first, &third), "a cwd change must re-derive");
+        assert_eq!(derive_routing_call_count(), 2);
     }
 }
