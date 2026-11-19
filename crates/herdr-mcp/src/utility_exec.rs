@@ -3933,4 +3933,76 @@ mod tests {
         drop(registry);
         let _ = fs::remove_dir_all(base);
     }
+
+    /// user dispatcher | Given a managed git workspace inspected before a
+    /// write | When run_durable modifies a file inside the 250ms cache TTL |
+    /// Then the next projects::derive sees the fresh dirty status end to end.
+    #[cfg(unix)]
+    #[test]
+    fn run_durable_write_invalidates_cached_git_status_for_next_derive() {
+        use std::process::Command;
+
+        let base = native_test_dir();
+        let root = base.join("project");
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "init"
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let snapshot = native_test_snapshot(&root);
+
+        // Seed the 250ms TTL cache with the clean status so a missed
+        // invalidation would hand the next derive stale evidence.
+        crate::projects::invalidate_git_status_cache(&root);
+        let clean = crate::projects::derive(&snapshot);
+        assert!(!clean.projects[&root].dirty, "precondition: repo is clean");
+
+        let client = HerdrClient::new(base.join("missing-herdr.sock"));
+        let registry = ExecRegistry::new(base.join("state")).unwrap();
+        let marker = root.join("written-by-exec.txt");
+        let result = run_durable(
+            &client,
+            &snapshot,
+            &registry,
+            &test_store(),
+            &json!({
+                "workspace": "w1",
+                "command": format!("printf dirty > {}", marker.to_string_lossy()),
+            }),
+        );
+        assert_eq!(result["ok"], true, "unexpected result: {result}");
+        assert!(marker.exists());
+
+        // No TTL wait and no manual invalidate: run_durable's post-write
+        // invalidation must make the fresh git status visible at once.
+        let refreshed = crate::projects::derive(&snapshot);
+        let project = &refreshed.projects[&root];
+        assert!(project.dirty, "{project:?}");
+        assert!(project.changed_files >= 1, "{project:?}");
+
+        drop(registry);
+        let _ = fs::remove_dir_all(base);
+    }
 }
