@@ -50,6 +50,38 @@ pub(crate) fn strip_handoff_context(text: &str) -> Option<String> {
     (!user.is_empty()).then_some(user)
 }
 
+/// Cheap pre-check for tool-call capture: can this call possibly resolve a
+/// work scope? `resolve_scope` only derives a scope from these keys (or a
+/// nested `params` object), so a call without any of them never produces an
+/// event. Callers skip the snapshot clone when this returns false.
+pub(crate) fn may_record_tool_call(tool_name: &str, arguments: &Value) -> bool {
+    if tool_name == "herdr_call"
+        && arguments.get("method").and_then(Value::as_str) == Some("work.pickup")
+    {
+        return false;
+    }
+    let Some(object) = arguments.as_object() else {
+        return false;
+    };
+    const SCOPE_KEYS: [&str; 12] = [
+        "project_root",
+        "root",
+        "cwd",
+        "path",
+        "paths",
+        "params",
+        "workspace",
+        "workspace_id",
+        "pane",
+        "pane_id",
+        "target",
+        "worktree",
+    ];
+    SCOPE_KEYS
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+}
+
 pub(crate) fn event_for_tool_call(
     tool_name: &str,
     arguments: &Value,
@@ -504,6 +536,23 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn user_skips_capture_when_the_call_has_no_scope_keys() {
+        assert!(!may_record_tool_call("herdr_inspect", &json!({})));
+        assert!(!may_record_tool_call(
+            "herdr_call",
+            &json!({"method": "work.pickup", "params": {}})
+        ));
+        assert!(may_record_tool_call(
+            "herdr_exec",
+            &json!({"command": "pwd", "cwd": "/work"})
+        ));
+        assert!(may_record_tool_call(
+            "herdr_call",
+            &json!({"method": "pane.split", "params": {"target": "w1:p1"}})
+        ));
+    }
 
     #[test]
     fn user_sees_tool_calls_classified_by_public_name_and_call_prefix() {
