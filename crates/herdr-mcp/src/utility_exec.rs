@@ -2222,7 +2222,7 @@ mod tests {
             ],
         );
         drop(registry);
-        fs::remove_dir_all(base).unwrap();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -2391,7 +2391,7 @@ mod tests {
             assert_eq!(result["output"], "first", "{result}");
         });
         drop(registry);
-        fs::remove_dir_all(base).unwrap();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
