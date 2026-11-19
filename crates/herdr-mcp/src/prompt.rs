@@ -556,6 +556,7 @@ struct PromptRegistryInner {
     // Serialize durable task read/modify/write across report, lifecycle, ack and
     // parent notification so a stale snapshot cannot erase an accepted report.
     task_mutations: Mutex<()>,
+    parent_notifications: Mutex<HashSet<String>>,
     /// Lightweight in-memory index of durable tasks that still need tracker
     /// attention: every non-terminal task plus terminal tasks whose
     /// notification_state is still "pending". `None` means "not hydrated" and
@@ -591,6 +592,19 @@ struct PromptRegistryInner {
 #[derive(Clone, Default)]
 pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
+}
+
+struct ParentNotificationGuard<'a> {
+    active: &'a Mutex<HashSet<String>>,
+    target: &'a str,
+}
+
+impl Drop for ParentNotificationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(self.target);
+        }
+    }
 }
 
 /// One in-flight spawn resume. Dropping it releases the key for the next replay.
@@ -644,6 +658,7 @@ impl PromptRegistry {
         Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -668,6 +683,7 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -699,6 +715,7 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -2620,19 +2637,26 @@ impl PromptRegistry {
         let Some(client) = self.inner.client.as_ref() else {
             return;
         };
-        // The liveness probe is a socket read, so it happens before the claim
-        // and outside the lock; the claim below re-checks the durable state
-        // it actually claims.
-        let Some(parent_state) = agent_state_of(client, parent_target) else {
+        let active = &self.inner.parent_notifications;
+        let Ok(mut targets) = active.lock() else {
             return;
         };
-        if !matches!(parent_state.agent_status.as_deref(), Some("idle" | "done")) {
+        if !targets.insert(parent_target.to_owned()) {
             return;
         }
-
-        // Claim phase: short lock; everything durable is re-validated here
-        // (the probe above ran unlocked, so the trigger may have been
-        // acknowledged or claimed already).
+        drop(targets);
+        let _notification_guard = ParentNotificationGuard {
+            active,
+            target: parent_target,
+        };
+        // Probe while holding the parent-specific reservation, before claiming
+        // rows, so busy or unreachable parents do not count as send attempts.
+        if !agent_state_of(client, parent_target)
+            .is_some_and(|state| matches!(state.agent_status.as_deref(), Some("idle" | "done")))
+        {
+            return;
+        }
+        // Claim phase: keep durable state changes under the short mutation lock.
         let (pending, text, claimed_at) = {
             let Ok(_guard) = self.inner.task_mutations.lock() else {
                 return;
@@ -2652,7 +2676,10 @@ impl PromptRegistry {
                     && (!task.is_terminal() || task.notification_state == "pending")
             }));
 
-            let mut pending = all_tasks
+            let Ok(terminal_tasks) = self.list_terminal_tasks() else {
+                return;
+            };
+            let mut pending = terminal_tasks
                 .into_iter()
                 .filter(|task| {
                     task.parent_target.as_deref() == Some(parent_target)
@@ -2715,6 +2742,14 @@ impl PromptRegistry {
             );
             (pending, lines.join("\n"), now)
         };
+
+        // The parent may have become busy while the batch was assembled.
+        if !agent_state_of(client, parent_target)
+            .is_some_and(|state| matches!(state.agent_status.as_deref(), Some("idle" | "done")))
+        {
+            self.finalize_notification_claim(&pending, claimed_at, "pending", None, now_ms());
+            return;
+        }
 
         // Slow path: the notification RPC runs with no lock held, so a slow
         // parent cannot stall concurrent register_task / task_ack /
@@ -2824,7 +2859,7 @@ impl PromptRegistry {
         // fresh row, and the excerpt write-back above may be the write that
         // completes the record.
         self.maybe_notify_parent(&saved);
-        Ok(Some(saved))
+        self.load_task(task_id)
     }
 
     /// In-memory half of [`reconcile_task`]. `deferred` carries the
@@ -11408,6 +11443,7 @@ mod tests {
         PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -12056,6 +12092,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -13782,6 +13819,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -13942,6 +13980,7 @@ mod tests {
         PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -14976,6 +15015,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -15123,6 +15163,7 @@ mod tests {
         let server = thread::spawn(move || {
             let responses = vec![
                 json!({"result": {"agent": {"pane_id": "w9:p9", "agent_status": "idle", "state_change_seq": 9}}}),
+                json!({"result": {"agent": {"pane_id": "w9:p9", "agent_status": "idle", "state_change_seq": 9}}}),
                 json!({"result": {"ok": true}}),
             ];
             for mut response in responses {
@@ -15165,6 +15206,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -16342,6 +16384,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -17331,6 +17374,191 @@ mod tests {
     /// `register_task` complete without waiting, and the ack the RPC raced
     /// with is never overwritten by the notification write-back.
     #[test]
+    fn old_pending_notification_survives_recent_terminal_window() {
+        let socket = temp_socket();
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                store: Some(Arc::clone(&store)),
+                client: Some(HerdrClient::new(&socket)),
+                ..Default::default()
+            }),
+        };
+        let mut pending = excerpt_test_task("dispatch:prompt:old-pending");
+        pending.lifecycle = PromptTaskLifecycle::Completed;
+        pending.parent_target = Some("w1:p0".to_owned());
+        pending.notification_state = "pending".to_owned();
+        pending.updated_at_ms = 1;
+        registry.save_task(&pending, None).unwrap();
+        for index in 0..513 {
+            let mut task = excerpt_test_task(&format!("dispatch:prompt:delivered-{index}"));
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            task.notification_state = "delivered".to_owned();
+            task.updated_at_ms = 10_000 + index;
+            registry.save_task(&task, None).unwrap();
+        }
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "agent.get" => json!({"agent": {"pane_id":"w1:p0","agent_status":"idle"}}),
+                    "agent.prompt" => json!({"ok":true}),
+                    method => panic!("unexpected method {method}"),
+                };
+                assert!(write_fake_reply(
+                    &mut stream,
+                    &json!({"id": request["id"], "result": result}).to_string()
+                ));
+            }
+        });
+        registry.maybe_notify_parent(&pending);
+        assert_eq!(
+            registry
+                .load_task(&pending.task_id)
+                .unwrap()
+                .unwrap()
+                .notification_state,
+            "delivered"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn notification_rechecks_parent_before_send() {
+        let socket = temp_socket();
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                store: Some(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()))),
+                client: Some(HerdrClient::new(&socket)),
+                ..Default::default()
+            }),
+        };
+        let mut task = excerpt_test_task("dispatch:prompt:parent-became-busy");
+        task.lifecycle = PromptTaskLifecycle::Completed;
+        task.parent_target = Some("w1:p0".to_owned());
+        task.notification_state = "pending".to_owned();
+        registry.save_task(&task, None).unwrap();
+        let server = thread::spawn(move || {
+            for status in ["idle", "working"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "agent.get");
+                assert!(write_fake_reply(&mut stream, &json!({"id":request["id"],"result":{"agent":{"pane_id":"w1:p0","agent_status":status}}}).to_string()));
+            }
+        });
+        registry.maybe_notify_parent(&task);
+        server.join().unwrap();
+        assert_eq!(
+            registry
+                .load_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .notification_state,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn notifications_to_same_parent_are_single_flight() {
+        let socket = temp_socket();
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                store: Some(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()))),
+                client: Some(HerdrClient::new(&socket)),
+                ..Default::default()
+            }),
+        };
+        let mut first = excerpt_test_task("dispatch:prompt:single-flight-a");
+        first.lifecycle = PromptTaskLifecycle::Completed;
+        first.parent_target = Some("w1:p0".to_owned());
+        first.notification_state = "pending".to_owned();
+        registry.save_task(&first, None).unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_gate = Arc::clone(&gate);
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let gate = Arc::clone(&server_gate);
+                        let seen = seen_tx.clone();
+                        handlers.push(thread::spawn(move || {
+                            let mut line = String::new();
+                            BufReader::new(stream.try_clone().unwrap())
+                                .read_line(&mut line)
+                                .unwrap();
+                            let request: Value = serde_json::from_str(&line).unwrap();
+                            let result = match request["method"].as_str().unwrap() {
+                                "agent.get" => {
+                                    json!({"agent":{"pane_id":"w1:p0","agent_status":"idle"}})
+                                }
+                                "agent.prompt" => {
+                                    seen.send(()).unwrap();
+                                    let (lock, cond) = &*gate;
+                                    let _guard = cond
+                                        .wait_while(lock.lock().unwrap(), |released| !*released)
+                                        .unwrap();
+                                    json!({"ok":true})
+                                }
+                                method => panic!("unexpected method {method}"),
+                            };
+                            let _ = write_fake_reply(
+                                &mut stream,
+                                &json!({"id": request["id"], "result":result}).to_string(),
+                            );
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let notify_registry = registry.clone();
+        let notifier = thread::spawn(move || notify_registry.maybe_notify_parent(&first));
+        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut second = excerpt_test_task("dispatch:prompt:single-flight-b");
+        second.lifecycle = PromptTaskLifecycle::Completed;
+        second.parent_target = Some("w1:p0".to_owned());
+        second.notification_state = "pending".to_owned();
+        registry.save_task(&second, None).unwrap();
+        let notify_registry = registry.clone();
+        let second_notifier = thread::spawn(move || notify_registry.maybe_notify_parent(&second));
+        let concurrent = seen_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        let (lock, cond) = &*gate;
+        *lock.lock().unwrap() = true;
+        cond.notify_all();
+        notifier.join().unwrap();
+        second_notifier.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert!(!concurrent, "same parent received two concurrent prompts");
+    }
+
+    #[test]
     fn slow_parent_prompt_neither_blocks_nor_overwrites_concurrent_ack() {
         let socket = temp_socket();
         let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
@@ -17340,6 +17568,7 @@ mod tests {
         let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
         let mut registry_inner = PromptRegistryInner {
             task_mutations: Mutex::new(()),
+            parent_notifications: Mutex::new(HashSet::new()),
             task_activity_index: Mutex::new(None),
             task_activity_writes: AtomicU64::new(0),
             role_dispatches: Mutex::new(()),
@@ -17371,7 +17600,7 @@ mod tests {
         let (prompt_seen_tx, prompt_seen_rx) = std::sync::mpsc::channel::<()>();
         let (prompt_release_tx, prompt_release_rx) = std::sync::mpsc::channel::<()>();
         let server = thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
@@ -17478,6 +17707,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -17587,6 +17817,9 @@ mod tests {
             .expect("guarded write-back still attaches the excerpt after an ack");
         assert!(excerpt.contains("T1062-DONE"), "excerpt: {excerpt:?}");
         assert!(saved.is_terminal());
+        assert_eq!(saved.notification_state, "acknowledged");
+        assert!(saved.acknowledged_at_ms.is_some());
+        assert_eq!(saved.final_excerpt, stored.final_excerpt);
     }
 
     /// #1062: a hydrated, empty activity index lets the tracker skip both the
@@ -17602,6 +17835,7 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
                 task_activity_index: Mutex::new(None),
                 task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
@@ -17730,6 +17964,7 @@ mod tests {
             .unwrap();
 
         let registry = PromptRegistry::with_store_only(Arc::clone(&store));
+        registry.reconcile_active_tasks();
         assert!(
             !registry.task_activity_index_idle(),
             "an active task outside the recent terminal window must keep tracking armed"
