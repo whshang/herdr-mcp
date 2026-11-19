@@ -2275,12 +2275,11 @@ impl StreamPool {
         }
         enum Step {
             Lease(StreamWorker),
-            Reap(Vec<StreamWorker>),
             Spawn,
             Wait,
         }
         loop {
-            let step = {
+            let (step, stale) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.unsupported {
                     return Ok(None);
@@ -2295,21 +2294,26 @@ impl StreamPool {
                         break;
                     }
                 }
+                // Every popped stale worker frees its concurrency slot
+                // immediately — leased or not — so interleaved last_used
+                // updates can never leak a slot toward the permanent wait
+                // deadlock (P1, review 7003213891). `stale` travels out of the
+                // block and drops after `state`: StreamWorker::drop runs
+                // terminate_pid_group (up to ~500ms) and must never run under
+                // the pool lock.
+                state.live -= stale.len();
                 if let Some(worker) = leased {
-                    Step::Lease(worker)
-                } else if !stale.is_empty() {
-                    // Free the slots now; the blocking reap runs unlocked.
-                    state.live -= stale.len();
-                    Step::Reap(stale)
+                    (Step::Lease(worker), stale)
                 } else if state.live < STREAM_POOL_MAX_WORKERS {
                     // Reserve the slot now; the expensive spawn runs unlocked.
                     state.live += 1;
-                    Step::Spawn
+                    (Step::Spawn, stale)
                 } else {
                     state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                    Step::Wait
+                    (Step::Wait, stale)
                 }
             };
+            drop(stale);
             match step {
                 Step::Lease(worker) => {
                     return Ok(Some(PoolLease {
@@ -2317,7 +2321,6 @@ impl StreamPool {
                         worker: Some(worker),
                     }));
                 }
-                Step::Reap(stale) => drop(stale),
                 Step::Spawn => match spawn_stream_worker(&self.broker) {
                     Ok(Some(worker)) => {
                         return Ok(Some(PoolLease {
@@ -3284,6 +3287,62 @@ mod tests {
         });
         let state = pool.state.lock().unwrap();
         assert_eq!(state.live, 0, "dead worker lease frees its pool slot");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_pool_acquire_frees_stale_slots_alongside_lease() {
+        // last_used is not stack-ordered: PoolLease::request refreshes it
+        // unlocked, so an idle entry above a fresh one may already be stale.
+        // When one scan pops stale then leases, the stale slots must still be
+        // freed — otherwise live reaches STREAM_POOL_MAX_WORKERS and acquire
+        // deadlocks on `ready` forever (P1, review 7003213891).
+        fn worker(last_used: std::time::Instant, pid: i32) -> StreamWorker {
+            StreamWorker {
+                // Nonexistent pid: terminate_pid_group fails fast and never
+                // touches a real process.
+                pid,
+                stdin: stream_pipe_pair().unwrap().1,
+                stdout: stream_pipe_pair().unwrap().0,
+                _registration: crate::child_process::register_owned_pid("test", 0),
+                last_used,
+                fingerprint: 0,
+                next_seq: 0,
+                healthy: true,
+            }
+        }
+        let fresh_pid = i32::MAX - 8;
+        let stale_pid = i32::MAX - 9;
+        let pool = std::sync::Arc::new(StreamPool::new(Path::new("/bin/cat"), None));
+        {
+            let mut state = pool.state.lock().unwrap();
+            state.live = 2;
+            state
+                .idle
+                .push(worker(std::time::Instant::now(), fresh_pid));
+            state.idle.push(worker(
+                std::time::Instant::now() - STREAM_WORKER_IDLE_TIMEOUT - Duration::from_secs(1),
+                stale_pid,
+            ));
+        }
+        let lease = pool.clone().acquire().unwrap().unwrap();
+        assert_eq!(
+            lease.worker.as_ref().unwrap().pid,
+            fresh_pid,
+            "the fresh worker must be leased, not reaped"
+        );
+        {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(
+                state.live, 1,
+                "the stale slot must be freed in the same scan that leases"
+            );
+            assert!(state.idle.is_empty());
+        }
+        drop(lease);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.live, 1);
+        assert_eq!(state.idle.len(), 1, "returned worker rejoins idle");
     }
 
     #[test]
