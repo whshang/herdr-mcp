@@ -33,42 +33,98 @@ function normalizedNativeFailure(message) {
   return { ok: false, error: err };
 }
 
-function nativePortMessage(message, timeoutMs = 30_000) {
-  return new Promise((resolve) => {
-    if (!globalThis.chrome?.runtime?.connectNative) {
-      resolve(null);
+const NATIVE_CONTROL_IDLE_MS = 30_000;
+let nativeControlPort = null;
+let nativeControlIdleTimer = null;
+let nativeControlSequence = 0;
+const nativeControlPending = new Map();
+
+function clearNativeControlIdleTimer() {
+  if (nativeControlIdleTimer) clearTimeout(nativeControlIdleTimer);
+  nativeControlIdleTimer = null;
+}
+
+function scheduleNativeControlIdleClose(port) {
+  clearNativeControlIdleTimer();
+  if (nativeControlPort !== port || nativeControlPending.size > 0) return;
+  nativeControlIdleTimer = setTimeout(() => {
+    nativeControlIdleTimer = null;
+    if (nativeControlPort !== port || nativeControlPending.size > 0) return;
+    nativeControlPort = null;
+    try { port.disconnect(); } catch (_) {}
+  }, NATIVE_CONTROL_IDLE_MS);
+}
+
+function settleNativeControlPending(value) {
+  const pending = [...nativeControlPending.values()];
+  nativeControlPending.clear();
+  for (const entry of pending) {
+    clearTimeout(entry.timer);
+    entry.resolve(value);
+  }
+}
+
+function nativeControlDisconnected(port, message = "native-host-empty-response") {
+  if (nativeControlPort !== port) return;
+  nativeControlPort = null;
+  clearNativeControlIdleTimer();
+  settleNativeControlPending(normalizedNativeFailure(message));
+}
+
+function nativeControlPortForRequests() {
+  if (!globalThis.chrome?.runtime?.connectNative) return null;
+  if (nativeControlPort) return nativeControlPort;
+  const port = chrome.runtime.connectNative(HERDR_NATIVE_HOST);
+  nativeControlPort = port;
+  port.onMessage.addListener((response) => {
+    if (!response || typeof response !== "object") {
+      nativeControlDisconnected(port);
       return;
     }
-    let port = null;
-    let settled = false;
-    let timer = null;
-    const finish = (value, disconnect = false) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      if (disconnect) {
-        try { port?.disconnect(); } catch (_) {}
-      }
-      resolve(value);
-    };
+    const requestId = typeof response.request_id === "string" ? response.request_id : null;
+    const entry = requestId
+      ? nativeControlPending.get(requestId)
+      : nativeControlPending.values().next().value;
+    if (!entry) return;
+    nativeControlPending.delete(entry.requestId);
+    clearTimeout(entry.timer);
+    const { request_id: _requestId, ...businessResponse } = response;
+    entry.resolve(businessResponse);
+    scheduleNativeControlIdleClose(port);
+  });
+  port.onDisconnect.addListener(() => {
+    const error = chrome.runtime.lastError?.message || "native-host-empty-response";
+    nativeControlDisconnected(port, error);
+  });
+  return port;
+}
+
+function nativePortMessage(message, timeoutMs = 30_000) {
+  if (!globalThis.chrome?.runtime?.connectNative) return Promise.resolve(null);
+  let port;
+  try {
+    port = nativeControlPortForRequests();
+  } catch (error) {
+    return Promise.resolve(normalizedNativeFailure(error?.message || error || "native-host-error"));
+  }
+  if (!port) return Promise.resolve(null);
+  const requestId = `native-${++nativeControlSequence}`;
+  const boundedTimeout = Math.max(1_000, Math.min(Number(timeoutMs) || 30_000, 60_000));
+  return new Promise((resolve) => {
+    clearNativeControlIdleTimer();
+    const timer = setTimeout(() => {
+      nativeControlDisconnected(port, "native-host-timeout");
+      try { port.disconnect(); } catch (_) {}
+    }, boundedTimeout);
+    nativeControlPending.set(requestId, { requestId, resolve, timer });
     try {
-      port = chrome.runtime.connectNative(HERDR_NATIVE_HOST);
-      port.onMessage.addListener((response) => {
-        finish(response && typeof response === "object"
-          ? response
-          : { ok: false, error: "native-host-empty-response" }, true);
-      });
-      port.onDisconnect.addListener(() => {
-        if (settled) return;
-        const err = chrome.runtime.lastError?.message;
-        finish(normalizedNativeFailure(err || "native-host-empty-response"));
-      });
-      timer = setTimeout(() => {
-        finish({ ok: false, error: "native-host-timeout" }, true);
-      }, Math.max(1_000, Math.min(Number(timeoutMs) || 30_000, 60_000)));
-      port.postMessage(message);
+      port.postMessage({ ...message, request_id: requestId });
     } catch (error) {
-      finish(normalizedNativeFailure(error?.message || error || "native-host-error"), true);
+      nativeControlPending.delete(requestId);
+      clearTimeout(timer);
+      nativeControlDisconnected(port, error?.message || error || "native-host-error");
+      try { port.disconnect(); } catch (_) {}
+      resolve(normalizedNativeFailure(error?.message || error || "native-host-error"));
     }
   });
 }
@@ -354,6 +410,9 @@ export function openLocalHerdrStream({ baseUrl, path = "/push/events", timeoutMs
 }
 
 export function resetLocalAuth() {
-  // Compatibility export for older background/tests. Tokenless transport has
-  // no credential cache to expire or refresh.
+  clearNativeControlIdleTimer();
+  const port = nativeControlPort;
+  nativeControlPort = null;
+  settleNativeControlPending({ ok: false, error: "native-host-reset" });
+  try { port?.disconnect(); } catch (_) {}
 }

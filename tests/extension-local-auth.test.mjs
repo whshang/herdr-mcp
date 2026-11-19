@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
+import { captureImageArtifactNative, captureWebArtifactNative, getNativeExtensionOwnerStatus, localHerdrFetch, openLocalHerdrStream, resetLocalAuth, HERDR_NATIVE_HOST } from "../extension/local-auth.js";
 import { nativeHostFailure } from "../extension/native-host-diagnostics.js";
 
 test("extension proxies localhost requests through Native Messaging without forwarding bearer auth", async () => {
@@ -43,12 +43,12 @@ test("extension proxies localhost requests through Native Messaging without forw
   }
 });
 
-test("one-shot local requests prefer a short-lived connectNative port", async () => {
+test("user reuses one control port | Given Native Messaging is available | When sequential local requests run | Then one control connection serves both", async () => {
   const oldChrome = globalThis.chrome;
   const messageListeners = [];
   const disconnectListeners = [];
-  let posted = null;
-  let disconnected = false;
+  const posted = [];
+  let connectCalls = 0;
   let legacyCalls = 0;
   globalThis.chrome = {
     runtime: {
@@ -56,14 +56,16 @@ test("one-shot local requests prefer a short-lived connectNative port", async ()
       lastError: null,
       connectNative(host) {
         assert.equal(host, HERDR_NATIVE_HOST);
+        connectCalls += 1;
         return {
           onMessage: { addListener(fn) { messageListeners.push(fn); } },
           onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
           postMessage(message) {
-            posted = message;
+            posted.push(message);
             queueMicrotask(() => {
               for (const fn of messageListeners) {
                 fn({
+                  request_id: message.request_id,
                   ok: true,
                   transport: "ipc",
                   status: 200,
@@ -74,7 +76,6 @@ test("one-shot local requests prefer a short-lived connectNative port", async ()
             });
           },
           disconnect() {
-            disconnected = true;
             for (const fn of disconnectListeners) fn();
           },
         };
@@ -90,11 +91,127 @@ test("one-shot local requests prefer a short-lived connectNative port", async ()
       nativeTimeoutMs: 4321,
     });
     assert.deepEqual(await response.json(), { ok: true, source: "connectNative" });
-    assert.equal(posted.type, "request");
-    assert.equal(posted.timeout_ms, 4321);
-    assert.equal(disconnected, true);
+    const second = await localHerdrFetch("http://127.0.0.1:8772/push/state", {
+      nativeTimeoutMs: 4321,
+    });
+    assert.deepEqual(await second.json(), { ok: true, source: "connectNative" });
+    assert.equal(connectCalls, 1);
+    assert.equal(posted.length, 2);
+    assert.equal(posted[0].type, "request");
+    assert.equal(posted[0].timeout_ms, 4321);
     assert.equal(legacyCalls, 0, "sendNativeMessage is compatibility-only when connectNative exists");
   } finally {
+    resetLocalAuth();
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("user keeps concurrent responses matched | Given two local requests share a control port | When the host replies out of order | Then each response resolves its own request", async () => {
+  const oldChrome = globalThis.chrome;
+  const messageListeners = [];
+  const disconnectListeners = [];
+  const posted = [];
+  let connectCalls = 0;
+  globalThis.chrome = {
+    runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      lastError: null,
+      connectNative() {
+        connectCalls += 1;
+        return {
+          onMessage: { addListener(fn) { messageListeners.push(fn); } },
+          onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
+          postMessage(message) {
+            posted.push(message);
+            if (posted.length !== 2) return;
+            queueMicrotask(() => {
+              for (const fn of messageListeners) {
+                for (const response of [...posted].reverse()) {
+                  fn({
+                    request_id: response.request_id,
+                    ok: true,
+                    transport: "ipc",
+                    status: 200,
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ request_id: response.request_id }),
+                  });
+                }
+              }
+            });
+          },
+          disconnect() {
+            for (const fn of disconnectListeners) fn();
+          },
+        };
+      },
+    },
+  };
+  try {
+    const first = localHerdrFetch("http://127.0.0.1:8772/one");
+    const second = localHerdrFetch("http://127.0.0.1:8772/two");
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    const firstBody = await firstResponse.json();
+    const secondBody = await secondResponse.json();
+    assert.notEqual(firstBody.request_id, secondBody.request_id);
+    assert.equal(connectCalls, 1);
+  } finally {
+    resetLocalAuth();
+    globalThis.chrome = oldChrome;
+  }
+});
+
+test("user recovers after control disconnect | Given an in-flight local request | When the port disconnects | Then the request settles and the next call reconnects", async () => {
+  const oldChrome = globalThis.chrome;
+  const ports = [];
+  let connectCalls = 0;
+  globalThis.chrome = {
+    runtime: {
+      id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      lastError: null,
+      connectNative() {
+        connectCalls += 1;
+        const messageListeners = [];
+        const disconnectListeners = [];
+        const port = {
+          onMessage: { addListener(fn) { messageListeners.push(fn); } },
+          onDisconnect: { addListener(fn) { disconnectListeners.push(fn); } },
+          postMessage(message) {
+            if (connectCalls > 1) {
+              queueMicrotask(() => {
+                for (const fn of messageListeners) {
+                  fn({
+                    request_id: message.request_id,
+                    ok: true,
+                    transport: "ipc",
+                    status: 200,
+                    headers: {},
+                    body: JSON.stringify({ reconnected: true }),
+                  });
+                }
+              });
+            }
+          },
+          disconnect() {
+            for (const fn of disconnectListeners) fn();
+          },
+          forceDisconnect() {
+            for (const fn of disconnectListeners) fn();
+          },
+        };
+        ports.push(port);
+        return port;
+      },
+    },
+  };
+  try {
+    const pending = localHerdrFetch("http://127.0.0.1:8772/pending", { nativeTimeoutMs: 5_000 });
+    ports[0].forceDisconnect();
+    await assert.rejects(pending, /native-host-empty-response/);
+    const response = await localHerdrFetch("http://127.0.0.1:8772/reconnected");
+    assert.deepEqual(await response.json(), { reconnected: true });
+    assert.equal(connectCalls, 2);
+  } finally {
+    resetLocalAuth();
     globalThis.chrome = oldChrome;
   }
 });

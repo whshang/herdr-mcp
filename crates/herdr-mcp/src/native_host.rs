@@ -323,6 +323,19 @@ struct HostOutcome {
     error: Option<String>,
 }
 
+fn with_request_id(mut response: Value, message: &Value) -> Value {
+    if let (Some(request_id), Some(object)) = (
+        message.get("request_id").and_then(Value::as_str),
+        response.as_object_mut(),
+    ) {
+        object.insert(
+            "request_id".to_owned(),
+            Value::String(request_id.to_owned()),
+        );
+    }
+    response
+}
+
 impl HostOutcome {
     fn completed(reason: &'static str) -> Self {
         Self {
@@ -341,8 +354,8 @@ impl HostOutcome {
 
 /// Answer the browser with an error frame and keep the host alive. Only a failed
 /// stdout write is fatal, because the browser would otherwise wait forever.
-fn refuse<W: Write>(writer: &mut W, code: &str) -> HostOutcome {
-    match write_error(writer, code) {
+fn refuse<W: Write>(writer: &mut W, code: &str, request_id: Option<&Value>) -> HostOutcome {
+    match write_error(writer, code, request_id) {
         Ok(()) => HostOutcome::completed(log_code(code)),
         Err(error) => HostOutcome::failed("native_stdout_failed", error),
     }
@@ -406,8 +419,8 @@ pub fn run(caller_origin: &str) -> Result<ExitCode, String> {
     }
 }
 
-/// One native-host process lifetime: read one framed message, serve it, and
-/// record the content-free connect/disconnect pair around it.
+/// One native-host process lifetime: serve framed messages until the browser
+/// closes the connection, and record one content-free connect/disconnect pair.
 ///
 /// `resolve_config` is the production environment read. Tests inject a config
 /// because they cannot own the installed extension registry.
@@ -419,25 +432,78 @@ fn serve<R: Read, W: Write>(
     #[cfg(unix)] resolve_config: impl FnOnce() -> Result<HostConfig, String>,
 ) -> Result<ExitCode, String> {
     let started = Instant::now();
-    let read = read_native_message(reader);
-    record_connect(log, caller_origin, &read);
-    let message_type = match &read {
-        Ok((message, _)) => message_type_code(message),
-        Err(_) => "-",
-    };
-    let outcome = serve_message(
-        caller_origin,
-        read,
-        writer,
-        log,
+    #[cfg(unix)]
+    let mut config = None;
+    #[cfg(unix)]
+    let mut resolve_config = Some(resolve_config);
+    let mut first_read = true;
+    let mut message_type = "-";
+    let mut last_reason = "native_host_eof";
+    loop {
+        let read = read_native_message(reader);
+        let current_message_type = read
+            .as_ref()
+            .ok()
+            .map(|(message, _)| message_type_code(message))
+            .unwrap_or("-");
+        if first_read {
+            record_connect(log, caller_origin, &read);
+            message_type = current_message_type;
+            first_read = false;
+        }
+        if matches!(&read, Err(error) if error == "native_host_eof") {
+            break;
+        }
+        if let Err(error) = &read {
+            let outcome = refuse(writer, error, None);
+            last_reason = outcome.reason;
+            if let Some(error) = outcome.error {
+                record_disconnect(log, outcome.reason, message_type, started);
+                return Err(error);
+            }
+            continue;
+        }
         #[cfg(unix)]
-        resolve_config,
-    );
-    record_disconnect(log, outcome.reason, message_type, started);
-    match outcome.error {
-        Some(error) => Err(error),
-        None => Ok(ExitCode::SUCCESS),
+        if config.is_none() {
+            let resolved = resolve_config
+                .take()
+                .expect("native host config resolver called once")();
+            match resolved {
+                Ok(value) => config = Some(value),
+                Err(error) => {
+                    let request_id = read
+                        .as_ref()
+                        .ok()
+                        .and_then(|(message, _)| message.get("request_id"));
+                    let outcome = refuse(writer, &error, request_id);
+                    last_reason = outcome.reason;
+                    if let Some(error) = outcome.error {
+                        record_disconnect(log, outcome.reason, message_type, started);
+                        return Err(error);
+                    }
+                    break;
+                }
+            }
+        }
+        let outcome = serve_message(
+            caller_origin,
+            read,
+            writer,
+            log,
+            #[cfg(unix)]
+            config.as_ref().expect("native host config resolved"),
+        );
+        last_reason = outcome.reason;
+        if let Some(error) = outcome.error {
+            record_disconnect(log, outcome.reason, message_type, started);
+            return Err(error);
+        }
+        if current_message_type == "stream" {
+            break;
+        }
     }
+    record_disconnect(log, last_reason, message_type, started);
+    Ok(ExitCode::SUCCESS)
 }
 
 fn serve_message<W: Write>(
@@ -445,11 +511,11 @@ fn serve_message<W: Write>(
     read: Result<(Value, usize), String>,
     writer: &mut W,
     log: Option<&NativeHostLog>,
-    #[cfg(unix)] resolve_config: impl FnOnce() -> Result<HostConfig, String>,
+    #[cfg(unix)] config: &HostConfig,
 ) -> HostOutcome {
     let (message, encoded_size) = match read {
         Ok(parsed) => parsed,
-        Err(error) => return refuse(writer, &error),
+        Err(error) => return refuse(writer, &error, None),
     };
 
     #[cfg(not(unix))]
@@ -457,22 +523,22 @@ fn serve_message<W: Write>(
         let _ = caller_origin;
         let _ = encoded_size;
         let _ = log;
-        return refuse(writer, "unsupported_platform");
+        return refuse(writer, "unsupported_platform", message.get("request_id"));
     }
 
     #[cfg(unix)]
     {
-        let config = match resolve_config() {
-            Ok(config) => config,
-            Err(error) => return refuse(writer, &error),
-        };
         let effective_caller_origin = if caller_origin.is_empty() {
             config.expected_origin.as_str()
         } else {
             caller_origin
         };
         if effective_caller_origin != config.expected_origin {
-            return refuse(writer, "extension_origin_not_allowed");
+            return refuse(
+                writer,
+                "extension_origin_not_allowed",
+                message.get("request_id"),
+            );
         }
 
         let message_type = message.get("type").and_then(Value::as_str).unwrap_or("");
@@ -480,21 +546,24 @@ fn serve_message<W: Write>(
         // native-message bound. All other messages remain capped at 1 MiB
         // measured against the bytes the host actually read.
         if let Some(error) = enforce_message_size_gate(message_type, encoded_size) {
-            return refuse(writer, &error);
+            return refuse(writer, &error, message.get("request_id"));
         }
 
         if message_type == "identity" {
-            let active = require_active_owner(&config).is_ok();
+            let active = require_active_owner(config).is_ok();
             return finish(
                 write_native_message(
                     writer,
-                    &json!({
-                        "ok": true,
-                        "active": active,
-                        "extension_origin": config.expected_origin,
-                        "browser_family": config.browser_family,
-                        "transport": "native",
-                    }),
+                    &with_request_id(
+                        json!({
+                            "ok": true,
+                            "active": active,
+                            "extension_origin": config.expected_origin,
+                            "browser_family": config.browser_family,
+                            "transport": "native",
+                        }),
+                        &message,
+                    ),
                 ),
                 "completed",
             );
@@ -513,33 +582,46 @@ fn serve_message<W: Write>(
             }
         };
         match message_type {
-            "request" => match runtime.block_on(proxy_request(&config, &message)) {
-                Ok(value) => finish(write_native_message(writer, &value), "completed"),
+            "request" => match runtime.block_on(proxy_request(config, &message)) {
+                Ok(value) => finish(
+                    write_native_message(writer, &with_request_id(value, &message)),
+                    "completed",
+                ),
                 Err(error) => {
                     record_io_error(log, &error);
-                    refuse(writer, &error)
+                    refuse(writer, &error, message.get("request_id"))
                 }
             },
-            "request_batch" => match runtime.block_on(proxy_request_batch(&config, &message)) {
-                Ok(value) => finish(write_native_message(writer, &value), "completed"),
+            "request_batch" => match runtime.block_on(proxy_request_batch(config, &message)) {
+                Ok(value) => finish(
+                    write_native_message(writer, &with_request_id(value, &message)),
+                    "completed",
+                ),
                 Err(error) => {
                     record_io_error(log, &error);
-                    refuse(writer, &error)
+                    refuse(writer, &error, message.get("request_id"))
                 }
             },
-            "stream" => match runtime.block_on(proxy_stream(&config, &message, writer)) {
+            "stream" => match runtime.block_on(proxy_stream(config, &message, writer)) {
                 Ok(()) => HostOutcome::completed("stream_end"),
                 Err(error) => {
                     record_io_error(log, &error);
-                    refuse(writer, &error)
+                    refuse(writer, &error, message.get("request_id"))
                 }
             },
-            "session" => refuse(writer, "legacy_session_requires_compat_host"),
-            "artifact_capture" => match handle_artifact_capture(&config, &message) {
-                Ok(value) => finish(write_native_message(writer, &value), "completed"),
-                Err(error) => refuse(writer, &error),
+            "session" => refuse(
+                writer,
+                "legacy_session_requires_compat_host",
+                message.get("request_id"),
+            ),
+            "artifact_capture" => match handle_artifact_capture(config, &message) {
+                Ok(value) => finish(
+                    write_native_message(writer, &with_request_id(value, &message)),
+                    "completed",
+                ),
+                Err(error) => refuse(writer, &error, message.get("request_id")),
             },
-            _ => refuse(writer, "unsupported_message"),
+            _ => refuse(writer, "unsupported_message", message.get("request_id")),
         }
     }
 }
@@ -702,9 +784,15 @@ pub(crate) fn chromium_id_for_path(path: &Path) -> Result<String, String> {
 
 fn read_native_message<R: Read>(reader: &mut R) -> Result<(Value, usize), String> {
     let mut header = [0_u8; 4];
-    reader
-        .read_exact(&mut header)
-        .map_err(|_| "invalid_native_message".to_owned())?;
+    match reader.read(&mut header[..1]) {
+        Ok(0) => return Err("native_host_eof".to_owned()),
+        Ok(1) => {}
+        Ok(_) => unreachable!("one-byte read cannot exceed one byte"),
+        Err(_) => return Err("invalid_native_message".to_owned()),
+    }
+    if reader.read_exact(&mut header[1..]).is_err() {
+        return Err("invalid_native_message".to_owned());
+    }
     let size = u32::from_le_bytes(header) as usize;
     if size > MAX_NATIVE_MESSAGE_FRAME {
         return Err("native_message_too_large".to_owned());
@@ -729,8 +817,16 @@ fn write_native_message<W: Write>(writer: &mut W, value: &Value) -> Result<(), S
         .map_err(|error| format!("native_stdout_failed: {error}"))
 }
 
-fn write_error<W: Write>(writer: &mut W, error: &str) -> Result<(), String> {
-    write_native_message(writer, &json!({"ok": false, "error": error}))
+fn write_error<W: Write>(
+    writer: &mut W,
+    error: &str,
+    request_id: Option<&Value>,
+) -> Result<(), String> {
+    let mut response = json!({"ok": false, "error": error});
+    if let Some(request_id) = request_id.and_then(Value::as_str) {
+        response["request_id"] = Value::String(request_id.to_owned());
+    }
+    write_native_message(writer, &response)
 }
 
 #[cfg(unix)]
@@ -1270,6 +1366,33 @@ mod tests {
         assert_eq!(parsed_big["type"], "artifact_capture");
         assert!(big_size > MAX_NATIVE_MESSAGE);
         assert!(big_size <= MAX_NATIVE_MESSAGE_FRAME);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_host_reuses_one_connection_for_multiple_request_id_frames() {
+        let config = test_config(env::temp_dir().join("unused-native-host.sock"), false);
+        let first = json!({"type": "identity", "request_id": "native-1"});
+        let second = json!({"type": "identity", "request_id": "native-2"});
+        let mut bytes = frame(&first);
+        bytes.extend_from_slice(&frame(&second));
+        let mut reader = Cursor::new(bytes);
+        let mut writer = Vec::new();
+
+        let outcome = serve(
+            &config.expected_origin,
+            &mut reader,
+            &mut writer,
+            None,
+            || Ok(config.clone()),
+        );
+        assert!(outcome.is_ok());
+        let responses = parse_frames(&writer);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["request_id"], "native-1");
+        assert_eq!(responses[1]["request_id"], "native-2");
+        assert_eq!(responses[0]["transport"], "native");
+        assert_eq!(responses[1]["transport"], "native");
     }
 
     #[test]
