@@ -1820,24 +1820,10 @@ fn admitted_tool_output(
             });
         }
     }
-    // One topology snapshot for this dispatch, taken before the tool runs.
-    // Capture keeps it so a tool that deletes its pane can still resolve
-    // scope, and pane.split's width check and the split itself see the same
-    // graph. Calls with no scope keys skip the clone.
-    let call_method = arguments.get("method").and_then(Value::as_str);
-    let wants_split = name == "herdr_call" && call_method == Some(pane_width::SPLIT_METHOD);
-    let record_work =
-        herdr_core.is_none() && crate::work_capture::may_record_tool_call(name, &arguments);
-    let dispatch_snapshot = if herdr_core.is_none() && (record_work || wants_split) {
-        Some(std::sync::Arc::new(context.cache.snapshot()))
-    } else {
-        None
-    };
-    let _work_capture = if record_work {
-        dispatch_snapshot.as_ref().map(|snapshot| ToolCallCapture {
+    let _work_capture = if herdr_core.is_none() {
+        Some(ToolCallCapture {
             name,
             arguments: &arguments,
-            snapshot: std::sync::Arc::clone(snapshot),
             context,
         })
     } else {
@@ -2183,14 +2169,11 @@ fn admitted_tool_output(
                 } else {
                     // A horizontal split must not create a pane whose agent output
                     // can only be captured as wrapping noise (#684).
-                    let snapshot = dispatch_snapshot
-                        .as_ref()
-                        .expect("pane.split captures one snapshot before the call");
-                    match pane_width::guard_split(snapshot.as_ref(), &params) {
+                    match pane_width::guard_split(&context.cache.snapshot(), &params) {
                         pane_width::SplitPlan::Forward(params) => native_tools::call_with_local(
                             context.client,
                             context.skill,
-                            snapshot.as_ref(),
+                            &context.cache.snapshot(),
                             method,
                             params,
                         ),
@@ -2510,9 +2493,6 @@ fn admitted_tool_output(
 struct ToolCallCapture<'a, 'context> {
     name: &'a str,
     arguments: &'a Value,
-    /// Topology from before the tool ran. Drop must not read the cache again:
-    /// the call may already have removed the pane or workspace.
-    snapshot: std::sync::Arc<Value>,
     context: &'a RuntimeContext<'context>,
 }
 
@@ -2521,11 +2501,10 @@ impl Drop for ToolCallCapture<'_, '_> {
         // Capture is best-effort and must never panic out of Drop (a panic
         // during unwind would abort the process).
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let Some(event) = crate::work_capture::event_for_tool_call(
-                self.name,
-                self.arguments,
-                self.snapshot.as_ref(),
-            ) else {
+            let snapshot = self.context.cache.snapshot();
+            let Some(event) =
+                crate::work_capture::event_for_tool_call(self.name, self.arguments, &snapshot)
+            else {
                 return;
             };
             // This drop runs after the tool output is computed, so this

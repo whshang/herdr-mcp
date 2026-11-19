@@ -379,6 +379,14 @@ struct PromptTaskRecord {
     /// observed. Later growth of the same path is then not this dispatch.
     #[serde(default, skip_serializing_if = "is_false")]
     session_evidence_closed: bool,
+    /// Last accepted `(dev, ino, len)` of the session file. A later shorter
+    /// length, or growth after a shorter observation, is a rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_len: Option<u64>,
     /// Why this task may still leave `delivery_uncertain`. Independent of
     /// `notification_error`, which parent notification reuses and clears.
     /// `recovery_closed` means a boot change, history gap, rotation, or
@@ -830,6 +838,7 @@ impl PromptRegistry {
             pre_submit_session,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
+            let _ = self.take_session_window(task_id);
             return Ok(None);
         }
         let guard = self
@@ -844,6 +853,8 @@ impl PromptRegistry {
             // idempotent and only touches still-unacknowledged records on this
             // lane, so the retry heals the crash window before returning.
             self.supersede_unacknowledged_tasks(&existing)?;
+            drop(guard);
+            let _ = self.take_session_window(task_id);
             return Ok(Some(existing));
         }
 
@@ -867,7 +878,10 @@ impl PromptRegistry {
         // This is the Runtime-owned turn envelope for this submission. It is
         // stable immediately, while exact_native_turn remains false until Herdr
         // exposes a native prompt-turn identity.
-        let mut turn_id = Some(runtime_turn_id(task_id, "dispatch"));
+        // The injected worker report names this id. A later working/seq
+        // observation updates lifecycle only; rewriting the turn here would
+        // make that report fail task_identity_mismatch.
+        let turn_id = Some(runtime_turn_id(task_id, "dispatch"));
         let after_status = after.and_then(|state| state.agent_status.as_deref());
         let after_seq = after.and_then(|state| state.state_change_seq);
         let seq_advanced = baseline_seq
@@ -878,10 +892,6 @@ impl PromptRegistry {
         {
             lifecycle = PromptTaskLifecycle::Running;
             activity_observed = true;
-            turn_id = Some(runtime_turn_id(
-                task_id,
-                &format!("seq:{}", after_seq.unwrap_or_default()),
-            ));
         }
         // Pin the dispatch to the pane's observed seq when one was reported;
         // an interrupt later refuses once the pane moves past it.
@@ -973,6 +983,9 @@ impl PromptRegistry {
             session_evidence_ino: session_evidence.ino,
             session_window_seq: window_seq,
             session_evidence_closed: false,
+            session_evidence_seen_dev: session_evidence.dev,
+            session_evidence_seen_ino: session_evidence.ino,
+            session_evidence_seen_len: session_evidence.bytes,
             delivery_uncertain_reason: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
@@ -1122,13 +1135,20 @@ impl PromptRegistry {
         if kind == "heartbeat" && task.is_terminal() {
             return json!({"ok": false, "code": "agent_task_terminal"});
         }
-        // A restart or an unconsumed event gap closes recovery before a
-        // matching worker_done can complete the old timeout.
-        if delivery_timeout_can_recover(&task)
-            && self.seal_recovery_fences(&mut task)
-            && let Err(error) = self.save_task(&task, None)
+        // A restart, an unconsumed event gap, or a store with no event cache
+        // closes recovery before a matching worker_done can complete the old
+        // timeout. A pending gate does not skip this fence.
+        if activity_timeout_open(&task)
+            && (self.seal_recovery_fences(&mut task) || self.inner.cache.is_none())
         {
-            return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+            if self.inner.cache.is_none() {
+                task.delivery_uncertain_reason = Some("recovery_closed".to_owned());
+                task.notification_error = Some("event_cache_unavailable".to_owned());
+                task.updated_at_ms = self.now_ms();
+            }
+            if let Err(error) = self.save_task(&task, None) {
+                return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+            }
         }
         let reported_turn = match optional_str(params, "turn_id") {
             Ok(value) => value,
@@ -1148,7 +1168,7 @@ impl PromptRegistry {
         // never stored one, is recorded as `worker_done` but does not complete.
         let turn_matches = reported_turn
             .is_some_and(|turn_id| task.turn_id.as_deref() == Some(turn_id) && !turn_id.is_empty());
-        let recoverable = delivery_timeout_can_recover(&task);
+        let recoverable = activity_timeout_open(&task);
         let newly_completed = kind == "worker_done"
             && task.gate.is_none()
             && ((!task.is_terminal() && !recoverable) || (recoverable && turn_matches));
@@ -2706,6 +2726,7 @@ impl PromptRegistry {
         // A report received during a gate is durable, but completes only after
         // the gate is released. This explicit report does not depend on cache cursors.
         if let Some(done_at) = task.worker_done_at_ms {
+            clear_receipt_for_recovery(&mut task);
             task.lifecycle = PromptTaskLifecycle::Completed;
             task.terminal_status = Some("worker_done".to_owned());
             task.terminal_at_ms = Some(done_at);
@@ -2766,17 +2787,15 @@ impl PromptRegistry {
                 changed = true;
             }
         } else if delivery_timeout_can_recover(&task) && self.session_transcript_grew(&mut task) {
-            // Apply the same window first. A done or pane_closed that already
-            // sits in this batch must not be skipped by jumping the cursor.
+            // Growth is the delivery fact. Apply the batch after leaving the
+            // timeout so a done or pane_closed in this same window can settle.
+            note_transcript_delivery(&mut task, self.now_ms());
+            changed = true;
             changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
-            if delivery_timeout_can_recover(&task) {
-                note_transcript_delivery(&mut task, self.now_ms());
-                changed = true;
-            }
-            changed |= task.session_evidence_closed;
         } else {
             changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
         }
+        changed |= task.session_evidence_closed;
         if changed {
             self.persist_reconciled_task(&mut task, task_id)?;
         }
@@ -2863,12 +2882,14 @@ impl PromptRegistry {
         if evidence.path.is_none() {
             return Ok(None);
         }
-        let seq = reserve_session_window_seq();
         let _order = self
             .inner
             .task_mutations
             .lock()
             .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
+        // Sequence and the durable row share this lock, so a later publisher
+        // cannot observe a smaller sequence than one that already committed.
+        let seq = reserve_session_window_seq();
         let Some(store) = self.inner.store.as_ref() else {
             return Ok(None);
         };
@@ -2876,7 +2897,11 @@ impl PromptRegistry {
             .lock()
             .map_err(|_| "agent task store lock unavailable".to_owned())?;
         let mut open = load_session_windows(&store)?;
-        open.retain(|window| window.task_id != task_id);
+        let now = self.now_ms();
+        open.retain(|window| {
+            window.task_id != task_id
+                && now.saturating_sub(window.published_at_ms) < SESSION_WINDOW_TTL_MS
+        });
         open.push(SessionWindow {
             task_id: task_id.to_owned(),
             pane_id: pane_id.map(str::to_owned),
@@ -2885,6 +2910,7 @@ impl PromptRegistry {
             dev: evidence.dev,
             ino: evidence.ino,
             seq,
+            published_at_ms: self.now_ms(),
         });
         save_session_windows(&mut store, &open, self.now_ms())?;
         Ok(Some(seq))
@@ -2967,15 +2993,36 @@ impl PromptRegistry {
         }
         let (len, dev, ino) = match session_file_stat(Path::new(path)) {
             SessionFileStat::File { len, dev, ino } => (len, dev, ino),
-            // Missing, rotated away, truncated to nothing we can see, or an
-            // unreadable stat: none of these is growth of the captured file.
-            SessionFileStat::Missing | SessionFileStat::Unreadable => return false,
+            // A file that existed (or cannot be read) is no longer evidence.
+            // A missing file at baseline 0 may still be created after submit.
+            SessionFileStat::Missing
+                if baseline == 0 && task.session_evidence_seen_len.is_none() =>
+            {
+                return false;
+            }
+            SessionFileStat::Missing | SessionFileStat::Unreadable => {
+                task.session_evidence_closed = true;
+                return false;
+            }
         };
         let identity = task
             .session_evidence_dev
             .zip(task.session_evidence_ino)
             .filter(|(dev, ino)| !(*dev == 0 && *ino == 0));
-        if len < baseline {
+        if len < baseline
+            || task
+                .session_evidence_seen_len
+                .is_some_and(|seen| len < seen)
+        {
+            task.session_evidence_closed = true;
+            return false;
+        }
+        if task
+            .session_evidence_seen_len
+            .is_some_and(|seen| seen < baseline && len > seen && len > baseline)
+        {
+            // The file was observed shorter than the submit baseline and then
+            // grew past it. Those bytes are a rewrite, not this dispatch.
             task.session_evidence_closed = true;
             return false;
         }
@@ -2993,6 +3040,9 @@ impl PromptRegistry {
             }
             _ => {}
         }
+        task.session_evidence_seen_dev = Some(dev);
+        task.session_evidence_seen_ino = Some(ino);
+        task.session_evidence_seen_len = Some(len);
         // Bytes after the next same-path dispatch's baseline belong to that
         // later task. The window stamp is taken before `agent.prompt`, so a
         // slow registration cannot hide the later submit.
@@ -3010,6 +3060,7 @@ impl PromptRegistry {
         path: &str,
     ) -> Result<Option<u64>, String> {
         let mut next = None;
+        let now = self.now_ms();
         let tasks = self
             .list_active_tasks()?
             .into_iter()
@@ -3031,7 +3082,10 @@ impl PromptRegistry {
         }
         let open = self.open_session_windows()?;
         for window in open {
-            if window.task_id == task.task_id || window.path != path {
+            if window.task_id == task.task_id
+                || window.path != path
+                || now.saturating_sub(window.published_at_ms) >= SESSION_WINDOW_TTL_MS
+            {
                 continue;
             }
             let later = task
@@ -3356,6 +3410,9 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "session_evidence_ino",
     "session_window_seq",
     "session_evidence_closed",
+    "session_evidence_seen_dev",
+    "session_evidence_seen_ino",
+    "session_evidence_seen_len",
     "delivery_uncertain_reason",
 ];
 
@@ -3372,6 +3429,8 @@ fn is_false(value: &bool) -> bool {
 const SESSION_WINDOW_LEDGER_ID: &str = "op:prompt:session-windows";
 const SESSION_WINDOW_LEDGER_KIND: &str = "herdr_prompt_session_window";
 
+const SESSION_WINDOW_TTL_MS: u64 = 30 * 60 * 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SessionWindow {
     task_id: String,
@@ -3381,6 +3440,8 @@ struct SessionWindow {
     dev: Option<u64>,
     ino: Option<u64>,
     seq: u64,
+    #[serde(default)]
+    published_at_ms: u64,
 }
 
 fn load_session_windows(store: &StateStore) -> Result<Vec<SessionWindow>, String> {
@@ -3942,22 +4003,24 @@ fn task_event_type(event: &Value) -> String {
 /// `activity_start_timeout` is the only `delivery_uncertain` reason a later
 /// same-dispatch observation may leave. Boot changes and history gaps stay
 /// fail-closed: their cursors are not evidence for this prompt.
-fn delivery_timeout_can_recover(task: &PromptTaskRecord) -> bool {
-    if task.gate.is_some() || task.lifecycle != PromptTaskLifecycle::DeliveryUncertain {
+/// The timeout itself is still open. A pending gate does not close it:
+/// reports must seal and check the turn before recording worker_done.
+fn activity_timeout_open(task: &PromptTaskRecord) -> bool {
+    if task.lifecycle != PromptTaskLifecycle::DeliveryUncertain {
         return false;
     }
     match task.delivery_uncertain_reason.as_deref() {
         Some("activity_start_timeout") => true,
-        // N-1 rows stored the timeout only in notification_error. Parent
-        // notification clears that field and writes "delivered"; a pending
-        // row still carrying the timeout is the unmigrated shape. A cleared
-        // or replaced notification_error stays closed.
         None => {
             task.notification_state == "pending"
                 && task.notification_error.as_deref() == Some("activity_start_timeout")
         }
         _ => false,
     }
+}
+
+fn delivery_timeout_can_recover(task: &PromptTaskRecord) -> bool {
+    task.gate.is_none() && activity_timeout_open(task)
 }
 
 /// Submit order on one session file. The window stamp is published before
@@ -12484,7 +12547,8 @@ mod tests {
     /// hold does not.
     #[test]
     fn late_worker_done_recovers_only_the_same_dispatch() {
-        let (db_path, registry) = escalation_registry("late-worker-done");
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("late-worker-done", json!({"panes": [], "agents": []}));
         let task_id = "dispatch:prompt:late-worker-done";
         let task = register_idle_task(&registry, task_id, "w1:p1");
         let turn_id = task.turn_id.clone().unwrap();
@@ -13125,7 +13189,8 @@ mod tests {
     /// delivery_uncertain. The matching turn still completes it.
     #[test]
     fn user_late_worker_done_requires_the_stored_turn() {
-        let (db_path, registry) = escalation_registry("late-turn");
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("late-turn", json!({"panes": [], "agents": []}));
         let task_id = "dispatch:prompt:late-turn";
         let task = register_idle_task(&registry, task_id, "w1:p1");
         let turn_id = task.turn_id.clone().unwrap();
@@ -13187,7 +13252,8 @@ mod tests {
     /// stays delivery_uncertain.
     #[test]
     fn user_legacy_timeout_row_recovers_until_its_reason_is_cleared() {
-        let (db_path, registry) = escalation_registry("legacy-reason");
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("legacy-reason", json!({"panes": [], "agents": []}));
         let task_id = "dispatch:prompt:legacy-reason";
         let task = register_idle_task(&registry, task_id, "w1:p1");
         let turn_id = task.turn_id.clone().unwrap();
@@ -13421,7 +13487,8 @@ mod tests {
     /// unacknowledged and visible in the default inbox.
     #[test]
     fn user_recovered_completion_is_visible_after_the_uncertain_receipt_was_acked() {
-        let (db_path, registry) = escalation_registry("acked-recovery");
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("acked-recovery", json!({"panes": [], "agents": []}));
         let task_id = "dispatch:prompt:acked-recovery";
         let task = register_idle_task(&registry, task_id, "w1:p1");
         let turn_id = task.turn_id.clone().unwrap();
@@ -13488,6 +13555,285 @@ mod tests {
         assert_eq!(inbox["summary"]["uncertain"], 0, "{inbox}");
         let stored = registry.load_task(task_id).unwrap().unwrap();
         assert_eq!(stored.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user worker | Given agent.prompt already shows working | When the
+    /// injected report command names the dispatch turn | Then the task
+    /// completes instead of rejecting the turn.
+    #[test]
+    fn user_injected_report_matches_the_turn_saved_after_a_working_response() {
+        let (db_path, registry) = escalation_registry("working-turn");
+        let task_id = "dispatch:prompt:working-turn";
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(1),
+            kind: None,
+        };
+        let after = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("working".to_owned()),
+            state_change_seq: Some(4),
+            kind: None,
+        };
+        let task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target: "child",
+                requested_target: None,
+                fingerprint: task_id,
+                idempotency_key: None,
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+                stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
+                foreground_blocker: None,
+                audit: None,
+                pre_submit_session: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Running);
+        let injected = runtime_turn_id(task_id, "dispatch");
+        assert_eq!(task.turn_id.as_deref(), Some(injected.as_str()));
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": injected,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "completed");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user worker | Given a store-only registry with no event cache | When a
+    /// matching worker_done arrives after activity_start_timeout | Then the
+    /// task stays delivery_uncertain.
+    #[test]
+    fn user_store_only_report_does_not_recover_an_unverified_timeout() {
+        let (db_path, registry) = escalation_registry("store-only-report");
+        let task_id = "dispatch:prompt:store-only-report";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "delivery_uncertain");
+        assert_eq!(
+            report["task"]["delivery_uncertain_reason"],
+            "recovery_closed"
+        );
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user worker | Given an activity timeout that also has an open gate |
+    /// When worker_done omits the turn | Then the report is refused and the
+    /// gate release does not complete it.
+    #[test]
+    fn user_gated_timeout_report_still_requires_the_stored_turn() {
+        let (db_path, registry) = escalation_registry("gated-report");
+        let task_id = "dispatch:prompt:gated-report";
+        let _task = register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let mut uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        uncertain.gate = Some(crate::state_store::decision_gates::DecisionGate {
+            gate_id: "gate-1".to_owned(),
+            task_id: task_id.to_owned(),
+            question: "continue?".to_owned(),
+            options: vec!["yes".to_owned()],
+            status: "open".to_owned(),
+            resolution: None,
+            resolved_by: None,
+            created_at_ms: 1,
+            resolved_at_ms: None,
+            creator_parent_session_ref: None,
+        });
+        assert!(activity_timeout_open(&uncertain));
+        assert!(!delivery_timeout_can_recover(&uncertain));
+        registry.save_task(&uncertain, None).unwrap();
+        // This registry has no event cache, so the report first seals the
+        // timeout. The missing turn is then a normal terminal report.
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "delivery_uncertain");
+        assert_eq!(
+            report["task"]["delivery_uncertain_reason"],
+            "recovery_closed"
+        );
+        let held = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            held.delivery_uncertain_reason.as_deref(),
+            Some("recovery_closed")
+        );
+        assert_ne!(held.lifecycle, PromptTaskLifecycle::Completed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given a timeout whose digest contains only done or
+    /// only pane_closed | When the session file grew | Then that event settles
+    /// the task.
+    #[test]
+    fn user_transcript_growth_applies_a_terminal_event_without_a_working_event() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-done-only-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, cache) =
+            registry_with_snapshot("done-only", session_snapshot(&path));
+        let task_id = "dispatch:prompt:done-only";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"done\"}}\n")
+            .unwrap();
+        cache.inject_event_for_test(json!({
+            "event": "pane.agent_status_changed",
+            "type": "pane.agent_status_changed",
+            "pane_id": "w1:p1",
+            "agent_status": "done",
+            "dispatch_id": task_id,
+            "turn_id": turn_id,
+        }));
+        let settled = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(settled.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(settled.terminal_status.as_deref(), Some("done"));
+
+        let closed_path = env::temp_dir().join(format!(
+            "herdr-mcp-session-closed-only-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &closed_path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (closed_db, closed_registry, closed_cache) =
+            registry_with_snapshot("closed-only", session_snapshot(&closed_path));
+        let closed_id = "dispatch:prompt:closed-only";
+        let closed = register_idle_task(&closed_registry, closed_id, "w1:p1");
+        let closed_turn = closed.turn_id.clone().unwrap();
+        age_for_activity_timeout(&closed_registry, closed_id);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&closed_path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"closed\"}}\n")
+            .unwrap();
+        closed_cache.inject_event_for_test(json!({
+            "event": "pane.closed",
+            "type": "pane.closed",
+            "pane_id": "w1:p1",
+            "dispatch_id": closed_id,
+            "turn_id": closed_turn,
+        }));
+        let failed = closed_registry.reconcile_task(closed_id).unwrap().unwrap();
+        assert_eq!(failed.lifecycle, PromptTaskLifecycle::Failed);
+        assert_eq!(failed.terminal_status.as_deref(), Some("pane_closed"));
+
+        drop(registry);
+        drop(closed_registry);
+        remove_escalation_db(&db_path);
+        remove_escalation_db(&closed_db);
+        fs::remove_file(&path).ok();
+        fs::remove_file(&closed_path).ok();
+    }
+
+    /// user dispatcher | Given a published session window older than its TTL |
+    /// When the earlier task's file grows | Then the stale window does not
+    /// cap that growth.
+    #[test]
+    fn user_expired_session_window_does_not_cap_earlier_growth() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-expired-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("expired-window", session_snapshot(&path));
+        let earlier_id = "dispatch:prompt:expired-earlier";
+        register_idle_task(&registry, earlier_id, "w1:p1");
+        let earlier = registry.load_task(earlier_id).unwrap().unwrap();
+        let evidence = SessionEvidence::known(
+            path.to_string_lossy().to_string(),
+            earlier.session_evidence_bytes.unwrap(),
+            earlier.session_evidence_dev.unwrap(),
+            earlier.session_evidence_ino.unwrap(),
+        );
+        registry
+            .publish_session_window("dispatch:prompt:expired-later", Some("w1:p1"), &evidence)
+            .unwrap();
+        let store = registry.inner.store.as_ref().unwrap().lock().unwrap();
+        let mut windows = load_session_windows(&store).unwrap();
+        drop(store);
+        windows[0].published_at_ms = registry.now_ms().saturating_sub(SESSION_WINDOW_TTL_MS + 1);
+        let mut store = registry.inner.store.as_ref().unwrap().lock().unwrap();
+        save_session_windows(&mut store, &windows, registry.now_ms()).unwrap();
+        drop(store);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later\"}}\n")
+            .unwrap();
+        age_for_activity_timeout(&registry, earlier_id);
+        let recovered = registry.reconcile_task(earlier_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
 
         drop(registry);
         remove_escalation_db(&db_path);
@@ -13763,6 +14109,9 @@ mod tests {
             session_evidence_ino: None,
             session_window_seq: None,
             session_evidence_closed: false,
+            session_evidence_seen_dev: None,
+            session_evidence_seen_ino: None,
+            session_evidence_seen_len: None,
             delivery_uncertain_reason: None,
         }
     }
@@ -15465,6 +15814,9 @@ mod tests {
             session_evidence_ino: None,
             session_window_seq: None,
             session_evidence_closed: false,
+            session_evidence_seen_dev: None,
+            session_evidence_seen_ino: None,
+            session_evidence_seen_len: None,
             delivery_uncertain_reason: None,
         }
     }
