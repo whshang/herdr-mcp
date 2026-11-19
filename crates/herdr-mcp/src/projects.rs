@@ -130,11 +130,14 @@ struct GitStatusCacheState {
     recent_invalidations: Vec<RecentInvalidation>,
 }
 
+#[derive(Clone)]
 struct RecentInvalidation {
     generation: u64,
     path: PathBuf,
     identities: Vec<PathBuf>,
 }
+
+const RECENT_INVALIDATION_LIMIT: u64 = 64;
 
 static GIT_STATUS_CACHE: OnceLock<Mutex<GitStatusCacheState>> = OnceLock::new();
 
@@ -541,6 +544,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         // allowed to inspect. Protected and broker-routed roots stay unresolved
         // here; the broker result supplies their identity after the probe.
         let mut repo_identity = safe_canonical_repo_identity(root);
+        let started_without_identity = repo_identity.is_none();
         if let Some(identity) = &repo_identity {
             *waiter
                 .repo_identity
@@ -564,36 +568,17 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.clone()
         };
-        let recent = {
-            let state = cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state
-                .recent_invalidations
-                .iter()
-                .map(|record| RecentInvalidation {
-                    generation: record.generation,
-                    path: record.path.clone(),
-                    identities: record.identities.clone(),
-                })
-                .collect::<Vec<_>>()
-        };
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let identity_became_known_after_invalidation = recent.iter().any(|record| {
-            record.generation > started_generation
-                && (record.path == key
-                    || key.starts_with(&record.path)
-                    || record.path.starts_with(&key)
-                    || known_identity.as_ref().is_some_and(|identity| {
-                        record
-                            .identities
-                            .iter()
-                            .any(|known| repo_identity_overlaps(known, identity))
-                            || repo_identity_overlaps(&record.path, identity)
-                    }))
-        });
+        let identity_became_known_after_invalidation = stale_probe_must_not_publish(
+            started_generation,
+            state.invalidation_generation,
+            started_without_identity,
+            &key,
+            known_identity.as_deref(),
+            &state.recent_invalidations,
+        );
         if identity_became_known_after_invalidation {
             waiter
                 .invalidated
@@ -740,7 +725,9 @@ fn invalidate_git_status_cache_matching(path: &Path, exact_root: bool) {
         path: path.to_path_buf(),
         identities: identities.clone(),
     });
-    let oldest = state.invalidation_generation.saturating_sub(64);
+    let oldest = state
+        .invalidation_generation
+        .saturating_sub(RECENT_INVALIDATION_LIMIT);
     state
         .recent_invalidations
         .retain(|record| record.generation > oldest);
@@ -770,6 +757,41 @@ fn safe_canonical_repo_identity(path: &Path) -> Option<PathBuf> {
         }
     }
     std::fs::canonicalize(path).ok()
+}
+
+/// A probe that started without a repository identity must not publish a
+/// result read before a later invalidation when that invalidation cannot be
+/// proven to name a different repository. A full history window is the same
+/// answer: the matching record may already have rolled off.
+fn stale_probe_must_not_publish(
+    started_generation: u64,
+    current_generation: u64,
+    started_without_identity: bool,
+    key: &Path,
+    known_identity: Option<&Path>,
+    recent: &[RecentInvalidation],
+) -> bool {
+    if started_without_identity
+        && current_generation.saturating_sub(started_generation) > RECENT_INVALIDATION_LIMIT
+    {
+        return true;
+    }
+    recent.iter().any(|record| {
+        if record.generation <= started_generation {
+            return false;
+        }
+        record.path == key
+            || key.starts_with(&record.path)
+            || record.path.starts_with(key)
+            || known_identity.is_some_and(|identity| {
+                record
+                    .identities
+                    .iter()
+                    .any(|known| repo_identity_overlaps(known, identity))
+                    || repo_identity_overlaps(&record.path, identity)
+            })
+            || (started_without_identity && record.identities.is_empty())
+    })
 }
 
 fn repo_identity_overlaps(path: &Path, identity: &Path) -> bool {
@@ -988,14 +1010,21 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-mcp-projects-{unique}"))
+        let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "herdr-mcp-projects-{}-{sequence}-{unique}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1210,17 +1239,29 @@ mod tests {
         }
         derive(&git_snapshot(&repo));
         derive(&git_snapshot(&sibling));
-        assert!(git_status_cache_has(&sibling));
+        let sibling_expiry = GIT_STATUS_CACHE
+            .get()
+            .and_then(|cache| {
+                cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entries
+                    .get(&sibling)
+                    .map(|entry| entry.expires_at)
+            })
+            .expect("sibling cache entry");
         // Path::starts_with compares whole components, so invalidating a path
-        // under `repo` must not evict `repo-backup`'s entry.
+        // under `repo` must not evict `repo-backup`'s entry while it is live.
         let touched = repo.join("created-by-write.txt");
         fs::write(&touched, "changed").unwrap();
         invalidate_git_status_cache_for_path(&touched);
         assert!(!git_status_cache_has(&repo));
-        assert!(
-            git_status_cache_has(&sibling),
-            "a sibling root sharing a name prefix keeps its cache entry"
-        );
+        if cache_now() < sibling_expiry {
+            assert!(
+                git_status_cache_has(&sibling),
+                "a sibling root sharing a name prefix keeps its cache entry"
+            );
+        }
         fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1411,55 +1452,76 @@ mod tests {
             generation
         };
         invalidate_git_status_cache_for_path(&alias_b);
-        let recent = {
+        let (current_generation, recent) = {
             let state = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state
-                .recent_invalidations
-                .iter()
-                .map(|record| RecentInvalidation {
-                    generation: record.generation,
-                    path: record.path.clone(),
-                    identities: record.identities.clone(),
-                })
-                .collect::<Vec<_>>()
+            (
+                state.invalidation_generation,
+                state.recent_invalidations.clone(),
+            )
         };
+        assert!(
+            stale_probe_must_not_publish(
+                started_generation,
+                current_generation,
+                true,
+                &alias_a,
+                Some(real.as_path()),
+                &recent,
+            ),
+            "an unresolved protected invalidation must block the other alias"
+        );
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stale = GitStatus {
-            root: alias_a.clone(),
-            dirty: false,
-            changed_files: 0,
-            source: "tcc_broker",
-            repo_identity: Some(real.clone()),
-        };
-        let blocked = recent
-            .iter()
-            .any(|record| record.generation > started_generation && record.path == alias_b);
-        assert!(
-            blocked,
-            "the alias B write must be visible to the in-flight probe"
-        );
-        if blocked {
-            // The probe learned the shared identity only after the write. The
-            // publish gate refuses the stale clean result.
-            assert!(recent.iter().any(|record| {
-                record.generation > started_generation
-                    && stale.repo_identity.as_ref().is_some_and(|identity| {
-                        record.path == alias_b
-                            || repo_identity_overlaps(&record.path, identity)
-                            || record
-                                .identities
-                                .iter()
-                                .any(|known| repo_identity_overlaps(known, identity))
-                    })
-            }));
-        }
         state.in_flight.remove(&alias_a);
         state.entries.remove(&alias_a);
         state.entries.remove(&alias_b);
+    }
+
+    #[test]
+    fn unknown_identity_probe_refuses_publish_after_invalidation_history_overflows() {
+        let alias_a = PathBuf::from("/protected/overflow-a");
+        let alias_b = PathBuf::from("/protected/overflow-b");
+        let real = PathBuf::from("/private/overflow-real");
+        let cache = GIT_STATUS_CACHE.get_or_init(|| Mutex::new(GitStatusCacheState::default()));
+        let started_generation = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidation_generation;
+        invalidate_git_status_cache_for_path(&alias_b);
+        let unrelated = temp_dir();
+        fs::create_dir_all(&unrelated).unwrap();
+        for _ in 0..=RECENT_INVALIDATION_LIMIT {
+            invalidate_git_status_cache(&unrelated);
+        }
+        let (current_generation, recent) = {
+            let state = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                state.invalidation_generation,
+                state.recent_invalidations.clone(),
+            )
+        };
+        assert!(current_generation.saturating_sub(started_generation) > RECENT_INVALIDATION_LIMIT);
+        assert!(
+            !recent.iter().any(|record| record.path == alias_b),
+            "the matching invalidation must have rolled out of the 64-record window"
+        );
+        assert!(
+            stale_probe_must_not_publish(
+                started_generation,
+                current_generation,
+                true,
+                &alias_a,
+                Some(real.as_path()),
+                &recent,
+            ),
+            "a probe cannot publish once the invalidation history no longer proves safety"
+        );
+        fs::remove_dir_all(unrelated).unwrap();
     }
 
     #[test]
