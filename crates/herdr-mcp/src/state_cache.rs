@@ -805,6 +805,16 @@ impl EventCache {
             boot_id: "test-boot".to_owned(),
         }
     }
+    /// Feed one event through the same `CacheState::apply_event` pipeline the
+    /// live worker uses: digest history, cursor bookkeeping and topology all
+    /// update identically. Test-only: `from_snapshot_for_test` caches have no
+    /// watch sender, so cursor subscribers never wake.
+    #[cfg(test)]
+    pub fn apply_event_for_test(&self, event: Value) {
+        if let Ok(mut state) = self.shared.state.write() {
+            state.apply_event(event, String::new());
+        }
+    }
 
     pub fn boot_id(&self) -> &str {
         &self.boot_id
