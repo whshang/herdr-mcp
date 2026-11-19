@@ -1072,7 +1072,6 @@ impl StateStore {
 
     /// Query the first column of the first row as i64, if present.
     #[cfg_attr(not(test), allow(dead_code))] // state-store tests
-    #[cfg_attr(not(test), allow(dead_code))] // state-store tests
     pub fn scalar_i64(&self, sql: &str) -> Result<Option<i64>, String> {
         let mut stmt = self
             .conn
@@ -9016,7 +9015,7 @@ pub struct ClosedExecSessionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
+#[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS runtime-generation / service-rollback path
 pub struct RuntimeGenerationRecord {
     pub generation_id: String,
     pub runtime_path: String,
@@ -9321,7 +9320,7 @@ impl StateStore {
         Ok(result)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn stage_runtime_generation(
         &self,
         generation_id: &str,
@@ -9366,7 +9365,7 @@ impl StateStore {
         self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, None)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn activate_runtime_generation_with_transition(
         &mut self,
         generation_id: &str,
@@ -9383,7 +9382,7 @@ impl StateStore {
         self.activate_runtime_generation_inner(generation_id, rollback_id, now_ms, Some(transition))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     fn activate_runtime_generation_inner(
         &mut self,
         generation_id: &str,
@@ -9497,7 +9496,7 @@ impl StateStore {
         Ok(Some(transition))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn active_runtime_generation(&self) -> Result<Option<RuntimeGenerationRecord>, String> {
         self.conn
             .query_row(
@@ -9522,7 +9521,7 @@ impl StateStore {
             .map_err(|error| format!("cannot read active runtime generation: {error}"))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service path
     pub fn record_service_event(
         &self,
         action: &str,
@@ -9548,7 +9547,7 @@ impl StateStore {
         Ok(())
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS runtime-generation / service-rollback path
     pub fn record_generation_transition(
         &self,
         transition: &GenerationTransitionRecord,
@@ -9572,7 +9571,7 @@ impl StateStore {
         Ok(())
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn prepare_service_rollback(&self, record: &ServiceRollbackRecord) -> Result<(), String> {
         self.conn
             .execute(
@@ -9626,7 +9625,7 @@ impl StateStore {
             .map_err(|error| format!("cannot commit rollback-ready transition: {error}"))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS runtime-generation / service-rollback path
     pub fn mark_prepared_service_rollback(
         &self,
         rollback_id: &str,
@@ -9661,7 +9660,7 @@ impl StateStore {
         self.claim_service_rollback(&record.rollback_id).map(Some)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn latest_ready_service_rollback(&self) -> Result<Option<ServiceRollbackRecord>, String> {
         self.conn
             .query_row(
@@ -9679,7 +9678,7 @@ impl StateStore {
             .map_err(|error| format!("cannot read ready service rollback: {error}"))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS runtime-generation / service-rollback path
     pub fn protected_service_rollbacks(&self) -> Result<Vec<ServiceRollbackRecord>, String> {
         let mut statement = self
             .conn
@@ -9700,7 +9699,7 @@ impl StateStore {
             .map_err(|error| format!("cannot decode protected service rollback: {error}"))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn claim_service_rollback(
         &mut self,
         rollback_id: &str,
@@ -9744,7 +9743,7 @@ impl StateStore {
         })
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn service_rollback_by_id(
         &self,
         rollback_id: &str,
@@ -9763,7 +9762,7 @@ impl StateStore {
             .map_err(|error| format!("cannot read service rollback {rollback_id}: {error}"))
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn recover_service_rollback_after_guardian(
         &self,
         rollback_id: &str,
@@ -9808,7 +9807,7 @@ impl StateStore {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn finish_service_rollback(
         &self,
         rollback_id: &str,
@@ -9832,7 +9831,7 @@ impl StateStore {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+    #[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
     pub fn complete_service_rollback(
         &mut self,
         rollback_id: &str,
@@ -9914,7 +9913,7 @@ impl StateStore {
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
+#[cfg_attr(not(all(target_os = "macos", test)), allow(dead_code))] // macOS-only runtime-generation / service-rollback path
 fn decode_service_rollback(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRollbackRecord> {
     Ok(ServiceRollbackRecord {
         rollback_id: row.get(0)?,

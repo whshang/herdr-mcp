@@ -486,8 +486,7 @@ fn load_stored_lease(
 }
 
 impl StateStore {
-    #[cfg_attr(not(test), allow(dead_code))] // exercised by state-store / tailer tests
-    #[cfg_attr(not(test), allow(dead_code))] // exercised by state-store / tailer tests
+    #[cfg_attr(not(test), allow(dead_code))] // all callers are test modules; production uses acquire_mutation_lease_for_device
     pub fn acquire_mutation_lease(
         &mut self,
         input: MutationLeaseAcquireInput<'_>,
