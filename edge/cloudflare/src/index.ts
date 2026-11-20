@@ -1134,13 +1134,24 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
   }
 
   const devAuth = await authenticateEdgeMcpRequest(request, env);
-  if (!devAuth.ok) {
+  // #1094 P0-b: an enrolled device's own credential may also use /mcp (the
+  // same-machine stdio shim fast path). It mints a bound `device:<id>`
+  // principal — never fleet admin, never force takeover — so a stolen device
+  // credential cannot mint identity, revoke devices, or approve connectors.
+  const deviceFleetPrincipal = devAuth.ok ? null : await authenticateFleetDevice(request, env);
+  if (!devAuth.ok && !deviceFleetPrincipal) {
     return mcpUnauthorized(env);
   }
+  // Human operator credentials mint an operator principal. OAuth Connectors
+  // never do, and device credentials mint neither: their authority is the
+  // dedicated `device:<id>` fleet authority wired below.
   const mcpFleetPrincipal =
-    devAuth.source === "dev_bearer" || devAuth.source === "static_bearer"
+    devAuth.ok && (devAuth.source === "dev_bearer" || devAuth.source === "static_bearer")
       ? `operator:${devAuth.source}`
       : null;
+  // `devAuth` may be the failure variant when a device credential carried the
+  // request; `authed` narrows every field access below to the ok variant.
+  const authed = devAuth.ok ? devAuth : undefined;
 
   if (request.method === "GET" && isMcpPath) {
     return withMcpCors(createSessionlessMcpProbeResponse({ signal: request.signal }));
@@ -1153,6 +1164,20 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         parsed.code === "payload_too_large" ? 413 : 400,
       ));
     }
+    // A `device:<id>` principal never reaches Edge-local fleet management —
+    // pairing, device revoke, and connector approve/revoke — regardless of the
+    // fleetAdmin gate inside the handler (defense in depth).
+    if (deviceFleetPrincipal && isDevicePrincipalDeniedMcpCall(parsed.value)) {
+      return withMcpCors(jsonResponse(
+        {
+          ok: false,
+          code: "device_principal_denied",
+          retryable: false,
+          message: "device credentials cannot mint, revoke, or approve fleet identities; use an operator credential for Edge-local fleet administration",
+        },
+        403,
+      ));
+    }
     const attributionOperation = mcpMinuteAttribution.record(parsed.value);
     // Count only the workstation forward hop(s) this single OpenAI-visible MCP
     // request issues (normally 1; more on a bounded retry). This is NOT total
@@ -1161,21 +1186,27 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
     // only, adds no requests.
     let workstationForwardCount = 0;
     const workstationId = resolveWorkstation(request, env);
-    const webchatControlGrants = devAuth.webchatControlGrants ?? [];
-    const pageAssistGrants = devAuth.pageAssistGrants ?? [];
+    const webchatControlGrants = authed?.webchatControlGrants ?? [];
+    const pageAssistGrants = authed?.pageAssistGrants ?? [];
     const dev = await handleMcp(parsed.value, workstationId, {
       edgeEnv: env.EDGE_ENV,
       limits,
       client: {
         userAgent: request.headers.get("user-agent"),
-        oauthClientId: devAuth.clientId ?? null,
-        connectorId: devAuth.connectorId ?? null,
-        platformAccount: devAuth.platformAccount ?? null,
-        grantGeneration: devAuth.grantGeneration ?? null,
-        authSource: devAuth.source,
+        oauthClientId: authed?.clientId ?? null,
+        connectorId: authed?.connectorId ?? null,
+        platformAccount: authed?.platformAccount ?? null,
+        grantGeneration: authed?.grantGeneration ?? null,
+        authSource: deviceFleetPrincipal ? "device_credential" : authed?.source,
         webchatControlGrants,
         pageAssistGrants,
-        automationDeviceId: devAuth.principalType === "automation" ? (devAuth.deviceId ?? null) : null,
+        // A device credential binds routing to its own device: the shim's
+        // credential must not be usable to reach another workstation.
+        automationDeviceId: deviceFleetPrincipal
+          ? deviceFleetPrincipal.slice("device:".length)
+          : authed?.principalType === "automation"
+            ? (authed.deviceId ?? null)
+            : null,
         fleetAdmin: Boolean(mcpFleetPrincipal),
       },
       forward: async (stub: unknown, body: string) => {
@@ -1239,18 +1270,24 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         };
       },
       plannerControl: async (action, params) => {
-        if (devAuth.source !== "oauth_edge" || !devAuth.clientId || !devAuth.connectorId || !devAuth.grantGeneration) {
+        if (authed?.source !== "oauth_edge" || !authed.clientId || !authed.connectorId || !authed.grantGeneration) {
           return { ok: false, code: "planner_control_denied" };
         }
         const { claim_secret, ...input } = params;
         return plannerControlStore(env, { ...input, action, secret: claim_secret,
-          client_id: devAuth.clientId, connector_id: devAuth.connectorId, grant_generation: devAuth.grantGeneration });
+          client_id: authed.clientId, connector_id: authed.connectorId, grant_generation: authed.grantGeneration });
       },
       fleetControl: async (method, params, capability) => {
-        let authority = fleetControllerAuthority(devAuth);
-        if (!authority && capability && devAuth.source === "oauth_edge" && devAuth.connectorId && devAuth.grantGeneration) {
+        // Dedicated device authority (P0-b): fleet-control reads and
+        // non-force mutations, structurally incapable of force takeover.
+        let authority = deviceFleetPrincipal
+          ? { principal: deviceFleetPrincipal, can_force_takeover: false }
+          : authed
+            ? fleetControllerAuthority(authed)
+            : null;
+        if (!authority && capability && authed?.source === "oauth_edge" && authed.connectorId && authed.grantGeneration) {
           const verified = await plannerControlStore(env, { action: "verify", secret: capability,
-            client_id: devAuth.clientId, connector_id: devAuth.connectorId, grant_generation: devAuth.grantGeneration });
+            client_id: authed.clientId, connector_id: authed.connectorId, grant_generation: authed.grantGeneration });
           if (verified.ok && isRecord(verified.authority) && typeof verified.authority.principal === "string"
             && verified.authority.can_force_takeover === false) {
             authority = { principal: verified.authority.principal, can_force_takeover: false };
@@ -1301,7 +1338,7 @@ async function handleMcpRouter(request: Request, env: Env): Promise<Response> {
         : "";
     return withMcpCors(serializeMcpResponse(dev, {
       userAgent: request.headers.get("user-agent"),
-      oauthClientId: devAuth.clientId ?? null,
+      oauthClientId: authed?.clientId ?? null,
       method,
     }));
   }
@@ -1491,6 +1528,29 @@ async function verifyEdgeAccessToken(env: Env, token: string): Promise<{
     ...(pageAssistGrants.length > 0 ? { pageAssistGrants } : {}),
     platformAccount,
   };
+}
+
+/**
+ * Edge-local fleet management methods a `device:<id>` principal can never
+ * invoke — minting device identity (pair), revoking devices, or
+ * approving/revoking OAuth connectors. They stay reachable only through an
+ * operator credential.
+ */
+const DEVICE_PRINCIPAL_DENIED_METHODS: ReadonlySet<string> = new Set([
+  "herdr_mcp.device.pair",
+  "herdr_mcp.device.revoke",
+  "herdr_mcp.connector.approve",
+  "herdr_mcp.connector.revoke",
+]);
+
+/** True when a parsed JSON-RPC envelope is a herdr_call to a denied fleet method. */
+function isDevicePrincipalDeniedMcpCall(body: unknown): boolean {
+  if (!isRecord(body) || body.method !== "tools/call") return false;
+  const params = isRecord(body.params) ? body.params : null;
+  if (!params || params.name !== "herdr_call") return false;
+  const args = isRecord(params.arguments) ? params.arguments : null;
+  if (!args || typeof args.method !== "string") return false;
+  return DEVICE_PRINCIPAL_DENIED_METHODS.has(args.method);
 }
 
 async function authenticateEdgeMcpRequest(request: Request, env: Env) {
