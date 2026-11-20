@@ -67,7 +67,9 @@ fn client_request_id_dedupes_and_status_resolves() {
         "workspaces": [], "tabs": [], "panes": [], "agents": []
     }));
     let exec = ExecRegistry::new(root.join("exec")).unwrap();
-    let prompt = PromptRegistry::new();
+    let prompt = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+        StateStore::open(":memory:").unwrap(),
+    )));
     let skill = SkillService::new();
     let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
     let backend = crate::test_env::tui_backend_selection();
@@ -170,7 +172,9 @@ fn client_request_id_hygiene_rejects_before_ledger() {
         "workspaces": [], "tabs": [], "panes": [], "agents": []
     }));
     let exec = ExecRegistry::new(root.join("exec")).unwrap();
-    let prompt = PromptRegistry::new();
+    let prompt = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+        StateStore::open(":memory:").unwrap(),
+    )));
     let skill = SkillService::new();
     let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
     let backend = crate::test_env::tui_backend_selection();
@@ -223,7 +227,9 @@ fn same_key_different_request_is_idempotency_conflict() {
         "workspaces": [], "tabs": [], "panes": [], "agents": []
     }));
     let exec = ExecRegistry::new(root.join("exec")).unwrap();
-    let prompt = PromptRegistry::new();
+    let prompt = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+        StateStore::open(":memory:").unwrap(),
+    )));
     let skill = SkillService::new();
     let state_store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
     let backend = crate::test_env::tui_backend_selection();

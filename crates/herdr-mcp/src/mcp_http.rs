@@ -4388,7 +4388,9 @@ mod tests {
             client: HerdrClient::new(root.join("missing-herdr.sock")),
             cache: Arc::new(EventCache::from_snapshot_for_test(snapshot)),
             exec: ExecRegistry::new(root.join("exec")).unwrap(),
-            prompt: PromptRegistry::new(),
+            prompt: PromptRegistry::with_store(Arc::new(Mutex::new(
+                StateStore::open_in_dir(root, "state-test-prompt").unwrap(),
+            ))),
             skill: SkillService::new(),
             state_store: Arc::new(Mutex::new(
                 StateStore::open_in_dir(root, "state-test").unwrap(),
