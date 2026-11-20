@@ -188,12 +188,20 @@ fn git_marker_from_marker_read(result: &Value) -> GitMarkerProbe {
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         return GitMarkerProbe::Present;
     }
+    // Mirrors the real `fs_tools::read` failure contract: `not_found` is the
+    // validate-existing refusal for a missing/canonicalize-unresolvable path
+    // (the common missing-.git case), `stat_failed` covers a path that
+    // vanished between validation and stat. `outside_managed_roots` only says
+    // the root no longer admits the probe — the marker may or may not exist —
+    // so it stays inconclusive rather than Gone.
     match result.get("reason").and_then(Value::as_str) {
         Some("not_a_file") => GitMarkerProbe::Present,
-        Some("stat_failed") => match result.get("os_error").and_then(Value::as_i64) {
-            Some(code) if code == libc::ENOENT as i64 => GitMarkerProbe::Gone,
-            _ => GitMarkerProbe::Inconclusive,
-        },
+        Some("not_found") | Some("stat_failed") => {
+            match result.get("os_error").and_then(Value::as_i64) {
+                Some(code) if code == libc::ENOENT as i64 => GitMarkerProbe::Gone,
+                _ => GitMarkerProbe::Inconclusive,
+            }
+        }
         _ => GitMarkerProbe::Inconclusive,
     }
 }
@@ -249,7 +257,13 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     // stable broker (`herdr_fs_*`) or the delegated utility pane
     // (`herdr_exec`) — the same route the pre-existing protected-root command
     // preflight already uses. Every other unresolvable path is refused.
-    let root_real = if tcc_delegated_root(home, root) {
+    // `runtime_must_not_probe` already carries the full protected-path
+    // contract (Documents/Desktop/Downloads, the /System/Volumes/Data firmlink
+    // spelling, APFS case variants) *and* the broker-child exemption: inside
+    // the stable TCC broker it returns false, so the authorized child still
+    // runs the complete canonicalize + HomeGuard + secret-path validation
+    // instead of inheriting the rotating runtime's delegation shortcut.
+    let root_real = if crate::macos_permissions::runtime_must_not_probe(root) {
         None
     } else {
         match std::fs::canonicalize(root) {
@@ -268,7 +282,7 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     // cannot borrow this root's authority. A delegated-root cwd is likewise
     // never probed in-process; only an exact match carries authority.
     project.cwds.iter().all(|cwd| {
-        if tcc_delegated_root(home, cwd) {
+        if crate::macos_permissions::runtime_must_not_probe(cwd) {
             cwd == root
         } else {
             match (&root_real, std::fs::canonicalize(cwd)) {
@@ -277,15 +291,6 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
             }
         }
     })
-}
-
-/// macOS Documents/Desktop/Downloads roots are executed/read through the TCC
-/// broker or utility pane, which can verify what this runtime cannot.
-fn tcc_delegated_root(home: &Path, candidate: &Path) -> bool {
-    cfg!(target_os = "macos")
-        && ["Documents", "Desktop", "Downloads"]
-            .iter()
-            .any(|name| candidate.starts_with(home.join(name)))
 }
 
 /// Stable filesystem identity of an existing path: `(device, inode)` on Unix.
@@ -1553,19 +1558,28 @@ mod tests {
             git_marker_from_marker_read(&json!({"ok": false, "reason": "not_a_file"})),
             GitMarkerProbe::Present
         );
-        // Marker removed: stat reports ENOENT.
-        assert_eq!(
-            git_marker_from_marker_read(&json!({
-                "ok": false, "reason": "stat_failed", "os_error": 2,
-            })),
-            GitMarkerProbe::Gone
-        );
-        // stat_failed without the structured errno (older broker) or with a
-        // different errno is not proof of removal.
+        // Marker removed: real `fs_tools::read` reports `not_found` (the
+        // validate-existing refusal) or `stat_failed` when the entry vanished
+        // between validation and stat; both carry the structured errno.
+        for gone in [
+            json!({"ok": false, "reason": "not_found", "os_error": 2}),
+            json!({"ok": false, "reason": "stat_failed", "os_error": 2}),
+        ] {
+            assert_eq!(
+                git_marker_from_marker_read(&gone),
+                GitMarkerProbe::Gone,
+                "{gone}"
+            );
+        }
+        // Failures without the structured ENOENT (older broker, different
+        // errno, or a refusal that cannot prove removal) are not proof the
+        // marker is gone.
         for failure in [
+            json!({"ok": false, "reason": "not_found"}),
+            json!({"ok": false, "reason": "not_found", "os_error": 13}),
             json!({"ok": false, "reason": "stat_failed"}),
             json!({"ok": false, "reason": "stat_failed", "os_error": 5}),
-            json!({"ok": false, "reason": "stat_failed", "os_error": 20}),
+            json!({"ok": false, "reason": "outside_managed_roots"}),
             json!({"ok": false, "reason": "read_failed", "os_error": 2}),
             json!({"ok": false, "reason": "macos_tcc_access_blocked"}),
             json!({}),
