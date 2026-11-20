@@ -48,15 +48,26 @@ pub(crate) fn advance_git_status_clock(by: Duration) {
 struct GitStatusCacheEntry {
     expires_at: Instant,
     value: Option<GitStatus>,
+    /// Canonical path of the probed repository. Entries keyed under different
+    /// aliases (symlinked checkouts, `/var` vs `/private/var`) share one
+    /// identity so a write through any alias invalidates all of them.
+    repo_identity: Option<PathBuf>,
 }
 
 /// A probe currently running for one root. `invalidated` is set when a write
-/// under that root lands while the probe is in flight, so the stale result is
-/// never published to the cache.
+/// under that root — or under any alias sharing its repo identity — lands
+/// while the probe is in flight, so the stale result is never published.
 struct GitStatusInFlight {
     done: Mutex<bool>,
     ready: Condvar,
     invalidated: std::sync::atomic::AtomicBool,
+    repo_identity: Option<PathBuf>,
+    /// `GitStatusCacheState::invalidation_epoch` at registration. Waiters
+    /// with no provable identity (protected or unresolvable roots) may only
+    /// publish while the epoch is unchanged — any invalidation during the
+    /// probe could be a write through an alias the runtime cannot see, so a
+    /// conservative epoch check replaces the unanswerable identity match.
+    started_epoch: u64,
 }
 
 /// Prober-side cleanup: dropping removes the in-flight marker and wakes all
@@ -97,6 +108,10 @@ impl Drop for GitStatusProbeGuard {
 struct GitStatusCacheState {
     entries: HashMap<PathBuf, GitStatusCacheEntry>,
     in_flight: HashMap<PathBuf, Arc<GitStatusInFlight>>,
+    /// Bumped on every cache invalidation. Identity-less in-flight probes
+    /// compare `started_epoch` against this before publishing (see
+    /// `GitStatusInFlight`).
+    invalidation_epoch: u64,
 }
 
 static GIT_STATUS_CACHE: OnceLock<Mutex<GitStatusCacheState>> = OnceLock::new();
@@ -109,6 +124,30 @@ thread_local! {
 #[cfg(test)]
 static GIT_STATUS_PROBES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
+/// Test-only per-root probe latency: `git_status_uncached` sleeps this long
+/// before running the probe so a test can invalidate mid-flight.
+#[cfg(test)]
+static GIT_STATUS_PROBE_DELAY_MS: OnceLock<Mutex<HashMap<PathBuf, std::time::Duration>>> =
+    OnceLock::new();
+
+/// Park the next probe for `root` by `delay`. Pass `Duration::ZERO` (or drop
+/// the entry) to release; tests clear the entry after the interleave ends.
+#[cfg(test)]
+pub(crate) fn set_git_status_probe_delay(root: &Path, delay: Option<std::time::Duration>) {
+    let delays = GIT_STATUS_PROBE_DELAY_MS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = delays
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match delay {
+        Some(value) => {
+            map.insert(root.to_path_buf(), value);
+        }
+        None => {
+            map.remove(root);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn reset_git_status_probe_count(root: &Path) {
     if let Some(probes) = GIT_STATUS_PROBES.get() {
@@ -117,6 +156,33 @@ pub(crate) fn reset_git_status_probe_count(root: &Path) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(root);
     }
+}
+
+/// Count live cache entries whose key shares a path prefix with `root`,
+/// regardless of expiry. Tests assert broker write invalidation
+/// deterministically: expired-but-kept entries keep counting, so a retained
+/// entry stays `>= 1` even when a route call outlasts the TTL, while a
+/// dropped entry reads `0`. Scoping by prefix keeps parallel tests' roots
+/// from polluting the count.
+#[cfg(test)]
+pub(crate) fn git_status_cache_entry_count_for(root: &Path) -> usize {
+    let identity = std::fs::canonicalize(root).ok();
+    GIT_STATUS_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entries
+                .iter()
+                .filter(|(key, entry)| {
+                    root.starts_with(key.as_path())
+                        || key.starts_with(root)
+                        || (identity.is_some() && entry.repo_identity == identity)
+                })
+                .count()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -405,6 +471,10 @@ struct GitStatus {
     dirty: bool,
     changed_files: usize,
     source: &'static str,
+    /// Canonical repository identity when the probe source can prove it —
+    /// the broker supplies one for protected roots it can see and the
+    /// runtime cannot. `None` keeps invalidation on path prefixes only.
+    repo_identity: Option<PathBuf>,
 }
 
 fn git_statuses(snapshot: &Value, roots: &[PathBuf]) -> HashMap<PathBuf, GitStatus> {
@@ -431,7 +501,7 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
     let key = root.to_path_buf();
     let cache = GIT_STATUS_CACHE.get_or_init(|| Mutex::new(GitStatusCacheState::default()));
     loop {
-        let mut state = cache
+        let state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = state.entries.get(&key)
@@ -466,6 +536,13 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                     .is_some_and(|current| Arc::ptr_eq(current, &waiter))
                 {
                     state.in_flight.remove(&key);
+                    // Poison the evicted waiter too: its late result must be
+                    // refused at the publish fence even if it raced a new
+                    // probe's registration (Codex 7035056472 / Claude
+                    // 7035902838 P1).
+                    waiter
+                        .invalidated
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     drop(state);
                     *waiter
                         .done
@@ -479,10 +556,36 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             }
             continue;
         }
+        drop(state);
+
+        // Resolve the caller-visible path identity OUTSIDE the lock:
+        // `repo_identity_for` may block up to ~500ms on macOS
+        // (bounded_real_path worker round-trip) and must not stall every
+        // cache reader or invalidation.
+        let probe_identity = repo_identity_for(&key);
+        let mut state = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Re-check under the lock: a concurrent probe may have published or
+        // registered while the identity resolved above. Both cases fold back
+        // into the top of the loop, which returns the fresh entry or joins
+        // the existing waiter. Any invalidation that ran meanwhile is also
+        // covered: it removed the entry and bumped `invalidation_epoch`.
+        if let Some(entry) = state.entries.get(&key)
+            && entry.expires_at > cache_now()
+        {
+            return entry.value.clone();
+        }
+        if state.in_flight.contains_key(&key) {
+            drop(state);
+            continue;
+        }
         let waiter = Arc::new(GitStatusInFlight {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
+            repo_identity: probe_identity,
+            started_epoch: state.invalidation_epoch,
         });
         state.in_flight.insert(key.clone(), waiter.clone());
         drop(state);
@@ -497,10 +600,26 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !waiter
-            .invalidated
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // This waiter may have been evicted by a wait-timeout — or poisoned
+        // directly — while the probe ran; it may publish only while it is
+        // still the registered in-flight probe for this key AND unflagged
+        // (Codex 7035056472 / Claude 7035902838 P1). Generation fence: an
+        // identity-less probe cannot be matched to any write's repo
+        // identity, so it may only publish when NO invalidation at all ran
+        // during the probe — the write could have landed through an alias
+        // the runtime cannot see (Codex 7030506844 P1). Probes with a
+        // provable identity rely on the direct `invalidated` flag instead:
+        // unrelated writes must not churn them.
+        let registered = state
+            .in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &waiter));
+        let stale = !registered
+            || waiter
+                .invalidated
+                .load(std::sync::atomic::Ordering::Relaxed)
+            || (waiter.repo_identity.is_none() && state.invalidation_epoch != waiter.started_epoch);
+        if !stale {
             let now = cache_now();
             // Evict expired entries for other roots opportunistically so the
             // map stays bounded by live roots rather than every root seen.
@@ -511,6 +630,14 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                 GitStatusCacheEntry {
                     expires_at,
                     value: value.clone(),
+                    // Prefer the status's repo identity (broker-supplied for
+                    // protected roots the runtime may not resolve); the cwd
+                    // identity is the fallback so a subdirectory probe keeps
+                    // its own alias identity for prefix overlap matching.
+                    repo_identity: value
+                        .as_ref()
+                        .and_then(|status| status.repo_identity.clone())
+                        .or_else(|| waiter.repo_identity.clone()),
                 },
             );
             if let Some(status) = &value {
@@ -519,6 +646,10 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                     GitStatusCacheEntry {
                         expires_at,
                         value: Some(status.clone()),
+                        repo_identity: status
+                            .repo_identity
+                            .clone()
+                            .or_else(|| waiter.repo_identity.clone()),
                     },
                 );
             }
@@ -539,11 +670,59 @@ pub fn invalidate_git_status_cache_for_path(path: &Path) {
     let mut state = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.invalidation_epoch += 1;
     state
         .entries
         .retain(|key, _| !(path.starts_with(key) || key.starts_with(path)));
     for (key, in_flight) in &state.in_flight {
         if path.starts_with(key) || key.starts_with(path) {
+            in_flight
+                .invalidated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Drop cached status evidence after a write when the caller knows the
+/// touched repository's caller-visible `root` and, when available, its
+/// canonical `repo_identity`. A key or in-flight probe is dropped when it
+/// shares a path prefix with `root` OR shares a canonical identity prefix
+/// with `repo_identity`. Identities overlap bidirectionally because a probe
+/// keyed on a subdirectory records that subdirectory's canonical path while
+/// a write reports the repository root — both spellings of the same repo
+/// must still match (#1023, Claude 7011094552). Entries and probes recorded
+/// without an identity can never prove they belong to a DIFFERENT repo, so
+/// once the write carries an identity they are dropped conservatively —
+/// otherwise a `value=None` cache (e.g. a protected root whose broker probe
+/// failed transiently) keeps serving pre-write state until TTL
+/// (Codex 7037947948 P2).
+pub fn invalidate_git_status_cache_matching(root: &Path, repo_identity: Option<&Path>) {
+    let Some(cache) = GIT_STATUS_CACHE.get() else {
+        return;
+    };
+    let identity = repo_identity.map(PathBuf::from);
+    let matches = |key: &Path, entry_identity: Option<&PathBuf>| {
+        if root.starts_with(key) || key.starts_with(root) {
+            return true;
+        }
+        let Some(identity) = &identity else {
+            return false;
+        };
+        let Some(entry_identity) = entry_identity else {
+            // Unknown identity cannot rule out the written repo: drop it.
+            return true;
+        };
+        entry_identity.starts_with(identity) || identity.starts_with(entry_identity)
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.invalidation_epoch += 1;
+    state
+        .entries
+        .retain(|key, entry| !matches(key, entry.repo_identity.as_ref()));
+    for (key, in_flight) in &state.in_flight {
+        if matches(key, in_flight.repo_identity.as_ref()) {
             in_flight
                 .invalidated
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -559,6 +738,7 @@ pub fn invalidate_git_status_cache(root: &Path) {
     let mut state = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.invalidation_epoch += 1;
     state
         .entries
         .retain(|key, _| key != root && !key.starts_with(root));
@@ -571,7 +751,42 @@ pub fn invalidate_git_status_cache(root: &Path) {
     }
 }
 
+/// Drop ALL cached status evidence and poison every in-flight probe. Bounded
+/// and strictly conservative: used when a write completed but the responder
+/// could not report the touched repository (an old broker response without
+/// `repo_identity` — Codex 7030506844 P1). Any cache state retained past
+/// that point could alias the write's root, so nothing is trusted.
+pub fn invalidate_git_status_cache_all() {
+    let Some(cache) = GIT_STATUS_CACHE.get() else {
+        return;
+    };
+    let mut state = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.invalidation_epoch += 1;
+    state.entries.clear();
+    for in_flight in state.in_flight.values() {
+        in_flight
+            .invalidated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+    #[cfg(test)]
+    let delay = GIT_STATUS_PROBE_DELAY_MS
+        .get()
+        .and_then(|delays| delays.lock().ok().and_then(|map| map.get(root).copied()));
+    let result = if should_use_stable_broker(snapshot, root) {
+        broker_git_status(snapshot, root)
+    } else {
+        git_status_direct(root).map(|(dirty, changed_files)| GitStatus {
+            root: root.to_path_buf(),
+            dirty,
+            changed_files,
+            source: "local_git",
+            repo_identity: repo_identity_for(root),
+        })
+    };
     #[cfg(test)]
     {
         *GIT_STATUS_PROBES
@@ -580,16 +795,16 @@ fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(root.to_path_buf())
             .or_insert(0) += 1;
+        // Controlled latency AFTER the probe computed: a test parks the
+        // prober on its way to publish so it can invalidate mid-flight and
+        // still distinguish the probe's (already captured) result from a
+        // fresh re-probe. The publish fences exist for exactly this
+        // interleave (#1023).
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
     }
-    if should_use_stable_broker(snapshot, root) {
-        return broker_git_status(snapshot, root);
-    }
-    git_status_direct(root).map(|(dirty, changed_files)| GitStatus {
-        root: root.to_path_buf(),
-        dirty,
-        changed_files,
-        source: "local_git",
-    })
+    result
 }
 
 fn git_status_direct(root: &Path) -> Option<(bool, usize)> {
@@ -606,6 +821,29 @@ fn git_status_direct(root: &Path) -> Option<(bool, usize)> {
         .filter(|line| !line.trim().is_empty())
         .count();
     Some((changed_files > 0, changed_files))
+}
+
+/// Canonical repository identity for a probed root, without letting a
+/// consent-gated path park the caller or probing what the runtime must not
+/// touch (#1023: the unconditional `std::fs::canonicalize` here violated
+/// `runtime_must_not_probe` on protected paths). Protected or unresolvable
+/// paths return `None`; the broker-supplied identity on the status covers
+/// them, and without one the entry keeps prefix-only matching.
+fn repo_identity_for(root: &Path) -> Option<PathBuf> {
+    if crate::macos_permissions::runtime_must_not_probe(root) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match crate::macos_permissions::bounded_real_path(root) {
+            crate::macos_permissions::BoundedRealPath::Resolved(path) => Some(path),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::canonicalize(root).ok()
+    }
 }
 
 fn should_use_stable_broker(snapshot: &Value, path: &Path) -> bool {
@@ -670,6 +908,13 @@ fn broker_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         dirty: changed_files > 0,
         changed_files,
         source: "tcc_broker",
+        // The broker child resolves the canonical root where the runtime may
+        // not probe; trust its `repo_identity` verbatim so a write through
+        // another alias of this repository can invalidate this entry.
+        repo_identity: value
+            .get("repo_identity")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
     })
 }
 
@@ -761,11 +1006,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
+        // pid + atomic + nanos: parallel tests in this and other binaries must
+        // never collide on the same fixture directory (Claude 7035902838).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-mcp-projects-{unique}"))
+        std::env::temp_dir().join(format!(
+            "herdr-mcp-projects-{}-{sequence}-{unique}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -885,6 +1137,9 @@ mod tests {
 
     #[test]
     fn git_status_ttl_expiry_refreshes_the_probe() {
+        // Shared-cache invalidations from parallel tests must not poison this
+        // probe count (pi 7035463441).
+        let _env_guard = crate::test_env::lock();
         let root = temp_dir();
         fs::create_dir_all(&root).unwrap();
         assert!(
@@ -993,6 +1248,10 @@ mod tests {
 
     #[test]
     fn expired_entries_are_evicted_on_the_next_probe() {
+        // The clear-all fallback poisons unrelated in-flight probes; hold the
+        // shared-cache lock so this probe count cannot be disturbed (pi
+        // 7035463441).
+        let _env_guard = crate::test_env::lock();
         let root_a = temp_dir();
         let root_b = temp_dir();
         for root in [&root_a, &root_b] {
@@ -1044,6 +1303,8 @@ mod tests {
             done: Mutex::new(false),
             ready: Condvar::new(),
             invalidated: std::sync::atomic::AtomicBool::new(false),
+            repo_identity: None,
+            started_epoch: 0,
         });
         GIT_STATUS_CACHE
             .get_or_init(|| Mutex::new(GitStatusCacheState::default()))
@@ -1058,6 +1319,250 @@ mod tests {
         assert!(!topology.projects[&root].dirty);
         assert_eq!(git_status_probe_count(&root), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user operator | Given a probe wedged past the wait bound, a second
+    /// caller that takes over, and a write during the takeover | When the
+    /// evicted probe finally returns | Then its stale result is refused and
+    /// the invalidation wins — no entry is backfilled (Codex 7035056472 /
+    /// Claude 7035902838 P1).
+    #[test]
+    fn evicted_probe_result_is_refused_after_a_write() {
+        let _env_guard = crate::test_env::lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // T1 probes slowly; the main caller waits past the 50ms test bound,
+        // evicts T1's marker, and becomes the replacement prober.
+        reset_git_status_probe_count(&root);
+        set_git_status_probe_delay(&root, Some(Duration::from_millis(200)));
+        let snapshot = git_snapshot(&root);
+        let first = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            move || derive(&snapshot)
+        });
+        // Barrier: the first probe must actually be parked inside
+        // git_status_uncached before the takeover attempt starts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while git_status_probe_count(&root) == 0 {
+            assert!(std::time::Instant::now() < deadline, "probe never ran");
+            std::thread::yield_now();
+        }
+        // This derive waits on T1, times out at the test bound, evicts the
+        // marker, and starts its own delayed probe.
+        let second = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            move || derive(&snapshot)
+        });
+        // Barrier: the takeover probe registered (count 2) before the write
+        // lands, so the invalidation runs strictly between takeover and its
+        // publish.
+        while git_status_probe_count(&root) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "takeover probe never ran"
+            );
+            std::thread::yield_now();
+        }
+        // The write lands while BOTH probes are parked post-computation.
+        std::fs::write(root.join("written-after-probe.txt"), "dirty\n").unwrap();
+        invalidate_git_status_cache(&root);
+        first.join().unwrap();
+        second.join().unwrap();
+        set_git_status_probe_delay(&root, None);
+
+        // Distinguishing evidence: every parked probe captured the CLEAN
+        // status before the write, so any dirty result now observable can
+        // only come from a fresh re-probe — had an evicted or invalidated
+        // probe published, the cache would read clean forever.
+        let latest = derive(&snapshot);
+        assert!(
+            latest.projects[&root].dirty,
+            "the post-write state is observable — no stale clean publish survived: {latest:?}"
+        );
+        assert!(
+            git_status_probe_count(&root) >= 3,
+            "the refused publishes must have forced a fresh probe: {}",
+            git_status_probe_count(&root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_less_probe_never_publishes_across_a_write() {
+        let _env_guard = crate::test_env::lock();
+        // Codex 7030506844 P1: a probe whose repo identity cannot be proven
+        // (protected root, or any path the runtime cannot resolve) must not
+        // publish pre-write state once ANY invalidation ran mid-flight — the
+        // write could have landed through an alias nobody can see. Here the
+        // "write" reports an unrelated root: neither path nor identity
+        // matches the probe's key, so only the epoch fence can stop it.
+        // The snapshot declares a worktree so the project is real, and the
+        // probe count proves the interleave actually ran (Claude 7035902838:
+        // the previous form could pass vacuously).
+        let gone = temp_dir().join("identity-less-probe");
+        let unrelated = temp_dir().join("unrelated-write");
+        fs::create_dir_all(&unrelated).unwrap();
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": gone.to_string_lossy()}
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": gone.to_string_lossy()
+            }],
+            "agents": []
+        });
+        reset_git_status_probe_count(&gone);
+        set_git_status_probe_delay(&gone, Some(Duration::from_millis(400)));
+        let probe_snapshot = snapshot.clone();
+        let gone_probe = gone.clone();
+        let handle = std::thread::spawn(move || derive(&probe_snapshot));
+        // Explicit barrier: spin until the prober has registered AND parked
+        // inside the delayed probe — only then invalidate, so the order
+        // register → invalidate → resume → refuse is deterministic, not
+        // timing luck.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while git_status_probe_count(&gone) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prober never reached git_status_uncached"
+            );
+            std::thread::yield_now();
+        }
+        invalidate_git_status_cache_matching(&unrelated, None);
+        handle.join().unwrap();
+        set_git_status_probe_delay(&gone, None);
+        assert_eq!(git_status_probe_count(&gone), 1, "exactly one probe ran");
+        assert_eq!(
+            git_status_cache_entry_count_for(&gone_probe),
+            0,
+            "an identity-less probe must not publish a result gathered while \
+             a write could have landed elsewhere (stale publish would be \
+             indistinguishable from the pre-write state it replaces)"
+        );
+        fs::remove_dir_all(unrelated.parent().unwrap()).unwrap_or_default();
+    }
+
+    #[test]
+    fn identified_probe_survives_an_unrelated_write() {
+        let _env_guard = crate::test_env::lock();
+        // The fence's inverse: a probe whose repo identity IS provable keeps
+        // its result when the invalidation cannot match it — unrelated writes
+        // must not churn healthy probes.
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let unrelated = temp_dir().join("unrelated-write-b");
+        fs::create_dir_all(&unrelated).unwrap();
+        let snapshot = git_snapshot(&root);
+        set_git_status_probe_delay(&root, Some(Duration::from_millis(400)));
+        let probe_snapshot = snapshot.clone();
+        let handle = std::thread::spawn(move || derive(&probe_snapshot));
+        std::thread::sleep(Duration::from_millis(50));
+        invalidate_git_status_cache_matching(&unrelated, None);
+        handle.join().unwrap();
+        set_git_status_probe_delay(&root, None);
+        assert!(
+            git_status_cache_has(&root),
+            "a probe with a provable identity publishes despite an unrelated write"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(unrelated).unwrap();
+    }
+
+    /// user operator | Given alias A's cached status was recorded without a
+    /// repo identity | When a write succeeds through alias B of the same
+    /// repository carrying its canonical identity | Then A's entry drops
+    /// conservatively and the next inspect re-probes (Codex 7037947948 P2).
+    #[cfg(unix)]
+    #[test]
+    fn unknown_identity_entry_drops_on_an_identified_write_through_another_alias() {
+        use std::os::unix::fs::symlink;
+
+        let _env_guard = crate::test_env::lock();
+        let real = temp_dir().join("real");
+        fs::create_dir_all(&real).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fixture = real.parent().unwrap().to_path_buf();
+        let alias_a = fixture.join("alias-a");
+        let alias_b = fixture.join("alias-b");
+        symlink(&real, &alias_a).unwrap();
+        symlink(&real, &alias_b).unwrap();
+
+        // Seed a value=None, identity-less entry keyed on alias A — the
+        // shape a protected-root probe leaves when its broker call failed.
+        GIT_STATUS_CACHE
+            .get_or_init(|| Mutex::new(GitStatusCacheState::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .insert(
+                alias_a.clone(),
+                GitStatusCacheEntry {
+                    expires_at: cache_now() + GIT_STATUS_CACHE_TTL,
+                    value: None,
+                    repo_identity: None,
+                },
+            );
+
+        // The write lands through alias B and reports the repo's canonical
+        // identity: A's entry cannot prove it is a different repo, so it must
+        // drop rather than keep serving pre-write state until TTL.
+        let identity = std::fs::canonicalize(&real).unwrap();
+        invalidate_git_status_cache_matching(&alias_b, Some(&identity));
+        assert_eq!(
+            git_status_cache_entry_count_for(&alias_a),
+            0,
+            "an identity-less entry cannot rule out the written repo and must drop"
+        );
+
+        // The next inspect re-probes instead of serving the dropped entry.
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": alias_a.to_string_lossy()}
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": alias_a.to_string_lossy()
+            }],
+            "agents": []
+        });
+        reset_git_status_probe_count(&alias_a);
+        let latest = derive(&snapshot);
+        assert!(latest.projects.contains_key(&alias_a), "{latest:?}");
+        assert_eq!(
+            git_status_probe_count(&alias_a),
+            1,
+            "alias A must re-probe immediately after the identified write"
+        );
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

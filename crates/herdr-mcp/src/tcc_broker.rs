@@ -928,13 +928,44 @@ fn dispatch(request: &Request) -> Value {
             }),
             Err(error) => error,
         },
-        "fs_edit" => fs_mutation::edit(&request.snapshot, &request.args),
-        "fs_write" => fs_mutation::write(&request.snapshot, &request.args),
-        "fs_patch" => fs_patch::apply(&request.snapshot, &request.args),
-        "git" => git_tools::run(&request.snapshot, &request.args),
+        "fs_edit" => with_repo_identity(fs_mutation::edit(&request.snapshot, &request.args)),
+        "fs_write" => with_repo_identity(fs_mutation::write(&request.snapshot, &request.args)),
+        "fs_patch" => with_repo_identity(fs_patch::apply(&request.snapshot, &request.args)),
+        "git" => with_repo_identity(git_tools::run(&request.snapshot, &request.args)),
+
         // Unreachable: parse_request enforces the allowlist.
         _ => broker_error("unknown_operation", &request.op),
     }
+}
+
+/// Add `repo_identity` (canonical path of the touched repository) to a
+/// successful fs-write result. The broker child holds the filesystem consent
+/// the runtime may lack, so it is the side that can resolve an alias `root`
+/// to the canonical repository path; the parent consumes this to invalidate
+/// every cache key that shares the same repository identity (#1023). A
+/// `dry_run` result and a non-ok result gain no identity, and a missing or
+/// unresolvable `root` leaves the result unchanged — the alias-based
+/// invalidation still applies.
+fn with_repo_identity(value: Value) -> Value {
+    let mut value = value;
+    if value.get("ok").and_then(Value::as_bool) != Some(true)
+        || value.get("dry_run").and_then(Value::as_bool) == Some(true)
+    {
+        return value;
+    }
+    let Some(root) = value.get("root").and_then(Value::as_str) else {
+        return value;
+    };
+    let Ok(identity) = std::fs::canonicalize(root) else {
+        return value;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "repo_identity".to_owned(),
+            json!(identity.to_string_lossy()),
+        );
+    }
+    value
 }
 
 /// Reconstruct the MCP `herdr_fs_image` tool result from a broker image
