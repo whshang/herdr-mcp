@@ -162,7 +162,7 @@ test("user cannot use a device credential without workstation identity or after 
   assert.equal(revoked.response.status, 401);
 });
 
-test("operator principals keep unbound fleet visibility | Given a paired device | When an operator credential calls herdr_devices | Then the full fleet is returned", async () => {
+test("user with an operator credential keeps unbound fleet visibility | Given a paired device | When an operator credential calls herdr_devices | Then the full fleet is returned", async () => {
   const h = makeHarness();
   const device = await enrollDevice(h.registry);
   const response = await worker.fetch(new Request("https://edge.example/mcp", {
