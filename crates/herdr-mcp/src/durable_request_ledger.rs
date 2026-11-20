@@ -434,7 +434,7 @@ pub fn durable_scope_unavailable_response(client_request_id: &str) -> Value {
 fn replay_response(record: &ClientRequestRecord, client_request_id: &str) -> Value {
     let result = record.result();
     let summary = result.get("result_summary").cloned().unwrap_or(Value::Null);
-    json!({
+    let mut response = json!({
         "ok": summary.get("ok").and_then(Value::as_bool).unwrap_or(false),
         "code": summary.get("code").cloned().unwrap_or_else(|| json!("result_recorded")),
         "result_summary": summary,
@@ -444,8 +444,19 @@ fn replay_response(record: &ClientRequestRecord, client_request_id: &str) -> Val
         "op_id": record.op_id,
         "request_id": record_request_id(record),
         "client_request_id": client_request_id,
-        "message": "the ledger stores a digest-only projection; it never retains the response body",
-    })
+        "message": "the ledger stores a digest-only projection plus whitelisted receipt identifiers; it never retains the response body",
+    });
+    // Surface the whitelisted receipt identifiers the first response carried
+    // (task_id/receipt_id for herdr_prompt) so a replayed submission returns
+    // the same receipt rather than only a digest.
+    if let Some(receipt) = result.get("receipt").and_then(Value::as_object) {
+        for (field, value) in receipt {
+            if !value.is_null() {
+                response[field] = value.clone();
+            }
+        }
+    }
+    response
 }
 
 /// Atomic dedupe + reserve for one durable submission. `Execute` must be
@@ -584,6 +595,10 @@ pub enum DurableSettle {
 /// Bounded `result_json` for a settled record: status fields, digest and byte
 /// count only — never response body, stdout, prompt, tokens, file content,
 /// or the raw `client_request_id` (D-1 keeps the raw key out of the DB).
+/// `receipt` carries only small identifier fields a retry legitimately needs
+/// back (`task_id`/`receipt_id` for `herdr_prompt` submissions); it is a
+/// whitelist, not the result body, so payload content still never lands in
+/// the projection.
 fn settled_result_json(
     read_only: bool,
     outcome: &str,
@@ -608,6 +623,10 @@ fn settled_result_json(
             "code": result.get("code").cloned().unwrap_or(Value::Null),
             "result_digest": sha256_hex(&serialized),
             "result_bytes": serialized.len(),
+        },
+        "receipt": {
+            "task_id": result.get("task_id").cloned().unwrap_or(Value::Null),
+            "receipt_id": result.get("receipt_id").cloned().unwrap_or(Value::Null),
         },
     })
     .to_string()
@@ -695,23 +714,27 @@ pub fn durable_settle_result(
 /// leaks across scopes.
 pub fn durable_client_request_status(store: &StateStore, key: &str, scope: &str) -> Option<Value> {
     let scope_digest = durable_scope_digest(scope);
+    // Select by caller scope first: the same key under a different kind or
+    // the same raw id submitted by another caller must not leak a foreign
+    // record's state, and two kinds may legitimately hold rows for one key.
     let record = CLIENT_REQUEST_KINDS
         .iter()
-        .find_map(|kind| {
+        .filter_map(|kind| {
             store
                 .client_request_record(kind, &client_request_key_digest(kind, key))
                 .ok()
                 .flatten()
         })
-        .or_else(|| {
+        .chain(
             store
                 .client_request_record_for_request_id(key)
                 .ok()
-                .flatten()
-        })?;
-    if durable_scope_digest_from_hash(&record.request_hash) != Some(scope_digest.as_str()) {
-        return None;
-    }
+                .flatten(),
+        )
+        .filter(|record| {
+            durable_scope_digest_from_hash(&record.request_hash) == Some(scope_digest.as_str())
+        })
+        .max_by_key(|record| record.updated_at)?;
     let result = record.result();
     Some(json!({
         "ok": true,
@@ -727,6 +750,7 @@ pub fn durable_client_request_status(store: &StateStore, key: &str, scope: &str)
         "delivery_state": result.get("delivery_state").cloned().unwrap_or(Value::Null),
         "expired": result.get("expired").and_then(Value::as_bool).unwrap_or(false),
         "result": result.get("result_summary").cloned().unwrap_or(Value::Null),
+        "receipt": result.get("receipt").cloned().unwrap_or(Value::Null),
         "created_ms": record.created_at,
         "updated_ms": record.updated_at,
     }))
@@ -1256,5 +1280,149 @@ mod tests {
                 "{write} must classify as write"
             );
         }
+    }
+
+    /// user caller | Given a settled request whose first response carried
+    /// receipt identifiers | When the same key retries | Then the replay
+    /// returns the same task_id/receipt_id while body payload stays out of
+    /// the projection.
+    #[test]
+    fn user_prompt_retry_then_replay_returns_same_receipt_identifiers() {
+        let dir = temp_state_dir();
+        let params = json!({"pane": "w1:p1", "prompt": "do it"});
+        let mut store = open_store(&dir);
+        let ids = ids_for(SCOPE_A, &params, "req_prompt_1", false);
+        expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        durable_settle_result(
+            &mut store,
+            &ids,
+            &json!({
+                "ok": true,
+                "task_id": "task_1",
+                "receipt_id": "rcpt_1",
+                "prompt_echo": "body content that must not persist",
+            }),
+            false,
+            1_100,
+        );
+
+        let retry = ids_for(SCOPE_A, &params, "req_prompt_2", false);
+        let replay = replay_body(begin(&mut store, &retry, SCOPE_A, &params, false, 2_000));
+        assert_eq!(replay["deduplicated"], true, "{replay}");
+        assert_eq!(replay["task_id"], "task_1", "{replay}");
+        assert_eq!(replay["receipt_id"], "rcpt_1", "{replay}");
+        assert!(
+            !replay.to_string().contains("prompt_echo"),
+            "receipt whitelist must not retain body fields: {replay}"
+        );
+        // request.status surfaces the same receipt for inspection.
+        let status = durable_client_request_status(&store, KEY, SCOPE_A).unwrap();
+        assert_eq!(status["receipt"]["task_id"], "task_1", "{status}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a commit failure whose rollback itself errored |
+    /// When the result settles | Then a delivery_unknown tombstone persists
+    /// and a same-key retry is refused with inspect_before_retry instead of
+    /// re-executing a possibly-applied write.
+    #[test]
+    fn user_write_retry_given_partial_rollback_then_inspect_before_retry() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        let ids = ids_for(SCOPE_A, &params, "req_patch_1", false);
+        expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        assert_eq!(
+            durable_settle_result(
+                &mut store,
+                &ids,
+                &json!({
+                    "ok": false,
+                    "code": "PATCH_COMMIT_FAILED",
+                    "message": "stage failed; rollback errors: remove a.txt: busy",
+                }),
+                false,
+                1_100,
+            ),
+            DurableSettle::RecordedUnknown
+        );
+
+        let retry = ids_for(SCOPE_A, &params, "req_patch_2", false);
+        let body = respond_body(begin(&mut store, &retry, SCOPE_A, &params, false, 2_000));
+        assert_eq!(body["safe_retry_mode"], "inspect_before_retry", "{body}");
+        assert_eq!(body["delivery_state"], "delivery_unknown", "{body}");
+
+        // A clean rollback (no rollback errors) stays rejected: under a
+        // different key the reservation releases and a retry reserves fresh.
+        let clean_params = json!({"path": "b.txt"});
+        let clean = client_request_ids(
+            KIND,
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            "cr-key-2",
+            "req_patch_3",
+            false,
+        );
+        expect_execute(durable_begin_or_replay(
+            &mut store,
+            &clean,
+            "cr-key-2",
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            false,
+            3_000,
+        ));
+        durable_settle_result(
+            &mut store,
+            &clean,
+            &json!({"ok": false, "code": "PATCH_COMMIT_FAILED", "message": "stage failed"}),
+            false,
+            3_100,
+        );
+        let retry = client_request_ids(
+            KIND,
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            "cr-key-2",
+            "req_patch_4",
+            false,
+        );
+        expect_execute(durable_begin_or_replay(
+            &mut store,
+            &retry,
+            "cr-key-2",
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            false,
+            4_000,
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given the same key stored under two kinds and two
+    /// scopes | When request.status runs per scope | Then each scope reads
+    /// its own record instead of whichever kind scans first.
+    #[test]
+    fn user_status_given_same_key_across_kinds_then_scope_selects_record() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        for (kind, scope, request_id) in [
+            (HERDR_CALL_CLIENT_REQUEST_KIND, SCOPE_A, "req_call_1"),
+            (HERDR_FS_WRITE_CLIENT_REQUEST_KIND, SCOPE_B, "req_write_1"),
+        ] {
+            let ids = client_request_ids(kind, scope, METHOD, &params, KEY, request_id, false);
+            expect_execute(begin(&mut store, &ids, scope, &params, false, 1_000));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        let status_a = durable_client_request_status(&store, KEY, SCOPE_A).unwrap();
+        assert_eq!(status_a["request_id"], "req_call_1", "{status_a}");
+        let status_b = durable_client_request_status(&store, KEY, SCOPE_B).unwrap();
+        assert_eq!(status_b["request_id"], "req_write_1", "{status_b}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

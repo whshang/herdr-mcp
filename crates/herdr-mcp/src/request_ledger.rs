@@ -124,6 +124,18 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
     ) {
         return RequestLedgerState::Unknown;
     }
+    // A commit failure whose rollback itself errored may have left staged
+    // mutations partially applied; the mutation layer reports that as
+    // "rollback errors" inside the failure message. That outcome cannot
+    // prove a clean rollback, so it is the "maybe applied" class too —
+    // releasing the reservation here would let a blind retry re-execute.
+    if result
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.contains("rollback errors"))
+    {
+        return RequestLedgerState::Unknown;
+    }
     RequestLedgerState::Rejected
 }
 

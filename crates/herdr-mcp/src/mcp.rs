@@ -1126,7 +1126,14 @@ fn initialize_result(request: &Value) -> Value {
     let identity = contract::identity().ok();
     json!({
         "protocolVersion": protocol,
-        "capabilities": {"tools": {"listChanged": false}},
+        "capabilities": {
+            "tools": {"listChanged": false},
+            // Advertised so ingresses (Edge /mcp admission, the same-host
+            // shim) can refuse client_request_id-keyed writes to runtimes
+            // that predate the durable write ledger — an older runtime
+            // silently ignores the undeclared parameter and would re-execute.
+            "experimental": {"herdr_durable_write_client_request_id": true},
+        },
         "serverInfo": {
             "name": "herdr-mcp",
             "version": crate::runtime_meta::runtime_version()
@@ -1144,7 +1151,10 @@ fn discover_result() -> Value {
     json!({
         "resultType": "complete",
         "supportedVersions": SUPPORTED_VERSIONS,
-        "capabilities": {"tools": {"listChanged": false}},
+        "capabilities": {
+            "tools": {"listChanged": false},
+            "experimental": {"herdr_durable_write_client_request_id": true},
+        },
         "instructions": SERVER_INSTRUCTIONS,
         "ttlMs": 3_600_000,
         "cacheScope": "private",
@@ -35275,5 +35285,25 @@ mod durable_client_request_tests {
         }
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user ingress | Given initialize/discover negotiation | When an
+    /// ingress inspects server capabilities | Then the durable write
+    /// client_request_id feature is advertised so keyed writes can be
+    /// refused to runtimes that predate it.
+    #[test]
+    fn user_ingress_then_handshake_advertises_durable_write_key_capability() {
+        let initialize =
+            initialize_result(&json!({"params": {"protocolVersion": SDK_WIRE_PROTOCOL}}));
+        assert_eq!(
+            initialize["capabilities"]["experimental"]["herdr_durable_write_client_request_id"],
+            true,
+            "{initialize}"
+        );
+        let discover = discover_result();
+        assert_eq!(
+            discover["capabilities"]["experimental"]["herdr_durable_write_client_request_id"], true,
+            "{discover}"
+        );
     }
 }
