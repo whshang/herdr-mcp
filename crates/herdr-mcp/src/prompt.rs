@@ -3112,28 +3112,28 @@ impl PromptRegistry {
             return TranscriptScan::Observed;
         }
         if baseline == 0 {
-            // Empty-baseline evidence: file identity and the creation stamp
-            // are all that separates an append from a delete+recreate. A
-            // first sighting records `seen_*` below; a later sighting must
-            // keep the bound stamp. When the platform cannot prove dev/ino
-            // identity, the stamp is the only remaining fence — and a file
-            // with neither provable identity nor stamp cannot prove a later
-            // sighting is the same file, so the first sighting itself seals
-            // rather than trusting whatever file grows at this path
-            // (Codex 7038274368: zero-identity platform recovers a
-            // replacement).
-            let admissible = match (reference_btime, btime_ns) {
-                (Some(expected), Some(current)) => expected == current,
-                // First sighting: `register_task` seeds `seen_dev` only when
-                // a file existed at submit, so `seen_dev = None` means this
-                // dispatch never bound any file identity; the scan binds
-                // this stamp below and it becomes the replacement fence.
-                (None, Some(_)) => task.session_evidence_seen_dev.is_none(),
-                // No provable identity and no bound stamp — a platform
-                // without dev/ino and without a creation stamp cannot
-                // prove a later sighting is the same file.
-                _ => false,
-            };
+            // Empty-baseline evidence needs a dev/ino identity fence plus
+            // the bound creation stamp to separate an append from a
+            // delete+recreate. A first sighting records `seen_*` below and
+            // a later sighting must keep both. Creation stamps alone are
+            // NOT identity: two different files can share one (they can be
+            // set equal), so a platform that cannot prove dev/ino (non-Unix
+            // `file_identity` yields `(0,0)`) must seal the first sighting
+            // itself — a replacement with a forged-equal stamp would
+            // otherwise be admitted and its growth wrongly recover the
+            // task (Codex 7038569024). A file with neither identity nor
+            // stamp seals the same way.
+            let provable_identity = dev != 0 || ino != 0;
+            let admissible = provable_identity
+                && match (reference_btime, btime_ns) {
+                    (Some(expected), Some(current)) => expected == current,
+                    // First sighting: `register_task` seeds `seen_dev` only
+                    // when a file existed at submit, so `seen_dev = None`
+                    // means this dispatch never bound any file identity;
+                    // the scan binds this stamp below as the fence.
+                    (None, Some(_)) => task.session_evidence_seen_dev.is_none(),
+                    _ => false,
+                };
             if !admissible {
                 task.session_evidence_closed = true;
                 return TranscriptScan::Observed;
@@ -13693,9 +13693,9 @@ mod tests {
     }
 
     /// user dispatcher | Given a platform with no dev/ino identity but a
-    /// creation stamp | When the first sighting's file is replaced | Then the
-    /// bound stamp seals the replacement while the same file may still
-    /// recover (Codex 7038274368).
+    /// creation stamp | When a file appears, is replaced, or grows | Then
+    /// every sighting seals — an equal creation stamp is forgeable and is
+    /// not an identity fence (Codex 7038569024).
     #[test]
     fn user_stamp_only_platform_still_fences_replacements() {
         let path = env::temp_dir().join(format!(
@@ -13708,14 +13708,15 @@ mod tests {
         register_idle_task(&registry, task_id, "w1:p1");
         age_for_activity_timeout(&registry, task_id);
         TEST_FILE_IDENTITY.set(Some((0, 0)));
+        TEST_FILE_CREATED_NS.set(Some(Some(1_000_000)));
+        // First sighting seals even though a stamp exists: without dev/ino,
+        // a replacement created with the same stamp is indistinguishable.
         fs::write(&path, b"").unwrap();
-        let bound = registry.reconcile_task(task_id).unwrap().unwrap();
-        assert!(!bound.session_evidence_closed);
-        assert_eq!(bound.session_evidence_seen_len, Some(0));
-        let bound_stamp = bound.session_evidence_seen_btime_ns;
-        assert!(bound_stamp.is_some());
-        // Delete + recreate: the new stamp differs from the bound one and
-        // seals — even though the first file produced no dev/ino identity.
+        let first = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(first.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(first.session_evidence_closed);
+        // A replacement reporting an identical stamp must not recover the
+        // task — equal stamps are not identity.
         fs::remove_file(&path).unwrap();
         fs::write(
             &path,
@@ -13724,6 +13725,7 @@ mod tests {
         .unwrap();
         let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
         TEST_FILE_IDENTITY.set(None);
+        TEST_FILE_CREATED_NS.set(None);
         assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
         assert!(sealed.session_evidence_closed);
 
