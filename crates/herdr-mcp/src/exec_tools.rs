@@ -17,7 +17,7 @@ const MAX_TYPED_ARGS: usize = 128;
 /// missing/outdated broker, resolution error, a real path that is not a
 /// directory, or a real path that no longer spells the declared root — is
 /// `not_delivered` so no pane is created and no command is sent.
-fn verify_protected_exec_root(snapshot: &Value, root: &Path) -> Result<(), Value> {
+fn verify_protected_exec_root(snapshot: &Value, root: &Path) -> Result<std::path::PathBuf, Value> {
     let response = match protected_exec_real_path(snapshot, root) {
         Ok(response) => response,
         Err(message) => {
@@ -45,7 +45,7 @@ fn verify_protected_exec_root(snapshot: &Value, root: &Path) -> Result<(), Value
         .map(std::path::PathBuf::from);
     let is_dir = response.get("is_dir").and_then(Value::as_bool) == Some(true);
     match real {
-        Some(real) if is_dir && fs_security::same_declared_spelling(&real, root) => Ok(()),
+        Some(real) if is_dir && fs_security::same_declared_spelling(&real, root) => Ok(real),
         _ => Err(json!({
             "ok": false,
             "reason": "protected_root_identity_mismatch",
@@ -200,6 +200,7 @@ pub fn start(
         Err(error) => return error,
     };
     let topology = projects::derive_routing_cached(snapshot);
+    let mut verified_real: Option<std::path::PathBuf> = None;
     let protected_root =
         crate::macos_permissions::project_path_needs_protected_transport(Path::new(root))
             || forced_protected_transport(Path::new(root));
@@ -217,10 +218,14 @@ pub fn start(
         // lexical — it cannot see a protected root swapped for a symlink after
         // the topology was derived, so the authorized stable broker must
         // re-prove the cd target is the declared directory before any pane is
-        // created. Every failure is not_delivered: no pane, no command.
-        if let Err(error) = verify_protected_exec_root(snapshot, &managed.root) {
-            return error;
-        }
+        // created. Every failure is not_delivered: no pane, no command. The
+        // broker's real path is rebound inside the pane script so the
+        // executed `cd` must land on the same directory identity — a swap
+        // after this check cannot redirect where the command runs.
+        verified_real = match verify_protected_exec_root(snapshot, &managed.root) {
+            Ok(real) => Some(real),
+            Err(error) => return error,
+        };
     }
     if !protected_root {
         if !managed.real.is_dir() {
@@ -260,6 +265,7 @@ pub fn start(
             workspace_id,
             &managed.real,
             &rendered,
+            verified_real.as_deref(),
         )
     } else {
         let started = match &invocation {
