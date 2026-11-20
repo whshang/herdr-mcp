@@ -1307,7 +1307,15 @@ impl ExecRegistry {
             .lock()
             .ok()
             .and_then(|recovered| recovered.get(id).cloned())?;
-        if !state.starts_with("settle_failed") {
+        // `closed_before_restart` is a settled-dead state: the process was
+        // confirmed gone before this runtime started and the settle write
+        // succeeded. A `settle_failed:*` row is the same proof with an
+        // unwritable DB. Both may serve a committed spool — `exit_code` and
+        // `signal` stay absent because the spool is the only honest evidence
+        // (Codex 7030542301 P1). States whose process may still be alive
+        // (`reaped_on_restart` pending SIGKILL, `detached_unverified`) never
+        // reach this gate.
+        if state != "closed_before_restart" && !state.starts_with("settle_failed") {
             return None;
         }
         let record = ClosedExecSessionRecord {
@@ -1357,6 +1365,15 @@ impl ExecRegistry {
         })?;
         let mut record = record;
         if record.ended_at_ms.is_none() && record.expires_at_ms.is_none() {
+            // Codex 7030542301 P1: verify the spool BEFORE binding a TTL. A
+            // still-active pidless pane row reaches this branch too; binding
+            // `ended_at`/`expires_at` first lets a later prune delete the row
+            // while the pane is alive. Only a row with committed, non-corrupt
+            // spool evidence is proven complete enough to expire.
+            let probe = load_session_from_spool_or_record(&self.inner.state_dir, &record);
+            if probe.evidence_missing || probe.spool_corrupt {
+                return Some(probe);
+            }
             let ended_at = now_ms();
             let expires_at = ended_at.saturating_add(SESSION_TTL_MS);
             if let Ok(store) = self.inner.state_store.lock()
@@ -1366,6 +1383,10 @@ impl ExecRegistry {
             {
                 record.ended_at_ms = Some(ended_at);
                 record.expires_at_ms = Some(expires_at);
+            } else {
+                // Another reader settled the row (or it vanished): the probe
+                // is already a truthful completed session; serve it as-is.
+                return Some(probe);
             }
         }
         let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
@@ -4623,6 +4644,88 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
     }
 
+    /// user operator | Given a restart leaves a pid-less pane row whose
+    /// spool has NOT committed | When the session is read, the spool later
+    /// lands, and the TTL expires | Then the live-pane read never binds a
+    /// TTL, the completed spool read binds one honestly, and prune removes
+    /// only the bounded row (Codex 7030542301 P1).
+    #[test]
+    fn user_operator_reading_a_live_pane_never_binds_its_ttl() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-live-pane-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        store
+            .record_pane_exec_running("es_live_pane", now_ms())
+            .unwrap();
+        drop(store);
+
+        let registry = ExecRegistry::new(path.clone()).unwrap();
+        // First read of a still-active pane: no committed spool exists, so
+        // the row is incomplete evidence — and, critically, must NOT gain
+        // ended_at/expires_at. Under the old bind-first order this read
+        // alone started the row's deletion clock.
+        let live = registry.read("es_live_pane", "stdout", 0, 64);
+        assert_eq!(live["ok"], false, "{live}");
+        assert_eq!(live["reason"], "session_evidence_incomplete");
+        let row = registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_unsettled_exec_session("es_live_pane")
+            .unwrap()
+            .expect("the live pane row stays");
+        assert_eq!(row.ended_at_ms, None, "a live pane read must not bind");
+        assert_eq!(row.expires_at_ms, None, "a live pane read must not bind");
+
+        // The pane finishes and its spool commits: the next read serves the
+        // real evidence and only NOW binds the TTL.
+        let finished = unpersisted_closed_session("es_live_pane", "live-done\n");
+        write_session_spool(&path, &finished).unwrap();
+        let done = registry.read("es_live_pane", "stdout", 0, 64);
+        assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(done["text"], "live-done\n");
+        assert!(
+            done["exit_code"].is_null(),
+            "no exit code is invented for a spool-only completion: {done}"
+        );
+        let bounded = registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_unsettled_exec_session("es_live_pane")
+            .unwrap()
+            .expect("the completed row is now bounded");
+        assert!(bounded.ended_at_ms.is_some());
+        assert!(bounded.expires_at_ms.is_some());
+
+        registry
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .expire_exec_session_for_test("es_live_pane", 1)
+            .unwrap();
+        registry.prune();
+        assert!(
+            registry
+                .inner
+                .state_store
+                .lock()
+                .unwrap()
+                .get_unsettled_exec_session("es_live_pane")
+                .unwrap()
+                .is_none(),
+            "the completed row expires on schedule"
+        );
+        drop(registry);
+        let _ = fs::remove_dir_all(&path);
+    }
+
     /// user operator | Given a real native command whose spool committed but
     /// both state updates failed | When the dead process is recovered after
     /// restart | Then the committed spool is readable and no exit code is
@@ -4818,12 +4921,16 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
     }
 
+    /// user operator | Given a crash committed the spool but not the state
+    /// write | When recovery settles the dead process as
+    /// `closed_before_restart` | Then the committed spool is readable and no
+    /// exit code is invented (Codex 7030542301 P1).
     #[test]
-    fn spool_written_before_settle_survives_crash_window() {
+    fn user_operator_reads_spool_after_closed_before_restart_settle() {
         // Crash between `persist_session_spool` and `settle_closed_evidence`:
-        // the row stays `running`, the spool exists. Restart recovery settles
-        // it as closed_before_restart — an honest recovery refusal, never a
-        // completed session with empty output.
+        // the row stays `running`, the spool exists. Restart recovery
+        // settles it as closed_before_restart — the DB was writable, the
+        // common case — and the committed spool is the honest evidence.
         let path = env::temp_dir().join(format!(
             "herdr-mcp-exec-spool-first-crash-{}-{}",
             std::process::id(),
@@ -4840,9 +4947,13 @@ mod tests {
 
         let restarted = ExecRegistry::new(path.clone()).unwrap();
         let view = restarted.read("es_crash_mid", "both", 0, 64);
-        assert_eq!(view["ok"], false);
-        assert_eq!(view["reason"], "session_recovered_after_restart");
-        assert_eq!(view["recovery_state"], "closed_before_restart");
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["phase"], "completed");
+        assert_eq!(view["text"], "mid-crash-output\n");
+        assert!(
+            view["exit_code"].is_null(),
+            "a settled-dead recovery serves the spool, never an invented exit: {view}"
+        );
 
         drop(restarted);
         let _ = fs::remove_dir_all(&path);
