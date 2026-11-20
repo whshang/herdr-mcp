@@ -22,6 +22,12 @@ const POLL_BACKOFF: [Duration; 6] = [
 ];
 /// A child reaped by its spawning call within this window cannot outlive a
 /// daemon restart, so it is never written to the on-disk orphan registry.
+///
+/// Trade-off (#1050 review): if the daemon dies inside this window, the child
+/// was never recorded, so boot-time orphan reaping cannot find it. The window
+/// is deliberately tiny (25 ms) and only covers commands that finish almost
+/// immediately; anything longer is registered before the daemon could next
+/// crash on a request path.
 const REGISTRATION_GRACE: Duration = Duration::from_millis(25);
 
 #[cfg(target_os = "macos")]
@@ -248,6 +254,12 @@ fn wait_with_deferred_registration<S, T, R>(
     }
     if clock.now() >= deadline {
         return Ok((None, None));
+    }
+    // The grace boundary can land on a child that just exited: poll once more
+    // before writing the registry entry, so a dead pid is never recorded and
+    // later "reaped" on boot (#1050 review).
+    if let Some(value) = poll(state)? {
+        return Ok((Some(value), None));
     }
     let registration = register(state);
     let value = poll_until(clock, deadline, &mut backoff, || poll(state))?;
@@ -1103,6 +1115,64 @@ mod poll_tests {
         assert!(registration.is_none());
         assert_eq!(registrations, 0);
         assert_eq!(clock.now(), started + Duration::from_millis(5));
+    }
+
+    /// user never gets a dead child registered | Given a child whose exit is
+    /// only visible on the poll that runs after the registration grace window |
+    /// When the waiter re-checks liveness before writing the orphan registry |
+    /// Then nothing is registered and the exit status is returned (#1050 review).
+    #[test]
+    fn child_exiting_at_the_grace_boundary_is_not_registered() {
+        // The exit has to land *after* the last poll inside `poll_until` and on
+        // the pre-register check, otherwise this only re-tests the grace loop.
+        // Discover the loop's poll count instead of hardcoding it, so a backoff
+        // change keeps the test pointed at the same window.
+        let grace_polls = {
+            let probe = FakeClock::new();
+            let started = probe.now();
+            let mut backoff = PollBackoff::default();
+            let mut polls = 0_u32;
+            poll_until(&probe, started + REGISTRATION_GRACE, &mut backoff, || {
+                polls += 1;
+                Ok(None::<u8>)
+            })
+            .expect("probe poll");
+            polls
+        };
+        assert!(grace_polls > 0, "the grace window must poll at least once");
+
+        let clock = FakeClock::new();
+        let started = clock.now();
+        let mut polls = 0_u32;
+        let mut registrations = 0_u32;
+        let (status, registration) = wait_with_deferred_registration(
+            &clock,
+            &mut (),
+            started,
+            Duration::from_secs(5),
+            REGISTRATION_GRACE,
+            |_| {
+                polls += 1;
+                if polls > grace_polls {
+                    Ok(Some(7_u8))
+                } else {
+                    Ok(None)
+                }
+            },
+            |_| registrations += 1,
+        )
+        .expect("wait result");
+        assert_eq!(
+            polls,
+            grace_polls + 1,
+            "the exit must be observed by the pre-register liveness poll"
+        );
+        assert_eq!(status, Some(7));
+        assert!(
+            registration.is_none(),
+            "a child that exited before registration must not be recorded"
+        );
+        assert_eq!(registrations, 0);
     }
 
     #[test]

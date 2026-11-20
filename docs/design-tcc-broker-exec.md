@@ -63,7 +63,7 @@ Adding `exec` creates the following amplification surfaces:
 | --- | --- | --- |
 | Remote/Edge caller sends arbitrary command to a TCC-holding process | Impossible — allowlist rejects unknown ops; no op accepts a shell string | **New surface**: the broker's child inherits the broker's TCC grants. A command string reaching the broker would run with FDA-level rights. This is the single largest amplification and the reason the op must be constrained to a command *template allowlist* or a flag-restricted program, not raw argv. |
 | Compromised broker binary | Signed binary + `inspect_code_identity` / `installed_compat_state` checks | Unchanged, but impact grows: a tampered broker that can exec is a full FDA backdoor. Signing/identity verification becomes mandatory, not advisory. |
-| Local non-runtime caller writes a request to the broker socket | Mitigated by `runtime_owner_token` binding | Must be kept: socket directory permissions + owner token are the only caller-identity channel (§3). |
+| Local same-user process tries to borrow the runtime's authority | **No broker socket exists today.** The runtime spawns the installed broker as a one-shot child and hands it the request over stdin; a same-user process that executes the broker binary itself is indistinguishable from that child and gets exactly the *current* fs/git allowlist — no runtime authority, no `exec`, and the `HERDR_MCP_TCC_BROKER_CHILD=1` fence still applies | **New surface**: once `exec` exists and a broker daemon socket is considered, caller identity must be authenticated by the future layers in §3 (0700 socket dir + peer credentials + peer image + `runtime_owner_token` binding). None of that exists today. |
 | Request bypasses workspace scoping | fs ops are path-validated under managed roots | An exec op must bind the working directory to the managed roots set and reject `cwd` escapes, `..`, symlinks out of the root. |
 | Environment variable injection (`DYLD_INSERT_LIBRARIES`, `PATH`, `SHELL`, `HOME` redirection) | N/A today | Broker child env must be a fixed minimal set (§4). `DYLD_*` on the broker's *own* process is already neutralized by signing + SIP; the child env is a fresh attack vector. |
 | Shell metacharacter / argv smuggling | N/A | If templates are allowed, template argv must be literal-token-only; no second-shell expansion. Prefer fixed-program + flag-subset over free argv. |
@@ -71,9 +71,12 @@ Adding `exec` creates the following amplification surfaces:
 | Runaway child after timeout | ExecRegistry reaps native children | Broker must reap the full process group (`setsid` + `killpg`) and audit the kill (§6). |
 | Denial-of-service via exec flood | Link applies rate/lease budgets | Broker needs a per-caller concurrency cap (e.g. 4) + queue bound; without it, a busy loop could pin TCC-holding CPU/IO. |
 
-**Privilege amplification summary:** today, a caller that can reach the broker
-socket can read/write protected *files within managed roots*; with `exec`, that
-caller could read/write/execute *anything* the user's TCC grants cover —
+**Privilege amplification summary:** today the broker is not a server. The
+runtime runs the installed broker binary as a one-shot child over pipes, so the
+only reachable surface is the existing fs/git allowlist applied to managed roots
+— for the runtime *and* for any same-user process that runs the binary itself.
+With `exec`, whoever can reach the broker could read/write/execute *anything*
+the user's TCC grants cover —
 an amplification from managed-root FS to all-protected-paths + arbitrary code.
 This is only acceptable if the executed surface stays at or below the semantic
 power of the current fs/git allowlist (i.e. bounded, non-shell operations), or
@@ -82,29 +85,53 @@ itself unprotected.
 
 ## 3. Caller identity verification
 
-Layers, weakest to strongest:
+### 3.1 What exists today (parent→child pipe boundary)
 
-1. **Socket directory + requester peer credentials.** The broker socket lives
-   under `~/.config/herdr-mcp/` with 0700. On macOS, verify `LOCAL_PEERCRED`
-   (pid) and confirm the peer's executable image is the active runtime
-   (`runtime/current/herdr-mcp` via `csops`/proc_pidinfo image path), not merely
-   any same-uid process. Same-uid is necessary but not sufficient: any user-owned
-   binary can connect — image-path verification binds requests to the managed
-   runtime.
-2. **`runtime_owner_token` (existing).** The runtime proves it wrote the
-   request file by embedding its per-instance owner token; broker rejects
-   requests whose token does not match the runtime owner record. Keep this.
-3. **Broker code identity (existing).** `inspect_code_identity`,
-   `installed_compat_state`, `installed_compat_revision` verify the broker's
-   signature/TeamID and protocol revision before the runtime delegates. For an
-   exec op, the runtime must require `installed_compat_revision >= <new rev>`
-   and refuse to send `exec` to a pre-exec broker (fail closed, fall back to
-   `utility_pane`).
-4. **Replay protection.** Request ids must be monotonic per runtime generation
-   and the broker must reject a request already seen (idempotency at the
-   broker layer, aligned with #332 D-2 ledger semantics).
-5. **Rate limiting.** Broker enforces per-peer-pid concurrency and a global
-   exec ops/sec ceiling; violations are audited (§6), not just refused.
+There is **no broker socket, no listener and no peer-credential check**. The
+runtime executes the installed broker as a one-shot child
+(`crates/herdr-mcp/src/tcc_broker.rs::run_broker_child`), writes one bounded
+request to the child's stdin and reads one JSON response from stdout
+(`run_broker_once` → `parse_request`, which accepts exactly
+`protocol`/`version`/`op`/`snapshot`/`args`). What is enforced:
+
+1. **Spawn-time binary identity.** The broker path must be a regular file, not a
+   symlink; `inspect_code_identity` / `installed_compat_state` /
+   `installed_compat_revision` verify signature/TeamID and protocol revision
+   *before* the runtime delegates. This answers "did we spawn the binary we
+   expect", not "who called".
+2. **Recursion fence.** `is_broker_child_process` checks
+   `HERDR_MCP_TCC_BROKER_CHILD == "1"` (`tcc_broker.rs:94`, set for the child by
+   `macos_permissions.rs:1791`) and stops a broker child from re-entering
+   protected-path routing.
+3. **Request-shape allowlist.** Exact top-level keys, one allowlisted `op`, and
+   fs ops still path-validate under managed roots (unchanged behaviour).
+
+Consequence to state plainly: a same-user process that runs the installed broker
+binary directly looks exactly like the runtime's child to the broker, and gets
+the same allowlist. That is acceptable only while the allowlist stays at the
+current fs/git power; it is **not** an identity boundary for a future `exec`.
+
+### 3.2 Required before tier-1 `exec` (or before any broker daemon socket)
+
+None of the following exists; each is a design-and-implementation precondition,
+tracked with the token item in §9:
+
+1. **Socket directory + requester peer credentials.** If the broker grows a
+   daemon socket, it must live under `~/.config/herdr-mcp/` with 0700 and verify
+   `LOCAL_PEERCRED` (pid) plus the peer's executable image path
+   (`runtime/current/herdr-mcp` via `csops`/proc_pidinfo), not merely same-uid.
+2. **`runtime_owner_token` binding and rotation.** The request would carry the
+   runtime's per-instance owner token, the broker would compare it with the
+   runtime owner record on every request, a mid-connection rotation would fail
+   closed, and a restart would load only the current owner record (§9).
+3. **Replay protection.** Request ids monotonic per runtime generation, with a
+   broker-side seen-request table (§9 item).
+4. **Rate limiting.** Per-caller concurrency cap and a global exec ops/sec
+   ceiling; violations audited (§5), not just refused.
+
+Until 1–4 are implemented together, enabling `exec` would put arbitrary
+TCC-scoped execution behind a boundary that authenticates nothing beyond "this
+is some same-user process running our signed binary".
 
 Non-goals: the broker does not authenticate the *Edge caller* end-to-end; the
 runtime remains the accountability boundary. The broker's job is to refuse
@@ -161,7 +188,7 @@ PATH=<fixed runtime-managed path list>   # never caller-provided
 HOME=<requester's $HOME>
 LANG / LC_ALL / TZ                       # locale only
 TMPDIR=<broker-created 0700 dir>
-HERDR_TCC_BROKER_EXEC=1                  # marker for children to detect broker context
+HERDR_MCP_TCC_BROKER_CHILD=1             # marker for children to detect broker context
 ```
 
 Explicitly dropped: `DYLD_*`, `PATH`/`SHELL`/`BASH_ENV`/`ENV`/`CDPATH`/`IFS`/
@@ -189,6 +216,9 @@ keys in v1.
 - **Audit log:** append-only JSONL at
   `~/.config/herdr-mcp/broker-audit/<YYYY-MM-DD>.jsonl`, one line per request:
   `{ts, request_id, peer_pid, peer_image, op:"exec", program, argv_len, cwd_root, outcome, exit_code, duration_ms, output_bytes, killed}`.
+  `peer_pid` / `peer_image` only become meaningful once §3.2 layer 1 exists; today
+  the broker is a pipe child, so the audit line records the parent runtime pid
+  (nothing about an independent caller).
   Program name and argv *length* are logged; argv content is logged only at
   `debug` level and never includes env values. Audit entries are what make
   the amplification reviewable.
@@ -218,6 +248,18 @@ mcp herdr_exec {workspace, project_root, command:"printf ok", timeout_ms:30000, 
 ```
 
 ### 6.2 Raw samples
+
+**Collection environment and time.** Samples were collected on 2026-11-18 on
+two macOS workstations (TCC-protected vs. home root) with the `herdr-mcp`
+runtime at `v1.2.0` and the pinned Herdr TUI `0.9.5`. The two utility-pane rows
+are 10 consecutive measured runs each after one warmup. The native rows are
+**not** the same length: the E2E array holds 9 measured runs plus a separately
+reported warmup (~4500 ms), while its `internal ms` array holds 10 values — the
+original capture kept one E2E sample out of the table, so compare medians and
+outlier counts rather than pairing E2E with `internal` element by element. Re-measure before treating these
+numbers as a current baseline — runtime and Herdr versions both affect the
+utility-pane overhead, and this table is evidence for the design trade-off, not
+a release gate.
 
 **Protected path — `backend:"utility_pane"`**, macOS device A
 (`dev_<device-A>`), workspace `<ws-A>`,
@@ -276,6 +318,27 @@ per-command latency, which is Edge-dominated anyway.
 
 ## 7. Proposed request/response contract (v1, tier 1)
 
+**Implementation precondition.** This contract is a proposal, and the
+`runtime_owner_token` field below **is not accepted by the current broker**:
+`parse_request` in `crates/herdr-mcp/src/tcc_broker.rs` accepts exactly
+`protocol`, `version`, `op`, `snapshot` and `args`, and rejects any other
+top-level key. Before tier-1 exec lands, three things must be designed and
+implemented together (tracked as the “`runtime_owner_token` support and
+rotation” item in §9):
+
+1. the token joins the request schema and the broker verifies it against the
+   runtime owner record on every request;
+2. a mid-connection rotation fails closed (no weaker fallback, no retry under
+   the old token);
+3. a broker restart loads only the current owner record and never authorizes a
+   request with a token cached from before the restart.
+
+Until all three exist, tier-1 exec mediation stays unimplemented. Note what the
+current boundary really is (§3.1): a one-shot parent→child pipe, a
+regular-file/signature check on the broker binary before spawn, and the request
+schema allowlist. There is no socket, no peer-credential check and no caller
+authentication today, so none of the layers above may be described as existing.
+
 ```jsonc
 // request
 {
@@ -326,5 +389,22 @@ Error codes mirror the runtime's: `outside_managed_roots`, `program_not_allowed`
   is a runtime concept.)
 - Pane-occupancy vs broker-process cost under concurrent `herdr_exec` (10+
   parallel calls) — needs the real workload measurement once implemented.
+- **`runtime_owner_token` support and rotation (§7 precondition).** The
+  current broker request schema has no token field and performs no token check
+  (`parse_request` accepts only `protocol`/`version`/`op`/`snapshot`/`args`), so
+  this is a design-and-implementation gap, not a parameter to tune. Three
+  things must be written down before tier-1 exec mediation lands:
+  1. *Schema and per-request verification* — the token joins the request shape
+     and the broker compares it with the runtime owner record on every request
+     (§7).
+  2. *Mid-connection rotation* — when the runtime writes a new owner token while
+     a broker request is in flight, the request either fails closed as
+     `owner_token_mismatch` (no weaker fallback, no retry on the old token) or
+     the broker re-reads the owner record and accepts the new token. Leaning
+     fail-closed: a request admitted under an older token must not silently
+     continue under a newer authority.
+  3. *Broker restart* — a restart must load the current owner record only; a
+     stale token cached from before the restart may never authorize a request.
+  The §7 precondition refers to this item; nothing here is implemented yet.
 - Windows/Linux parity: broker is macOS-only; the `backend` contract must
   degrade identically on other OSes (they already take `native`).
