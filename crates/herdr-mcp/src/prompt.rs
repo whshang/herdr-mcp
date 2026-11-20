@@ -398,6 +398,12 @@ struct PromptTaskRecord {
     /// filesystem cannot report it: later growth then fails closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_evidence_btime_ns: Option<u64>,
+    /// Creation stamp (ns since epoch) of the last observed file. A missing-
+    /// at-submit baseline binds its identity on first observation, so a
+    /// later delete+recreate that reuses the inode still fails the creation
+    /// check. None when the filesystem cannot report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_btime_ns: Option<u64>,
     /// Why this task may still leave `delivery_uncertain`. Independent of
     /// `notification_error`, which parent notification reuses and clears.
     /// `recovery_closed` means a boot change, history gap, rotation, or
@@ -999,6 +1005,7 @@ impl PromptRegistry {
             session_evidence_seen_ino: session_evidence.ino,
             session_evidence_seen_len: session_evidence.bytes,
             session_evidence_btime_ns: session_evidence.btime_ns,
+            session_evidence_seen_btime_ns: session_evidence.btime_ns,
             delivery_uncertain_reason: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
@@ -2320,27 +2327,37 @@ impl PromptRegistry {
         let _ = store.put_operation_ledgers_atomic(&inputs);
     }
 
+    /// Reconcile every still-active task and deliver pending terminal
+    /// notifications. Both lists are unbounded by the recent-window cap: a
+    /// recoverable timeout older than 512 newer writes must still be seen by
+    /// the tracker and periodic passes (Codex 7037362769 / Claude 7037794826).
     fn reconcile_active_tasks(&self) {
         self.repair_supersession_gaps();
-        let Ok(tasks) = self.list_tasks(512) else {
-            return;
-        };
-        for task in tasks {
-            // A recoverable activity timeout is terminal in the ledger but
-            // must still be reconciled here: the tracker/event path is the
-            // only caller that runs without an inbox request.
-            if task.is_terminal() && !delivery_timeout_can_recover(&task) {
-                if task.notification_state == "pending" {
-                    self.maybe_notify_parent(&task);
-                }
-            } else {
+        if let Ok(tasks) = self.list_active_tasks() {
+            for task in &tasks {
                 let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+        if let Ok(tasks) = self.list_terminal_tasks() {
+            for task in &tasks {
+                // A recoverable activity timeout is terminal in the ledger
+                // but must still be reconciled here: the tracker/event path
+                // is the only caller that runs without an inbox request.
+                if delivery_timeout_can_recover(task) {
+                    let _ = self.reconcile_task(&task.task_id);
+                } else if task.notification_state == "pending" {
+                    self.maybe_notify_parent(task);
+                }
             }
         }
     }
 
+    /// Unbounded scan for terminal tasks that may still leave
+    /// `delivery_uncertain`: a recoverable timeout past the recent window is
+    /// reconciled on the periodic/tracker path instead of waiting for an
+    /// inbox request. `list_terminal_tasks` is not capped at 512.
     fn reconcile_recoverable_timeouts(&self) {
-        let Ok(tasks) = self.list_tasks(512) else {
+        let Ok(tasks) = self.list_terminal_tasks() else {
             return;
         };
         for task in tasks {
@@ -2766,11 +2783,15 @@ impl PromptRegistry {
         }
         let Some(cache) = self.inner.cache.as_ref() else {
             // No event cache: file growth is the only remaining evidence, and
-            // there is no boot cursor to distrust.
-            if delivery_timeout_can_recover(&task) && self.session_transcript_grew(&mut task) {
+            // there is no boot cursor to distrust. The scan still runs so a
+            // first-sighting identity or a seal is persisted even when this
+            // task is not currently recoverable.
+            let scan = self.session_transcript_grew(&mut task);
+            if scan == TranscriptScan::Grew && delivery_timeout_can_recover(&task) {
                 note_transcript_delivery(&mut task, self.now_ms());
                 changed = true;
             }
+            changed |= scan != TranscriptScan::Unchanged;
             changed |= task.session_evidence_closed;
             if changed {
                 self.persist_reconciled_task(&mut task, task_id)?;
@@ -2803,13 +2824,19 @@ impl PromptRegistry {
                 task.last_cursor = digest.cursor;
                 changed = true;
             }
-        } else if delivery_timeout_can_recover(&task) && self.session_transcript_grew(&mut task) {
-            // Growth is the delivery fact. Apply the batch after leaving the
-            // timeout so a done or pane_closed in this same window can settle.
-            note_transcript_delivery(&mut task, self.now_ms());
-            changed = true;
-            changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
         } else {
+            // The scan runs whether or not this task is currently
+            // recoverable: a first-sighting identity or a seal must persist,
+            // and a matching event may still settle a gate-held task.
+            let scan = self.session_transcript_grew(&mut task);
+            if scan == TranscriptScan::Grew && delivery_timeout_can_recover(&task) {
+                // Growth is the delivery fact. Apply the batch after leaving
+                // the timeout so a done or pane_closed in this same window
+                // can settle.
+                note_transcript_delivery(&mut task, self.now_ms());
+                changed = true;
+            }
+            changed |= scan != TranscriptScan::Unchanged;
             changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
         }
         changed |= task.session_evidence_closed;
@@ -2999,20 +3026,40 @@ impl PromptRegistry {
         None
     }
 
-    fn session_transcript_grew(&self, task: &mut PromptTaskRecord) -> bool {
+    /// Whether the transcript scan changed durable evidence or proved growth.
+    /// `Observed` means the recorded file identity moved (first observation
+    /// binds it, or the file was sealed); `Grew` additionally proves this
+    /// dispatch produced new bytes.
+    fn session_transcript_grew(&self, task: &mut PromptTaskRecord) -> TranscriptScan {
         let (Some(baseline), Some(path)) = (
             task.session_evidence_bytes,
             task.session_evidence_path.as_deref(),
         ) else {
-            return false;
+            return TranscriptScan::Unchanged;
         };
         // The offset belongs to the turn captured at submit. A rewritten
         // turn id means this file growth is no longer that dispatch's evidence.
         if task.session_evidence_closed
             || task.session_evidence_turn_id.as_deref() != task.turn_id.as_deref()
         {
-            return false;
+            return TranscriptScan::Unchanged;
         }
+        // The identity the file must keep: the submit baseline when a file
+        // existed then, else the first observed file's bound identity. A
+        // missing-at-submit baseline stays `None` only until first sighting;
+        // afterwards the seen_* identity is the fence.
+        let baseline_identity = task
+            .session_evidence_dev
+            .zip(task.session_evidence_ino)
+            .filter(|(dev, ino)| !(*dev == 0 && *ino == 0));
+        let seen_identity = task
+            .session_evidence_seen_dev
+            .zip(task.session_evidence_seen_ino)
+            .filter(|(dev, ino)| !(*dev == 0 && *ino == 0));
+        let identity = baseline_identity.or(seen_identity);
+        let reference_btime = task
+            .session_evidence_btime_ns
+            .or(task.session_evidence_seen_btime_ns);
         let (len, dev, ino, btime_ns) = match session_file_stat(Path::new(path)) {
             SessionFileStat::File {
                 len,
@@ -3020,33 +3067,24 @@ impl PromptRegistry {
                 ino,
                 btime_ns,
             } => (len, dev, ino, btime_ns),
-            // "missing at submit" is recorded as baseline 0 with no baseline
-            // device identity; that file may still be created after the
-            // dispatch. A file that existed at submit (identity present) and
-            // vanished later, or one that cannot be stat'ed, is sealed.
-            SessionFileStat::Missing
-                if baseline == 0
-                    && task.session_evidence_dev.is_none()
-                    && task.session_evidence_ino.is_none() =>
-            {
-                return false;
+            // "missing at submit" may still be created — but only while no
+            // file identity has ever been recorded. Once a file was observed
+            // (seen_* set), a missing stat is evidence of deletion and seals.
+            SessionFileStat::Missing if baseline == 0 && identity.is_none() => {
+                return TranscriptScan::Unchanged;
             }
             SessionFileStat::Missing | SessionFileStat::Unreadable => {
                 task.session_evidence_closed = true;
-                return false;
+                return TranscriptScan::Observed;
             }
         };
-        let identity = task
-            .session_evidence_dev
-            .zip(task.session_evidence_ino)
-            .filter(|(dev, ino)| !(*dev == 0 && *ino == 0));
         if len < baseline
             || task
                 .session_evidence_seen_len
                 .is_some_and(|seen| len < seen)
         {
             task.session_evidence_closed = true;
-            return false;
+            return TranscriptScan::Observed;
         }
         if task
             .session_evidence_seen_len
@@ -3055,30 +3093,31 @@ impl PromptRegistry {
             // The file was observed shorter than the submit baseline and then
             // grew past it. Those bytes are a rewrite, not this dispatch.
             task.session_evidence_closed = true;
-            return false;
+            return TranscriptScan::Observed;
         }
         if let Some((expected_dev, expected_ino)) = identity
             && (dev != expected_dev || ino != expected_ino)
         {
             task.session_evidence_closed = true;
-            return false;
+            return TranscriptScan::Observed;
         }
         if identity.is_none() && baseline > 0 {
             // A file that already had bytes but no device identity cannot
             // prove later bytes are the same file.
             task.session_evidence_closed = true;
-            return false;
+            return TranscriptScan::Observed;
         }
         if baseline == 0 && identity.is_some() {
-            // The baseline file existed but was empty, so no prefix digest
-            // can prove identity. A delete+recreate that reuses the inode is
-            // otherwise indistinguishable from an append; only a matching
-            // creation stamp keeps the file admissible.
-            match (task.session_evidence_btime_ns, btime_ns) {
+            // The reference file was empty (at submit or first sighting), so
+            // no prefix digest can prove identity. A delete+recreate that
+            // reuses the inode is otherwise indistinguishable from an
+            // append; only a matching creation stamp keeps the file
+            // admissible. Missing or unreadable stamps fail closed.
+            match (reference_btime, btime_ns) {
                 (Some(expected), Some(current)) if expected == current => {}
                 _ => {
                     task.session_evidence_closed = true;
-                    return false;
+                    return TranscriptScan::Observed;
                 }
             }
         }
@@ -3095,24 +3134,35 @@ impl PromptRegistry {
                 Some(current) if current == expected => {}
                 _ => {
                     task.session_evidence_closed = true;
-                    return false;
+                    return TranscriptScan::Observed;
                 }
             }
         } else if baseline > 0 {
             task.session_evidence_closed = true;
-            return false;
+            return TranscriptScan::Observed;
         }
+        let observed_changed = task.session_evidence_seen_dev != Some(dev)
+            || task.session_evidence_seen_ino != Some(ino)
+            || task.session_evidence_seen_len != Some(len)
+            || task.session_evidence_seen_btime_ns != btime_ns;
         task.session_evidence_seen_dev = Some(dev);
         task.session_evidence_seen_ino = Some(ino);
         task.session_evidence_seen_len = Some(len);
+        task.session_evidence_seen_btime_ns = btime_ns;
         // Bytes after the next same-path dispatch's baseline belong to that
         // later task. The window stamp is taken before `agent.prompt`, so a
         // slow registration cannot hide the later submit.
         let Ok(next) = self.next_session_baseline(task, path) else {
-            return false;
+            return TranscriptScan::Unchanged;
         };
         let end = next.unwrap_or(len).min(len);
-        end > baseline
+        if end > baseline {
+            TranscriptScan::Grew
+        } else if observed_changed {
+            TranscriptScan::Observed
+        } else {
+            TranscriptScan::Unchanged
+        }
     }
 
     /// Smallest baseline of a later submit on the same session file.
@@ -3477,6 +3527,7 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "session_evidence_seen_ino",
     "session_evidence_seen_len",
     "session_evidence_btime_ns",
+    "session_evidence_seen_btime_ns",
     "delivery_uncertain_reason",
 ];
 
@@ -4144,6 +4195,19 @@ impl SessionEvidence {
             prefix,
         }
     }
+}
+
+/// Result of one transcript scan, ordered by how strong the signal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptScan {
+    /// Nothing durable changed and the file did not grow past the baseline.
+    Unchanged,
+    /// The recorded file identity or seal state moved; persist it, but the
+    /// scan did not prove this dispatch produced new bytes.
+    Observed,
+    /// The file identity held and the window grew past the baseline: the
+    /// dispatch's transcript delivered.
+    Grew,
 }
 
 enum SessionFileStat {
@@ -13346,6 +13410,133 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    /// user dispatcher | Given a session file missing at submit that was then
+    /// observed empty | When it is deleted and replaced by a grown file |
+    /// Then the bound first-sighting identity seals the recovery: the new
+    /// file's bytes are not this dispatch's evidence (Codex 7037362769).
+    #[test]
+    fn user_first_sighting_binds_identity_and_a_replacement_stays_sealed() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-bind-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("bind-sight", session_snapshot(&path));
+        let task_id = "dispatch:prompt:bind-sight";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        // The file appears empty after the timeout but before any bytes are
+        // flushed: the scan binds (dev, ino, btime_ns, len=0) as the observed
+        // identity AND persists it — no growth yet, so the task stays
+        // delivery_uncertain with open evidence.
+        fs::write(&path, b"").unwrap();
+        let bound = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(bound.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(!bound.session_evidence_closed);
+        assert!(bound.session_evidence_seen_dev.is_some());
+        assert_eq!(bound.session_evidence_seen_len, Some(0));
+
+        // The observed file is deleted and a new file is created at the same
+        // path with content. Even when the filesystem reuses the inode, the
+        // new file has a different creation stamp; a different inode fails
+        // the identity check directly. Either way the bound identity seals.
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"other\"}}\n",
+        )
+        .unwrap();
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        // Force the observed identity to the replacement's inode so the
+        // creation stamp is the only remaining fence, making the outcome
+        // deterministic regardless of inode reuse.
+        task.session_evidence_seen_dev = Some(dev);
+        task.session_evidence_seen_ino = Some(ino);
+        registry.save_task(&task, None).unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a session file missing at submit that was
+    /// observed and then deleted | When reconcile runs while it is absent |
+    /// Then the bound identity treats the missing stat as deletion and seals
+    /// — a still-missing file is only open while nothing was ever sighted.
+    #[test]
+    fn user_observed_then_deleted_missing_at_submit_seals() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-seen-gone-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("seen-gone", session_snapshot(&path));
+        let task_id = "dispatch:prompt:seen-gone";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        fs::write(&path, b"").unwrap();
+        let bound = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert!(!bound.session_evidence_closed);
+        fs::remove_file(&path).unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user tracker | Given a recoverable timeout older than 512 newer
+    /// tasks | When the periodic/tracker pass runs | Then the windowed-out
+    /// task is still reconciled and recovered by transcript growth.
+    #[test]
+    fn user_recoverable_timeout_beyond_the_recent_window_still_recovers() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-window-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, _) = registry_with_snapshot("window-old", session_snapshot(&path));
+        let task_id = "dispatch:prompt:window-old";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        // 600 newer tasks push the recoverable row outside list_tasks(512)'s
+        // updated_at window. They use a different pane so no session baseline
+        // claims the grown bytes.
+        for index in 0..600 {
+            register_idle_task(
+                &registry,
+                &format!("dispatch:prompt:filler-{index}"),
+                "w1:p2",
+            );
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"late\"}}\n")
+            .unwrap();
+        registry.reconcile_recoverable_timeouts();
+        let recovered = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
     /// user tracker | Given a delivery_uncertain task whose transcript then
     /// grows | When the tracker pass runs without an inbox request | Then it
     /// recovers the task instead of waiting for the next status poll.
@@ -14360,6 +14551,7 @@ mod tests {
             session_evidence_seen_ino: None,
             session_evidence_seen_len: None,
             session_evidence_btime_ns: None,
+            session_evidence_seen_btime_ns: None,
             delivery_uncertain_reason: None,
         }
     }
@@ -16066,6 +16258,7 @@ mod tests {
             session_evidence_seen_dev: None,
             session_evidence_seen_ino: None,
             session_evidence_seen_len: None,
+            session_evidence_seen_btime_ns: None,
             session_evidence_btime_ns: None,
             delivery_uncertain_reason: None,
         }
