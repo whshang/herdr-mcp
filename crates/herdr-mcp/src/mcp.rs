@@ -1409,7 +1409,236 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             }
         }
     }
+    // #1094 P0-a: the same durable `client_request_id` ledger guards the
+    // first-class write tools — the contracts do not declare the field, so it
+    // arrives undeclared inside `params.arguments` (option (b), no epoch/hash
+    // change). `herdr_prompt` additionally keeps its native `idempotency_key`;
+    // D-1 means one call never holds both idempotency slots.
+    if let Some(kind) = client_request_tool_kind(name) {
+        if name == "herdr_prompt"
+            && arguments.get("client_request_id").is_some()
+            && arguments.get("idempotency_key").is_some()
+        {
+            return Ok(tool_result(
+                json!({
+                    "ok": false,
+                    "code": "invalid_params",
+                    "retryable": false,
+                    "delivery_state": "not_delivered",
+                    "message": "client_request_id and idempotency_key are mutually exclusive; submit exactly one idempotency key",
+                }),
+                true,
+            ));
+        }
+        if let Some(client_request_id) = arguments.get("client_request_id") {
+            match crate::request_ledger::validate_client_request_id(client_request_id) {
+                Err(invalid) => return Ok(tool_result(invalid, true)),
+                Ok(key) => {
+                    return write_tool_with_request_ledger(
+                        kind,
+                        &key,
+                        name,
+                        arguments,
+                        herdr_call_params,
+                        context,
+                        route,
+                    );
+                }
+            }
+        }
+    }
     dispatch_admitted_tool(name, arguments, herdr_call_params, context, route)
+}
+
+/// #1094 P0-a: durable-ledger kinds for the first-class write tools that
+/// accept `client_request_id` in `params.arguments`. Every other tool keeps
+/// its pre-existing dedupe surface.
+fn client_request_tool_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "herdr_fs_write" => Some(crate::durable_request_ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+        "herdr_fs_edit" => Some(crate::durable_request_ledger::HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+        "herdr_fs_patch" => Some(crate::durable_request_ledger::HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+        "herdr_prompt" => Some(crate::durable_request_ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        _ => None,
+    }
+}
+
+/// `client_request_id` on a first-class write tool goes through the same
+/// durable `operations` ledger as `herdr_call` — D-2: writes without a
+/// resolvable durable caller scope are refused before executing, never
+/// downgraded to the process-local fallback. A same-key replay of
+/// `herdr_prompt` returns the first dispatch's recorded result verbatim,
+/// which carries its `task_id`/`receipt_id`.
+#[allow(clippy::too_many_arguments)]
+fn write_tool_with_request_ledger(
+    kind: &str,
+    client_request_id: &str,
+    name: &str,
+    mut arguments: Value,
+    herdr_call_params: Option<Value>,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+) -> Result<Value, String> {
+    let now_ms = mutation_lease_now_ms();
+    let mut store = context
+        .state_store
+        .lock()
+        .map_err(|_| "state store lock is poisoned".to_owned())?;
+    let Some(scope) = crate::durable_request_ledger::durable_caller_scope(context, &store) else {
+        return Ok(tool_result(
+            crate::durable_request_ledger::durable_scope_unavailable_response(client_request_id),
+            true,
+        ));
+    };
+    let request_id =
+        crate::durable_request_ledger::preferred_client_request_id(context.wire_request_id);
+    // The key is ledger metadata, not tool payload: it leaves the request
+    // before the fingerprint and before dispatch so the tool never sees it.
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("client_request_id");
+    }
+    let ids = crate::durable_request_ledger::client_request_ids(
+        kind,
+        &scope,
+        name,
+        &arguments,
+        client_request_id,
+        &request_id,
+        false,
+    );
+    match crate::durable_request_ledger::durable_begin_or_replay(
+        &mut store,
+        &ids,
+        client_request_id,
+        &scope,
+        name,
+        &arguments,
+        false,
+        now_ms,
+    ) {
+        crate::durable_request_ledger::ClientRequestOutcome::Replay(replay) => {
+            let is_error = replay.get("ok").and_then(Value::as_bool) == Some(false);
+            Ok(tool_result(
+                model_visible_tool_output(name, &arguments, replay),
+                is_error,
+            ))
+        }
+        crate::durable_request_ledger::ClientRequestOutcome::Respond(body) => {
+            let is_error = body.get("ok").and_then(Value::as_bool) == Some(false);
+            Ok(tool_result(body, is_error))
+        }
+        crate::durable_request_ledger::ClientRequestOutcome::Execute { request_id } => {
+            drop(store);
+            execute_durable_ledgered_call(
+                &ids,
+                false,
+                name,
+                arguments,
+                herdr_call_params,
+                context,
+                route,
+                request_id,
+            )
+        }
+    }
+}
+
+/// Execute arm shared by the `herdr_call` and first-class-tool durable ledger
+/// paths: run the admitted dispatch, settle the row, and decorate the live
+/// response with `request_id`/`safe_retry_mode`.
+#[allow(clippy::too_many_arguments)]
+fn execute_durable_ledgered_call(
+    ids: &crate::durable_request_ledger::ClientRequestIds,
+    read_only: bool,
+    name: &str,
+    arguments: Value,
+    herdr_call_params: Option<Value>,
+    context: &RuntimeContext<'_>,
+    route: crate::runtime_adapter::PublicToolRoute,
+    request_id: String,
+) -> Result<Value, String> {
+    let (mut output, is_error) = match admitted_tool_output(
+        name,
+        arguments.clone(),
+        herdr_call_params,
+        context,
+        route,
+    ) {
+        Ok(AdmittedToolResult::Raw { output, is_error }) => (output, is_error),
+        // Envelope results bypass the raw projection, so the ledger
+        // records only that the call ran and whether it was an error —
+        // honest classification, never a fabricated request_timeout.
+        Ok(AdmittedToolResult::Envelope(response)) => {
+            let is_error = response
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Ok(mut store) = context.state_store.lock() {
+                crate::durable_request_ledger::durable_settle_result(
+                    &mut store,
+                    ids,
+                    &json!({"ok": !is_error, "code": if is_error { "envelope_error" } else { "ok" }}),
+                    read_only,
+                    mutation_lease_now_ms(),
+                );
+            }
+            return Ok(response);
+        }
+        // The tool call itself failed before producing a result: the
+        // mutation may or may not have run, so the record settles as
+        // `unknown` — never left pending to pin the key.
+        Err(error) => {
+            if let Ok(mut store) = context.state_store.lock() {
+                crate::durable_request_ledger::durable_settle_result(
+                    &mut store,
+                    ids,
+                    &json!({"ok": false, "code": "internal_error", "delivery_state": "delivery_unknown", "message": error}),
+                    read_only,
+                    mutation_lease_now_ms(),
+                );
+            }
+            return Err(error);
+        }
+    };
+    if let Some(object) = output.as_object_mut() {
+        object.insert("request_id".to_owned(), json!(request_id));
+    }
+    if let Ok(mut store) = context.state_store.lock() {
+        let settled = crate::durable_request_ledger::durable_settle_result(
+            &mut store,
+            ids,
+            &output,
+            read_only,
+            mutation_lease_now_ms(),
+        );
+        // safe_retry_mode is a fact of the first settlement, recorded
+        // in the ledger; the live response carries the same value so
+        // callers see one authoritative retry vocabulary.
+        if let Some(object) = output.as_object_mut() {
+            let mode = match settled {
+                crate::durable_request_ledger::DurableSettle::Completed => "none",
+                crate::durable_request_ledger::DurableSettle::RecordedUnknown => {
+                    "inspect_before_retry"
+                }
+                crate::durable_request_ledger::DurableSettle::Released => {
+                    if object
+                        .get("retryable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        "retry_after_resource_release"
+                    } else {
+                        "none"
+                    }
+                }
+            };
+            object.insert("safe_retry_mode".to_owned(), json!(mode));
+        }
+    }
+    Ok(tool_result(
+        model_visible_tool_output(name, &arguments, output),
+        is_error,
+    ))
 }
 
 /// 1.2/S2: `herdr_call` carrying `client_request_id` goes through the bounded
@@ -1492,88 +1721,16 @@ fn herdr_call_with_request_ledger(
         }
         crate::durable_request_ledger::ClientRequestOutcome::Execute { request_id } => {
             drop(store);
-            let (mut output, is_error) = match admitted_tool_output(
+            execute_durable_ledgered_call(
+                &ids,
+                read_only,
                 name,
-                arguments.clone(),
+                arguments,
                 herdr_call_params,
                 context,
                 route,
-            ) {
-                Ok(AdmittedToolResult::Raw { output, is_error }) => (output, is_error),
-                // Envelope results bypass the raw projection, so the ledger
-                // records only that the call ran and whether it was an error —
-                // honest classification, never a fabricated request_timeout.
-                Ok(AdmittedToolResult::Envelope(response)) => {
-                    let is_error = response
-                        .get("isError")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if let Ok(mut store) = context.state_store.lock() {
-                        crate::durable_request_ledger::durable_settle_result(
-                            &mut store,
-                            &ids,
-                            &json!({"ok": !is_error, "code": if is_error { "envelope_error" } else { "ok" }}),
-                            read_only,
-                            mutation_lease_now_ms(),
-                        );
-                    }
-                    return Ok(response);
-                }
-                // The tool call itself failed before producing a result: the
-                // mutation may or may not have run, so the record settles as
-                // `unknown` — never left pending to pin the key.
-                Err(error) => {
-                    if let Ok(mut store) = context.state_store.lock() {
-                        crate::durable_request_ledger::durable_settle_result(
-                            &mut store,
-                            &ids,
-                            &json!({"ok": false, "code": "internal_error", "delivery_state": "delivery_unknown", "message": error}),
-                            read_only,
-                            mutation_lease_now_ms(),
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            if let Some(object) = output.as_object_mut() {
-                object.insert("request_id".to_owned(), json!(request_id));
-            }
-            if let Ok(mut store) = context.state_store.lock() {
-                let settled = crate::durable_request_ledger::durable_settle_result(
-                    &mut store,
-                    &ids,
-                    &output,
-                    read_only,
-                    mutation_lease_now_ms(),
-                );
-                // safe_retry_mode is a fact of the first settlement, recorded
-                // in the ledger; the live response carries the same value so
-                // callers see one authoritative retry vocabulary.
-                if let Some(object) = output.as_object_mut() {
-                    let mode = match settled {
-                        crate::durable_request_ledger::DurableSettle::Completed => "none",
-                        crate::durable_request_ledger::DurableSettle::RecordedUnknown => {
-                            "inspect_before_retry"
-                        }
-                        crate::durable_request_ledger::DurableSettle::Released => {
-                            if object
-                                .get("retryable")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                            {
-                                "retry_after_resource_release"
-                            } else {
-                                "none"
-                            }
-                        }
-                    };
-                    object.insert("safe_retry_mode".to_owned(), json!(mode));
-                }
-            }
-            Ok(tool_result(
-                model_visible_tool_output(name, &arguments, output),
-                is_error,
-            ))
+                request_id,
+            )
         }
     }
 }
@@ -34867,6 +35024,249 @@ mod durable_client_request_tests {
                 store
                     .client_request_record(
                         crate::durable_request_ledger::HERDR_CALL_CLIENT_REQUEST_KIND,
+                        &digest,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given a durable-scoped first-class write tool with
+    /// client_request_id | When the key retries | Then the recorded result
+    /// replays deduplicated and the tool does not re-execute.
+    #[test]
+    fn user_write_tool_retry_given_durable_scope_then_replays_recorded_result() {
+        let root = temp_dir("wreplay");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().into_owned();
+        let target = repo.join("file.txt");
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"id": "w1", "workspace_id": "w1", "label": "main",
+                "worktree": {"checkout_path": repo_str}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": repo_str}],
+            "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let request = || {
+            json!({"params": {"name": "herdr_fs_write", "arguments": {
+                "path": target.to_string_lossy(),
+                "content": "payload\n",
+                "overwrite": true,
+                "confirm_dirty": true,
+                "client_request_id": "cr-fw1"
+            }}})
+        };
+        let first = call_body(&tool_call(&request(), &context).unwrap());
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "payload\n");
+        // First execution recorded the settled outcome under the fs-write kind.
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                "cr-fw1",
+            );
+            assert!(
+                store
+                    .client_request_record(
+                        crate::durable_request_ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                        &digest,
+                    )
+                    .unwrap()
+                    .is_some(),
+                "durable row for the first-class write tool"
+            );
+        }
+        // Diverge the on-disk state: a replay must not re-apply the write.
+        std::fs::write(&target, "touched-afterwards\n").unwrap();
+        let second = call_body(&tool_call(&request(), &context).unwrap());
+        assert_eq!(second["deduplicated"], true, "{second}");
+        assert_eq!(second["ok"], first["ok"], "{second}");
+        assert_eq!(second["request_id"], first["request_id"], "{second}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "touched-afterwards\n",
+            "replay must not re-execute the write"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given a durable-scoped write tool | When the same
+    /// client_request_id arrives with a different payload | Then the call is
+    /// refused with idempotency_conflict and nothing new executes.
+    #[test]
+    fn user_write_tool_same_key_other_payload_then_idempotency_conflict() {
+        let root = temp_dir("wconflict");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().into_owned();
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"id": "w1", "workspace_id": "w1", "label": "main",
+                "worktree": {"checkout_path": repo_str}}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": repo_str}],
+            "agents": []
+        }));
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let write = |name: &str| {
+            json!({"params": {"name": "herdr_fs_write", "arguments": {
+                "path": repo.join(name).to_string_lossy(),
+                "content": "payload\n",
+                "overwrite": true,
+                "confirm_dirty": true,
+                "client_request_id": "cr-fw-conflict"
+            }}})
+        };
+        let first = call_body(&tool_call(&write("a.txt"), &context).unwrap());
+        assert_eq!(first["ok"], true, "{first}");
+        let conflict = call_body(&tool_call(&write("b.txt"), &context).unwrap());
+        assert_eq!(conflict["ok"], false, "{conflict}");
+        assert_eq!(conflict["code"], "idempotency_conflict", "{conflict}");
+        assert!(!repo.join("b.txt").exists(), "conflict must not execute");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given herdr_prompt carrying both client_request_id and
+    /// its native idempotency_key | When submitted | Then the call is
+    /// rejected before any ledger reservation (D-1: one idempotency slot).
+    #[test]
+    fn user_prompt_given_both_idempotency_slots_then_invalid_params() {
+        let root = temp_dir("wdual");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let request = json!({"params": {"name": "herdr_prompt", "arguments": {
+            "pane": "w1:p1",
+            "text": "hello",
+            "client_request_id": "cr-pdual",
+            "idempotency_key": "idem-pdual"
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "invalid_params", "{body}");
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND,
+                "cr-pdual",
+            );
+            assert!(
+                store
+                    .client_request_record(
+                        crate::durable_request_ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND,
+                        &digest,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given no resolvable durable caller identity | When a
+    /// first-class write tool carries client_request_id | Then the call is
+    /// refused before execution and no durable row exists — writes never
+    /// fall back to the in-memory ledger.
+    #[test]
+    fn user_write_tool_given_no_durable_scope_then_refused_without_row() {
+        let root = temp_dir("wnoscope");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            None,
+        );
+
+        let request = json!({"params": {"name": "herdr_fs_write", "arguments": {
+            "path": "/nonexistent-managed-root/file.txt",
+            "content": "payload\n",
+            "client_request_id": "cr-wnoscope"
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "durable_caller_scope_unavailable", "{body}");
+        {
+            let store = state_store.lock().unwrap();
+            let digest = crate::durable_request_ledger::client_request_key_digest(
+                crate::durable_request_ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                "cr-wnoscope",
+            );
+            assert!(
+                store
+                    .client_request_record(
+                        crate::durable_request_ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
                         &digest,
                     )
                     .unwrap()

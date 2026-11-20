@@ -41,10 +41,22 @@ pub const HERDR_CALL_CLIENT_REQUEST_KIND: &str = "herdr_call.client_request.v1";
 /// namespace is fixed now; deliberately not wired into `herdr_exec` — that
 /// needs the contract change D-1 deferred to separate review.
 pub const HERDR_EXEC_CLIENT_REQUEST_KIND: &str = "herdr_exec.client_request.v1";
-/// Both durable client-request kinds; shared by cleanup and status scans.
-pub const CLIENT_REQUEST_KINDS: [&str; 2] = [
+/// #1094 P0-a: first-class write tools accept `client_request_id` inside
+/// `params.arguments` (the contracts do not declare it — option (b), no
+/// epoch/hash change). One kind per tool keeps each key's namespace disjoint
+/// from `herdr_call` and from each other.
+pub const HERDR_FS_WRITE_CLIENT_REQUEST_KIND: &str = "herdr_fs_write.client_request.v1";
+pub const HERDR_FS_EDIT_CLIENT_REQUEST_KIND: &str = "herdr_fs_edit.client_request.v1";
+pub const HERDR_FS_PATCH_CLIENT_REQUEST_KIND: &str = "herdr_fs_patch.client_request.v1";
+pub const HERDR_PROMPT_CLIENT_REQUEST_KIND: &str = "herdr_prompt.client_request.v1";
+/// All durable client-request kinds; shared by cleanup and status scans.
+pub const CLIENT_REQUEST_KINDS: [&str; 6] = [
     HERDR_CALL_CLIENT_REQUEST_KIND,
     HERDR_EXEC_CLIENT_REQUEST_KIND,
+    HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+    HERDR_FS_EDIT_CLIENT_REQUEST_KIND,
+    HERDR_FS_PATCH_CLIENT_REQUEST_KIND,
+    HERDR_PROMPT_CLIENT_REQUEST_KIND,
 ];
 /// Logical full-summary retention for settled rows: `result_json` carries the
 /// bounded projection for 24h, after which kind-specific cleanup compacts the

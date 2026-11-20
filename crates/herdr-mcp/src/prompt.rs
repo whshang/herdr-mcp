@@ -21,7 +21,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const RECORD_TTL_MS: u64 = 10 * 60_000;
+// #1094 P0-a: replay window matches the durable request ledger's 24h
+// summary TTL so a same-key retry within a day finds the first outcome
+// regardless of which idempotency mechanism recorded it.
+const RECORD_TTL_MS: u64 = 24 * 60 * 60_000;
 const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
