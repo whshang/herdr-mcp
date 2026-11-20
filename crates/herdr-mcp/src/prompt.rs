@@ -3070,7 +3070,11 @@ impl PromptRegistry {
             // "missing at submit" may still be created — but only while no
             // file identity has ever been recorded. Once a file was observed
             // (seen_* set), a missing stat is evidence of deletion and seals.
-            SessionFileStat::Missing if baseline == 0 && identity.is_none() => {
+            SessionFileStat::Missing
+                if baseline == 0
+                    && task.session_evidence_seen_dev.is_none()
+                    && identity.is_none() =>
+            {
                 return TranscriptScan::Unchanged;
             }
             SessionFileStat::Missing | SessionFileStat::Unreadable => {
@@ -3107,18 +3111,32 @@ impl PromptRegistry {
             task.session_evidence_closed = true;
             return TranscriptScan::Observed;
         }
-        if baseline == 0 && identity.is_some() {
-            // The reference file was empty (at submit or first sighting), so
-            // no prefix digest can prove identity. A delete+recreate that
-            // reuses the inode is otherwise indistinguishable from an
-            // append; only a matching creation stamp keeps the file
-            // admissible. Missing or unreadable stamps fail closed.
-            match (reference_btime, btime_ns) {
-                (Some(expected), Some(current)) if expected == current => {}
-                _ => {
-                    task.session_evidence_closed = true;
-                    return TranscriptScan::Observed;
-                }
+        if baseline == 0 {
+            // Empty-baseline evidence: file identity and the creation stamp
+            // are all that separates an append from a delete+recreate. A
+            // first sighting records `seen_*` below; a later sighting must
+            // keep the bound stamp. When the platform cannot prove dev/ino
+            // identity, the stamp is the only remaining fence — and a file
+            // with neither provable identity nor stamp cannot prove a later
+            // sighting is the same file, so the first sighting itself seals
+            // rather than trusting whatever file grows at this path
+            // (Codex 7038274368: zero-identity platform recovers a
+            // replacement).
+            let admissible = match (reference_btime, btime_ns) {
+                (Some(expected), Some(current)) => expected == current,
+                // First sighting: `register_task` seeds `seen_dev` only when
+                // a file existed at submit, so `seen_dev = None` means this
+                // dispatch never bound any file identity; the scan binds
+                // this stamp below and it becomes the replacement fence.
+                (None, Some(_)) => task.session_evidence_seen_dev.is_none(),
+                // No provable identity and no bound stamp — a platform
+                // without dev/ino and without a creation stamp cannot
+                // prove a later sighting is the same file.
+                _ => false,
+            };
+            if !admissible {
+                task.session_evidence_closed = true;
+                return TranscriptScan::Observed;
             }
         }
         // Same device and inode is not enough: unlink plus recreate can reuse
@@ -3152,8 +3170,16 @@ impl PromptRegistry {
         // Bytes after the next same-path dispatch's baseline belong to that
         // later task. The window stamp is taken before `agent.prompt`, so a
         // slow registration cannot hide the later submit.
+        // A window-query failure cannot prove growth, but the freshly bound
+        // identity must still persist: returning `Unchanged` here would drop
+        // the first-sighting record and let a later replacement pose as the
+        // file this dispatch observed (Codex 7038274368).
         let Ok(next) = self.next_session_baseline(task, path) else {
-            return TranscriptScan::Unchanged;
+            return if observed_changed {
+                TranscriptScan::Observed
+            } else {
+                TranscriptScan::Unchanged
+            };
         };
         let end = next.unwrap_or(len).min(len);
         if end > baseline {
@@ -4238,10 +4264,26 @@ fn session_file_stat(path: &Path) -> SessionFileStat {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test override for `file_created_ns`: `None` simulates a platform that
+    /// reports no creation stamp at all. Thread-local so parallel tests are
+    /// unaffected.
+    static TEST_FILE_CREATED_NS: core::cell::Cell<Option<Option<u64>>> = const { core::cell::Cell::new(None) };
+    /// Test override for `file_identity`: `Some((dev, ino))` replaces the
+    /// platform identity. `Some((0, 0))` simulates a platform without a
+    /// device/inode identity (the `#[cfg(not(unix))]` shape).
+    static TEST_FILE_IDENTITY: core::cell::Cell<Option<(u64, u64)>> = const { core::cell::Cell::new(None) };
+}
+
 /// File creation stamp in nanos since epoch. `Metadata::created` uses
 /// `statx` btime where the filesystem reports it; a filesystem that cannot
 /// prove creation returns None and the caller fails closed.
 fn file_created_ns(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(stamp) = TEST_FILE_CREATED_NS.get() {
+        return stamp;
+    }
     meta.created()
         .ok()
         .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
@@ -4265,6 +4307,10 @@ fn file_prefix_digest(path: &Path, baseline: usize) -> Option<String> {
 }
 
 fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(test)]
+    if let Some(identity) = TEST_FILE_IDENTITY.get() {
+        return identity;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -13531,6 +13577,155 @@ mod tests {
         registry.reconcile_recoverable_timeouts();
         let recovered = registry.load_task(task_id).unwrap().unwrap();
         assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given the session-window ledger is corrupt when the
+    /// first file sighting binds | When the sighting is written and a
+    /// replacement later appears | Then the persisted identity still seals
+    /// the recovery instead of treating the replacement as the first file
+    /// (Codex 7038274368).
+    #[test]
+    fn user_first_sighting_survives_a_failed_window_query() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-winfail-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("win-fail", session_snapshot(&path));
+        let task_id = "dispatch:prompt:win-fail";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        // Corrupt the session-window ledger so `next_session_baseline` fails
+        // inside the scan; `put_operation_ledger` on the task itself still
+        // works, so the bound identity must persist.
+        {
+            let store = Arc::clone(registry.inner.store.as_ref().unwrap());
+            let mut store = store.lock().unwrap();
+            store
+                .put_operation_ledger(OperationLedgerInput {
+                    op_id: SESSION_WINDOW_LEDGER_ID,
+                    kind: SESSION_WINDOW_LEDGER_KIND,
+                    idempotency_key: None,
+                    request_hash: None,
+                    phase: "open",
+                    state: "open",
+                    result_json: "not-valid-json",
+                    now_ms: now_ms() as i64,
+                    expires_at: None,
+                })
+                .unwrap();
+        }
+        fs::write(&path, b"").unwrap();
+        let sighted = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert!(
+            sighted.session_evidence_seen_dev.is_some(),
+            "the failed window query must still persist the bound identity"
+        );
+        assert!(!sighted.session_evidence_closed);
+        // Restore the ledger, then replace the file: the bound first-sighting
+        // identity (not a fresh sighting of the replacement) must seal.
+        {
+            let store = Arc::clone(registry.inner.store.as_ref().unwrap());
+            let mut store = store.lock().unwrap();
+            save_session_windows(&mut store, &[], now_ms()).unwrap();
+        }
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        // Align the bound identity to the replacement so the creation stamp
+        // is the only remaining fence — deterministic under inode reuse.
+        task.session_evidence_seen_dev = Some(dev);
+        task.session_evidence_seen_ino = Some(ino);
+        registry.save_task(&task, None).unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a platform that proves neither file identity
+    /// nor a creation stamp | When a file first appears, is deleted, is
+    /// recreated, or grows | Then every path seals instead of trusting
+    /// unprovable bytes (Codex 7038274368).
+    #[test]
+    fn user_zero_identity_platform_seals_recovery() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-noid-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("no-identity", session_snapshot(&path));
+        let task_id = "dispatch:prompt:no-identity";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        TEST_FILE_IDENTITY.set(Some((0, 0)));
+        TEST_FILE_CREATED_NS.set(Some(None));
+        // First sighting with no provable identity and no stamp seals
+        // immediately — anything later at this path is indistinguishable
+        // from the file this dispatch observed.
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        TEST_FILE_IDENTITY.set(None);
+        TEST_FILE_CREATED_NS.set(None);
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a platform with no dev/ino identity but a
+    /// creation stamp | When the first sighting's file is replaced | Then the
+    /// bound stamp seals the replacement while the same file may still
+    /// recover (Codex 7038274368).
+    #[test]
+    fn user_stamp_only_platform_still_fences_replacements() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-stamp-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("stamp-only", session_snapshot(&path));
+        let task_id = "dispatch:prompt:stamp-only";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        TEST_FILE_IDENTITY.set(Some((0, 0)));
+        fs::write(&path, b"").unwrap();
+        let bound = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert!(!bound.session_evidence_closed);
+        assert_eq!(bound.session_evidence_seen_len, Some(0));
+        let bound_stamp = bound.session_evidence_seen_btime_ns;
+        assert!(bound_stamp.is_some());
+        // Delete + recreate: the new stamp differs from the bound one and
+        // seals — even though the first file produced no dev/ino identity.
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        TEST_FILE_IDENTITY.set(None);
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
 
         drop(registry);
         remove_escalation_db(&db_path);
