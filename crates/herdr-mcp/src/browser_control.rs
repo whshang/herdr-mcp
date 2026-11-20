@@ -543,6 +543,7 @@ fn invalid(message: &str) -> Value {
 mod tests {
     use super::*;
     use crate::state_cache::EventCache;
+    use crate::state_store::StateStore;
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -636,7 +637,9 @@ mod tests {
             "idempotency_key": "browser-control-prompt-1"
         });
         let client = HerdrClient::new(&socket);
-        let registry = PromptRegistry::new();
+        let registry = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+            StateStore::open(":memory:").unwrap(),
+        )));
         let first = execute_action(&client, &cache, &registry, &request);
         assert_eq!(first["ok"], true);
         assert_eq!(first["outcome"], "submitted");
@@ -718,7 +721,9 @@ mod tests {
             "idempotency_key": "browser-control-terminal-1"
         });
         let client = HerdrClient::new(&socket);
-        let registry = PromptRegistry::new();
+        let registry = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+            StateStore::open(":memory:").unwrap(),
+        )));
         let result = execute_action(&client, &cache, &registry, &request);
         assert_eq!(result["ok"], true);
         assert_eq!(result["outcome"], "submitted");
@@ -760,7 +765,9 @@ mod tests {
             "idempotency_key": "browser-control-interrupt-1"
         });
         let client = HerdrClient::new(&socket);
-        let registry = PromptRegistry::new();
+        let registry = PromptRegistry::with_store(std::sync::Arc::new(std::sync::Mutex::new(
+            StateStore::open(":memory:").unwrap(),
+        )));
         let result = execute_action(&client, &cache, &registry, &request);
         assert_eq!(result["ok"], true);
         assert_eq!(result["outcome"], "interrupted");

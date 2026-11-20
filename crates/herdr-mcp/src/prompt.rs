@@ -22,7 +22,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_TTL_MS: u64 = 10 * 60_000;
-const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
 const PROMPT_TASK_TTL_MS: u64 = 7 * 24 * 60 * 60_000;
@@ -194,6 +193,9 @@ struct RegisterTaskInput<'a> {
     /// while the prompt was still unacknowledged. `None` skips the field.
     foreground_blocker: Option<Value>,
     audit: Option<Value>,
+    /// JSONL path and length observed before `agent.prompt`. `None` tells
+    /// `register_task` to stat the file itself.
+    pre_submit_session: Option<SessionEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,6 +354,62 @@ struct PromptTaskRecord {
     foreground_blocker: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audit: Option<Value>,
+    /// Agent session JSONL path and length captured before `agent.prompt`,
+    /// plus the dispatch turn that owns that offset. Growth after the offset
+    /// counts only until the next task's baseline on the same path. Absent
+    /// when the pane had no path session; older rows still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_turn_id: Option<String>,
+    /// `(dev, ino)` of the session file at the baseline stat. A later stat
+    /// with a different identity is a rotation, not growth of this dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_ino: Option<u64>,
+    /// SHA-256 of the first 64 bytes at submit. Linux can reuse the inode of
+    /// a file that was unlinked and recreated, so identity alone cannot tell
+    /// a rotation from an append.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_prefix: Option<String>,
+    /// Unix nanos when this submit reserved its session window. Later submits
+    /// on the same file publish a higher stamp before `agent.prompt`, so a
+    /// slow RPC cannot hide the next window until registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_window_seq: Option<u64>,
+    /// Set once a shorter file, a replacement inode, or an unreadable stat is
+    /// observed. Later growth of the same path is then not this dispatch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    session_evidence_closed: bool,
+    /// Last accepted `(dev, ino, len)` of the session file. A later shorter
+    /// length, or growth after a shorter observation, is a rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_len: Option<u64>,
+    /// Creation stamp (ns since epoch) captured with the baseline stat. A
+    /// recreated file that reuses the inode gets a new creation time, so a
+    /// zero-length baseline can still reject rotation. None when the
+    /// filesystem cannot report it: later growth then fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_btime_ns: Option<u64>,
+    /// Creation stamp (ns since epoch) of the last observed file. A missing-
+    /// at-submit baseline binds its identity on first observation, so a
+    /// later delete+recreate that reuses the inode still fails the creation
+    /// check. None when the filesystem cannot report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_seen_btime_ns: Option<u64>,
+    /// Why this task may still leave `delivery_uncertain`. Independent of
+    /// `notification_error`, which parent notification reuses and clears.
+    /// `recovery_closed` means a boot change, history gap, rotation, or
+    /// unreadable stat sealed the timeout: later growth must not reopen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_uncertain_reason: Option<String>,
     #[serde(skip)]
     gate: Option<DecisionGate>,
 }
@@ -483,6 +541,9 @@ impl PromptTaskRecord {
             if let Some(audit) = &self.audit {
                 object.insert("audit".to_owned(), json!(audit));
             }
+            if let Some(reason) = &self.delivery_uncertain_reason {
+                object.insert("delivery_uncertain_reason".to_owned(), json!(reason));
+            }
             // S4: `delivery_uncertain` means "may already have been delivered".
             // The row therefore carries the read-only check a caller can run to
             // find out, instead of a bare doubt. The pane echo cursor is the
@@ -496,7 +557,7 @@ impl PromptTaskRecord {
                         "action": "herdr_mcp.agent.read",
                         "target": pane,
                         "cursor": self.terminal_cursor,
-                        "reason": self.notification_error,
+                        "reason": self.delivery_uncertain_reason.clone().or_else(|| self.notification_error.clone()),
                         "meaning": "the prompt may or may not have reached the agent; read the pane before re-dispatching",
                     }),
                 );
@@ -504,19 +565,6 @@ impl PromptTaskRecord {
         }
         public
     }
-}
-
-#[derive(Debug, Clone)]
-enum RecordState {
-    Pending,
-    Complete(Value),
-}
-
-#[derive(Debug, Clone)]
-struct PromptRecord {
-    at_ms: u64,
-    fingerprint: String,
-    state: RecordState,
 }
 
 struct HandoffInjection {
@@ -551,7 +599,6 @@ fn dispatch_definitely_not_delivered(result: &Value) -> bool {
             || result.get("retryable").and_then(Value::as_bool) == Some(true))
 }
 
-#[derive(Default)]
 struct PromptRegistryInner {
     // Serialize durable task read/modify/write across report, lifecycle, ack and
     // parent notification so a stale snapshot cannot erase an accepted report.
@@ -566,14 +613,13 @@ struct PromptRegistryInner {
     spawn_early_exit_watch_disabled: AtomicBool,
     #[cfg(test)]
     clock: Option<Arc<AtomicU64>>,
-    records: Mutex<HashMap<String, PromptRecord>>,
     handoff_injected_panes: Mutex<HashSet<String>>,
     store: Option<Arc<Mutex<StateStore>>>,
     cache: Option<Arc<EventCache>>,
     client: Option<HerdrClient>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
 }
@@ -607,11 +653,6 @@ impl PromptRegistry {
         now_ms()
     }
 
-    #[cfg(test)]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Disable the S5 post-readiness early-exit watch for this registry.
     ///
     /// Test-only: a scripted Herdr fake answers one fixed sequence regardless of
@@ -634,7 +675,6 @@ impl PromptRegistry {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -656,7 +696,6 @@ impl PromptRegistry {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -685,7 +724,6 @@ impl PromptRegistry {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
@@ -710,85 +748,31 @@ impl PromptRegistry {
         })
     }
 
+    /// B2: idempotency reservations are always durable. A registry built
+    /// without a store cannot reserve or replay — fail closed rather than
+    /// falling back to a process-local state machine (#980).
     fn begin(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
-        if let Some(store) = &self.inner.store {
-            return begin_persisted(store, key, fingerprint);
-        }
-        self.begin_memory(key, fingerprint)
-    }
-
-    fn begin_memory(&self, key: &str, fingerprint: &str) -> Result<BeginPrompt, Value> {
-        let now = self.now_ms();
-        let mut records = self
-            .inner
-            .records
-            .lock()
-            .map_err(|_| json!({"ok": false, "code": "idempotency_registry_unavailable"}))?;
-        records.retain(|_, record| now.saturating_sub(record.at_ms) < RECORD_TTL_MS);
-        if let Some(record) = records.get(key) {
-            if record.fingerprint != fingerprint {
-                return Err(json!({
-                    "ok": false,
-                    "code": "idempotency_key_conflict",
-                    "message": "idempotency_key is already bound to a different prompt request",
-                    "retryable": false,
-                }));
-            }
-            return match &record.state {
-                RecordState::Pending => Err(json!({
-                    "ok": false,
-                    "code": "idempotency_in_flight",
-                    "message": "a prompt with this idempotency_key is already in flight",
-                    "submitted": "unknown",
-                    "retryable": false,
-                    "hint": "A matching submission is already in progress; repeating it can duplicate work. The existing result or live agent state identifies the outcome.",
-                })),
-                RecordState::Complete(result) => {
-                    let mut replay = result.clone();
-                    if let Some(object) = replay.as_object_mut() {
-                        object.insert("idempotent_replay".to_owned(), json!(true));
-                    }
-                    Ok(BeginPrompt::Replay(replay))
-                }
-            };
-        }
-        records.insert(
-            key.to_owned(),
-            PromptRecord {
-                at_ms: now,
-                fingerprint: fingerprint.to_owned(),
-                state: RecordState::Pending,
-            },
-        );
-        if records.len() > RECORD_LIMIT {
-            let mut oldest = records
-                .iter()
-                .filter(|(candidate, _)| candidate.as_str() != key)
-                .map(|(candidate, record)| (candidate.clone(), record.at_ms))
-                .collect::<Vec<_>>();
-            oldest.sort_by_key(|(_, at)| *at);
-            for (candidate, _) in oldest.into_iter().take(records.len() - RECORD_LIMIT) {
-                records.remove(&candidate);
-            }
-        }
-        Ok(BeginPrompt::Reserved(None))
+        let Some(store) = &self.inner.store else {
+            return Err(json!({
+                "ok": false,
+                "code": "idempotency_store_unavailable",
+                "message": "prompt registry has no durable idempotency store; prompt was not submitted",
+                "retryable": false,
+            }));
+        };
+        begin_persisted(store, key, fingerprint)
     }
 
     fn complete(&self, key: &str, fingerprint: &str, result: &Value) -> Result<(), Value> {
-        if let Some(store) = &self.inner.store {
-            return complete_persisted(store, key, fingerprint, result);
-        }
-        if let Ok(mut records) = self.inner.records.lock() {
-            records.insert(
-                key.to_owned(),
-                PromptRecord {
-                    at_ms: now_ms(),
-                    fingerprint: fingerprint.to_owned(),
-                    state: RecordState::Complete(result.clone()),
-                },
-            );
-        }
-        Ok(())
+        let Some(store) = &self.inner.store else {
+            return Err(json!({
+                "ok": false,
+                "code": "idempotency_store_unavailable",
+                "message": "prompt registry has no durable idempotency store; result could not be journaled",
+                "retryable": false,
+            }));
+        };
+        complete_persisted(store, key, fingerprint, result)
     }
 
     /// Outcome of a first-dispatch handoff injection attempt. `marked_now` is
@@ -868,8 +852,10 @@ impl PromptRegistry {
             request_id,
             foreground_blocker,
             audit,
+            pre_submit_session,
         } = input;
         if submitted == Some(false) || self.inner.store.is_none() {
+            let _ = self.take_session_window(task_id);
             return Ok(None);
         }
         let guard = self
@@ -884,6 +870,8 @@ impl PromptRegistry {
             // idempotent and only touches still-unacknowledged records on this
             // lane, so the retry heals the crash window before returning.
             self.supersede_unacknowledged_tasks(&existing)?;
+            drop(guard);
+            let _ = self.take_session_window(task_id);
             return Ok(Some(existing));
         }
 
@@ -907,7 +895,10 @@ impl PromptRegistry {
         // This is the Runtime-owned turn envelope for this submission. It is
         // stable immediately, while exact_native_turn remains false until Herdr
         // exposes a native prompt-turn identity.
-        let mut turn_id = Some(runtime_turn_id(task_id, "dispatch"));
+        // The injected worker report names this id. A later working/seq
+        // observation updates lifecycle only; rewriting the turn here would
+        // make that report fail task_identity_mismatch.
+        let turn_id = Some(runtime_turn_id(task_id, "dispatch"));
         let after_status = after.and_then(|state| state.agent_status.as_deref());
         let after_seq = after.and_then(|state| state.state_change_seq);
         let seq_advanced = baseline_seq
@@ -918,10 +909,6 @@ impl PromptRegistry {
         {
             lifecycle = PromptTaskLifecycle::Running;
             activity_observed = true;
-            turn_id = Some(runtime_turn_id(
-                task_id,
-                &format!("seq:{}", after_seq.unwrap_or_default()),
-            ));
         }
         // Pin the dispatch to the pane's observed seq when one was reported;
         // an interrupt later refuses once the pane moves past it.
@@ -929,6 +916,27 @@ impl PromptRegistry {
             after_seq
         } else {
             baseline_seq
+        };
+        // Prefer the length taken before `agent.prompt`. A stat here would
+        // fold a fast first token into the baseline and then time out.
+        let session_evidence = match pre_submit_session {
+            Some(evidence) => evidence,
+            None => self.observe_session_evidence(pane_id.as_deref()),
+        };
+        // The dispatch path publishes this seq before agent.prompt. A direct
+        // register_task call (tests, replay) still needs one.
+        let window_seq = if session_evidence.path.is_some() {
+            self.open_session_windows()
+                .ok()
+                .and_then(|windows| {
+                    windows
+                        .into_iter()
+                        .find(|window| window.task_id == task_id)
+                        .map(|window| window.seq)
+                })
+                .or_else(|| Some(reserve_session_window_seq()))
+        } else {
+            None
         };
 
         let mut record = PromptTaskRecord {
@@ -948,7 +956,7 @@ impl PromptRegistry {
             lifecycle,
             activity_observed,
             prior_settle_observed: false,
-            turn_id,
+            turn_id: turn_id.clone(),
             turn_seq,
             exact_native_turn: false,
             terminal_status: None,
@@ -985,6 +993,20 @@ impl PromptRegistry {
             superseded_by: None,
             foreground_blocker,
             audit,
+            session_evidence_path: session_evidence.path,
+            session_evidence_bytes: session_evidence.bytes,
+            session_evidence_turn_id: turn_id.clone(),
+            session_evidence_dev: session_evidence.dev,
+            session_evidence_ino: session_evidence.ino,
+            session_evidence_prefix: session_evidence.prefix.clone(),
+            session_window_seq: window_seq,
+            session_evidence_closed: false,
+            session_evidence_seen_dev: session_evidence.dev,
+            session_evidence_seen_ino: session_evidence.ino,
+            session_evidence_seen_len: session_evidence.bytes,
+            session_evidence_btime_ns: session_evidence.btime_ns,
+            session_evidence_seen_btime_ns: session_evidence.btime_ns,
+            delivery_uncertain_reason: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
             mark_delivery_uncertain(&mut record, now, "delivery_state_unknown_at_submit");
@@ -995,6 +1017,16 @@ impl PromptRegistry {
         record.on_budget = on_budget.map(str::to_owned);
         record.request_id = request_id.map(str::to_owned);
         self.persist_task_with_supersede(&record, Some(fingerprint))?;
+        if let Some(store) = self.inner.store.as_ref()
+            && let Ok(mut store) = store.lock()
+            && let Ok(mut open) = load_session_windows(&store)
+        {
+            let before = open.len();
+            open.retain(|window| window.task_id != task_id);
+            if open.len() != before {
+                let _ = save_session_windows(&mut store, &open, self.now_ms());
+            }
+        }
         drop(guard);
         let reconciled = self.reconcile_task(task_id)?;
         Ok(reconciled.or(Some(record)))
@@ -1123,19 +1155,68 @@ impl PromptRegistry {
         if kind == "heartbeat" && task.is_terminal() {
             return json!({"ok": false, "code": "agent_task_terminal"});
         }
+        // A restart, an unconsumed event gap, or a store with no event cache
+        // closes recovery before a matching worker_done can complete the old
+        // timeout. A pending gate does not skip this fence.
+        if activity_timeout_open(&task)
+            && (self.seal_recovery_fences(&mut task) || self.inner.cache.is_none())
+        {
+            if self.inner.cache.is_none() {
+                task.delivery_uncertain_reason = Some("recovery_closed".to_owned());
+                task.notification_error = Some("event_cache_unavailable".to_owned());
+                task.updated_at_ms = self.now_ms();
+            }
+            if let Err(error) = self.save_task(&task, None) {
+                return json!({"ok": false, "code": "agent_task_store_unavailable", "message": error});
+            }
+        }
+        let reported_turn = match optional_str(params, "turn_id") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        if reported_turn.is_some_and(|turn_id| {
+            task.turn_id
+                .as_deref()
+                .is_some_and(|current| current != turn_id)
+        }) {
+            return json!({"ok": false, "code": "task_identity_mismatch"});
+        }
         let now = self.now_ms();
-        let newly_completed = kind == "worker_done" && !task.is_terminal() && task.gate.is_none();
+        // A non-terminal report keeps today's contract: `turn_id` is optional.
+        // Leaving `activity_start_timeout` is stricter. The report must name
+        // the turn stored on the task. A missing report turn, or a record that
+        // never stored one, is recorded as `worker_done` but does not complete.
+        let turn_matches = reported_turn
+            .is_some_and(|turn_id| task.turn_id.as_deref() == Some(turn_id) && !turn_id.is_empty());
+        let recoverable = activity_timeout_open(&task);
+        let newly_completed = kind == "worker_done"
+            && task.gate.is_none()
+            && ((!task.is_terminal() && !recoverable) || (recoverable && turn_matches));
         if kind == "heartbeat" {
             task.last_heartbeat_at_ms = Some(now);
+        } else if recoverable && !turn_matches {
+            // Do not consume the one-shot worker_done. A later report that
+            // names this task's turn can still complete it. ok stays false:
+            // the caller must not treat a dropped report as a completion.
+            drop(guard);
+            return json!({
+                "ok": false,
+                "code": "worker_done_turn_required",
+                "message": "activity_start_timeout recovery requires the stored turn_id",
+                "task": task.public_json_at(now),
+            });
         } else {
             task.worker_done_at_ms = Some(now);
             task.worker_done_summary = summary;
             if newly_completed {
+                clear_receipt_for_recovery(&mut task);
                 task.lifecycle = PromptTaskLifecycle::Completed;
                 task.terminal_status = Some("worker_done".to_owned());
                 task.terminal_at_ms = Some(now);
                 task.terminal_cursor = None;
                 task.awaiting_children = None;
+                task.notification_error = None;
+                task.delivery_uncertain_reason = None;
                 task.notification_state = "pending".to_owned();
                 update_steering(&mut task);
             }
@@ -1345,12 +1426,8 @@ impl PromptRegistry {
         let key_hash = stable_digest(&[b"herdr_prompt/idempotency", idempotency_key.as_bytes()]);
         let op_id = format!("op:prompt:{}", &key_hash[..32]);
         let Some(store) = self.inner.store.as_ref() else {
-            return self
-                .inner
-                .records
-                .lock()
-                .map(|records| records.contains_key(idempotency_key))
-                .unwrap_or(false);
+            // B2: no store means no durable idempotency knowledge at all.
+            return false;
         };
         let Ok(store) = store.lock() else {
             return false;
@@ -1827,7 +1904,9 @@ impl PromptRegistry {
         }
         let reconcilable = tasks
             .iter()
-            .filter(|task| in_scope(task) && !task.is_terminal())
+            .filter(|task| {
+                in_scope(task) && (!task.is_terminal() || delivery_timeout_can_recover(task))
+            })
             .map(|task| task.task_id.clone())
             .collect::<Vec<_>>();
         if reconcilable.is_empty() {
@@ -1852,6 +1931,7 @@ impl PromptRegistry {
             since_ms,
         } = *query;
         self.reconcile_active_tasks();
+        self.reconcile_recoverable_timeouts();
         let tasks = self.list_tasks(512)?;
         let scoped = tasks
             .iter()
@@ -2162,6 +2242,7 @@ impl PromptRegistry {
                         let registry = PromptRegistry { inner };
                         registry.reconcile_activity_timeouts();
                         registry.sweep_task_budgets();
+                        registry.reconcile_recoverable_timeouts();
                         last_timeout_scan = std::time::Instant::now();
                     }
                 }
@@ -2246,17 +2327,41 @@ impl PromptRegistry {
         let _ = store.put_operation_ledgers_atomic(&inputs);
     }
 
+    /// Reconcile every still-active task and deliver pending terminal
+    /// notifications. Both lists are unbounded by the recent-window cap: a
+    /// recoverable timeout older than 512 newer writes must still be seen by
+    /// the tracker and periodic passes (Codex 7037362769 / Claude 7037794826).
     fn reconcile_active_tasks(&self) {
         self.repair_supersession_gaps();
-        let Ok(tasks) = self.list_tasks(512) else {
+        if let Ok(tasks) = self.list_active_tasks() {
+            for task in &tasks {
+                let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+        if let Ok(tasks) = self.list_terminal_tasks() {
+            for task in &tasks {
+                // A recoverable activity timeout is terminal in the ledger
+                // but must still be reconciled here: the tracker/event path
+                // is the only caller that runs without an inbox request.
+                if delivery_timeout_can_recover(task) {
+                    let _ = self.reconcile_task(&task.task_id);
+                } else if task.notification_state == "pending" {
+                    self.maybe_notify_parent(task);
+                }
+            }
+        }
+    }
+
+    /// Unbounded scan for terminal tasks that may still leave
+    /// `delivery_uncertain`: a recoverable timeout past the recent window is
+    /// reconciled on the periodic/tracker path instead of waiting for an
+    /// inbox request. `list_terminal_tasks` is not capped at 512.
+    fn reconcile_recoverable_timeouts(&self) {
+        let Ok(tasks) = self.list_terminal_tasks() else {
             return;
         };
         for task in tasks {
-            if task.is_terminal() {
-                if task.notification_state == "pending" {
-                    self.maybe_notify_parent(&task);
-                }
-            } else {
+            if delivery_timeout_can_recover(&task) {
                 let _ = self.reconcile_task(&task.task_id);
             }
         }
@@ -2646,17 +2751,23 @@ impl PromptRegistry {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
-        if task.gate.is_some() || task.is_terminal() {
+        // `activity_start_timeout` stays in the ledger as delivery_uncertain,
+        // but a later same-dispatch report or event may still recover it.
+        // Boot-mismatch and history-gap uncertainty stay fail-closed.
+        if task.gate.is_some() || (task.is_terminal() && !delivery_timeout_can_recover(&task)) {
             return Ok(Some(task));
         }
         // A report received during a gate is durable, but completes only after
         // the gate is released. This explicit report does not depend on cache cursors.
         if let Some(done_at) = task.worker_done_at_ms {
+            clear_receipt_for_recovery(&mut task);
             task.lifecycle = PromptTaskLifecycle::Completed;
             task.terminal_status = Some("worker_done".to_owned());
             task.terminal_at_ms = Some(done_at);
             task.terminal_cursor = None;
             task.awaiting_children = None;
+            task.notification_error = None;
+            task.delivery_uncertain_reason = None;
             task.notification_state = "pending".to_owned();
             update_steering(&mut task);
             self.save_task(&task, None)?;
@@ -2664,30 +2775,32 @@ impl PromptRegistry {
             return self.load_task(task_id);
         }
         let mut changed = false;
-        if task.lifecycle == PromptTaskLifecycle::AwaitingActivity
+        let activity_timed_out = task.lifecycle == PromptTaskLifecycle::AwaitingActivity
             && self.now_ms().saturating_sub(task.updated_at_ms)
-                >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS
-        {
+                >= PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS;
+        if activity_timed_out {
             changed |= mark_delivery_uncertain(&mut task, self.now_ms(), "activity_start_timeout");
         }
-        if task.is_terminal() {
+        let Some(cache) = self.inner.cache.as_ref() else {
+            // No event cache: file growth is the only remaining evidence, and
+            // there is no boot cursor to distrust. The scan still runs so a
+            // first-sighting identity or a seal is persisted even when this
+            // task is not currently recoverable.
+            let scan = self.session_transcript_grew(&mut task);
+            if scan == TranscriptScan::Grew && delivery_timeout_can_recover(&task) {
+                note_transcript_delivery(&mut task, self.now_ms());
+                changed = true;
+            }
+            changed |= scan != TranscriptScan::Unchanged;
+            changed |= task.session_evidence_closed;
             if changed {
-                self.save_task(&task, None)?;
-                self.maybe_notify_parent_locked(&task);
-                if let Some(reloaded) = self.load_task(task_id)? {
-                    task = reloaded;
-                }
+                self.persist_reconciled_task(&mut task, task_id)?;
             }
             return Ok(Some(task));
-        }
-        let Some(cache) = self.inner.cache.as_ref() else {
-            return Ok(Some(task));
         };
-        // Boot-epoch fence: the persisted cursor is only meaningful against
-        // the EventCache of the process that recorded it. A different (or
-        // unknown, for pre-epoch records) boot means the cursor cannot be
-        // trusted and later events from the new cache may belong to unrelated
-        // conversations — fail closed, never optimistically complete.
+        // Boot-epoch fence comes before any transcript recovery. A cursor from
+        // another process, and a file that grew across that restart, are both
+        // incomplete evidence.
         let boot_mismatch = match task.boot_epoch.as_deref() {
             Some(epoch) => epoch != cache.boot_id(),
             None => true, // legacy record without an epoch: fail closed
@@ -2698,28 +2811,430 @@ impl PromptRegistry {
             } else {
                 "runtime_boot_unknown"
             };
-            changed |= mark_delivery_uncertain(&mut task, self.now_ms(), reason);
+            changed |= self.seal_uncertain(&mut task, reason);
             if changed {
-                self.save_task(&task, None)?;
-                self.maybe_notify_parent_locked(&task);
-                if let Some(reloaded) = self.load_task(task_id)? {
-                    task = reloaded;
-                }
+                self.persist_reconciled_task(&mut task, task_id)?;
             }
             return Ok(Some(task));
         }
         let digest = cache.digest_since(task.last_cursor);
-        changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
-        if changed {
-            self.save_task(&task, None)?;
-            if task.is_terminal() {
-                self.maybe_notify_parent_locked(&task);
-                if let Some(reloaded) = self.load_task(task_id)? {
-                    task = reloaded;
-                }
+        if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
+            changed |= self.seal_uncertain(&mut task, "event_history_gap");
+            if digest.cursor > task.last_cursor {
+                task.last_cursor = digest.cursor;
+                changed = true;
             }
+        } else {
+            // The scan runs whether or not this task is currently
+            // recoverable: a first-sighting identity or a seal must persist,
+            // and a matching event may still settle a gate-held task.
+            let scan = self.session_transcript_grew(&mut task);
+            if scan == TranscriptScan::Grew && delivery_timeout_can_recover(&task) {
+                // Growth is the delivery fact. Apply the batch after leaving
+                // the timeout so a done or pane_closed in this same window
+                // can settle.
+                note_transcript_delivery(&mut task, self.now_ms());
+                changed = true;
+            }
+            changed |= scan != TranscriptScan::Unchanged;
+            changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
+        }
+        changed |= task.session_evidence_closed;
+        if changed {
+            self.persist_reconciled_task(&mut task, task_id)?;
         }
         Ok(Some(task))
+    }
+
+    fn persist_reconciled_task(
+        &self,
+        task: &mut PromptTaskRecord,
+        task_id: &str,
+    ) -> Result<(), String> {
+        self.save_task(task, None)?;
+        if task.is_terminal() {
+            self.maybe_notify_parent_locked(task);
+            if let Some(reloaded) = self.load_task(task_id)? {
+                *task = reloaded;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record an unrecoverable delivery fence. An activity-start timeout that
+    /// is already terminal still loses its recovery reason here.
+    fn seal_uncertain(&self, task: &mut PromptTaskRecord, reason: &str) -> bool {
+        if task.lifecycle == PromptTaskLifecycle::DeliveryUncertain
+            && task.delivery_uncertain_reason.as_deref() == Some("activity_start_timeout")
+        {
+            task.delivery_uncertain_reason = Some("recovery_closed".to_owned());
+            task.notification_error = Some(reason.to_owned());
+            task.updated_at_ms = self.now_ms();
+            return true;
+        }
+        if task.lifecycle == PromptTaskLifecycle::DeliveryUncertain
+            && task.delivery_uncertain_reason.is_none()
+            && task.notification_state == "pending"
+            && task.notification_error.as_deref() == Some("activity_start_timeout")
+        {
+            task.delivery_uncertain_reason = Some("recovery_closed".to_owned());
+            task.notification_error = Some(reason.to_owned());
+            task.updated_at_ms = self.now_ms();
+            return true;
+        }
+        mark_delivery_uncertain(task, self.now_ms(), reason)
+    }
+
+    /// Boot change and event-history gap, shared by reconcile and task_report.
+    /// Returns whether the task record changed.
+    fn seal_recovery_fences(&self, task: &mut PromptTaskRecord) -> bool {
+        let Some(cache) = self.inner.cache.as_ref() else {
+            return false;
+        };
+        let boot_mismatch = match task.boot_epoch.as_deref() {
+            Some(epoch) => epoch != cache.boot_id(),
+            None => true,
+        };
+        if boot_mismatch {
+            let reason = if task.boot_epoch.is_some() {
+                "runtime_boot_changed"
+            } else {
+                "runtime_boot_unknown"
+            };
+            return self.seal_uncertain(task, reason);
+        }
+        let digest = cache.digest_since(task.last_cursor);
+        if digest.cursor.saturating_sub(task.last_cursor) > 2048 {
+            let mut changed = self.seal_uncertain(task, "event_history_gap");
+            if digest.cursor > task.last_cursor {
+                task.last_cursor = digest.cursor;
+                changed = true;
+            }
+            return changed;
+        }
+        false
+    }
+
+    /// Persist one in-flight session window before `agent.prompt` returns.
+    /// `None` when this pane has no session file to bound.
+    fn publish_session_window(
+        &self,
+        task_id: &str,
+        pane_id: Option<&str>,
+        evidence: &SessionEvidence,
+    ) -> Result<Option<u64>, String> {
+        if evidence.path.is_none() {
+            return Ok(None);
+        }
+        let _order = self
+            .inner
+            .task_mutations
+            .lock()
+            .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
+        // Sequence and the durable row share this lock, so a later publisher
+        // cannot observe a smaller sequence than one that already committed.
+        let seq = reserve_session_window_seq();
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(None);
+        };
+        let mut store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        let mut open = load_session_windows(&store)?;
+        let now = self.now_ms();
+        open.retain(|window| {
+            window.task_id != task_id
+                && now.saturating_sub(window.published_at_ms) < SESSION_WINDOW_TTL_MS
+        });
+        open.push(SessionWindow {
+            task_id: task_id.to_owned(),
+            pane_id: pane_id.map(str::to_owned),
+            path: evidence.path.clone().unwrap_or_default(),
+            bytes: evidence.bytes.unwrap_or(0),
+            dev: evidence.dev,
+            ino: evidence.ino,
+            seq,
+            published_at_ms: self.now_ms(),
+        });
+        save_session_windows(&mut store, &open, self.now_ms())?;
+        Ok(Some(seq))
+    }
+
+    fn take_session_window(&self, task_id: &str) -> Result<Option<SessionWindow>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(None);
+        };
+        let mut store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        let mut open = load_session_windows(&store)?;
+        let window = open
+            .iter()
+            .find(|window| window.task_id == task_id)
+            .cloned();
+        if window.is_some() {
+            open.retain(|window| window.task_id != task_id);
+            save_session_windows(&mut store, &open, self.now_ms())?;
+        }
+        Ok(window)
+    }
+
+    fn open_session_windows(&self) -> Result<Vec<SessionWindow>, String> {
+        let Some(store) = self.inner.store.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let store = store
+            .lock()
+            .map_err(|_| "agent task store lock unavailable".to_owned())?;
+        load_session_windows(&store)
+    }
+
+    /// Path session identity captured at submit. A missing file is length 0
+    /// with no device identity. An unreadable path records no baseline.
+    fn observe_session_evidence(&self, pane_id: Option<&str>) -> SessionEvidence {
+        let Some(path) = self.session_path_for_pane(pane_id) else {
+            return SessionEvidence::none();
+        };
+        match session_file_stat(Path::new(&path)) {
+            SessionFileStat::Missing => SessionEvidence::missing_file(path),
+            SessionFileStat::File {
+                len,
+                dev,
+                ino,
+                btime_ns,
+            } => SessionEvidence::known(path, len, dev, ino, btime_ns),
+            SessionFileStat::Unreadable => SessionEvidence::none(),
+        }
+    }
+
+    fn session_path_for_pane(&self, pane_id: Option<&str>) -> Option<String> {
+        let pane_id = pane_id?;
+        let snapshot = self.inner.cache.as_ref()?.snapshot();
+        for collection in ["agents", "panes"] {
+            let path = snapshot
+                .get(collection)
+                .and_then(Value::as_array)
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|row| row.get("pane_id").and_then(Value::as_str) == Some(pane_id))
+                })
+                .and_then(session_path_from_agent_value);
+            if let Some(path) = path {
+                return Some(path.to_owned());
+            }
+        }
+        None
+    }
+
+    /// Whether the transcript scan changed durable evidence or proved growth.
+    /// `Observed` means the recorded file identity moved (first observation
+    /// binds it, or the file was sealed); `Grew` additionally proves this
+    /// dispatch produced new bytes.
+    fn session_transcript_grew(&self, task: &mut PromptTaskRecord) -> TranscriptScan {
+        let (Some(baseline), Some(path)) = (
+            task.session_evidence_bytes,
+            task.session_evidence_path.as_deref(),
+        ) else {
+            return TranscriptScan::Unchanged;
+        };
+        // The offset belongs to the turn captured at submit. A rewritten
+        // turn id means this file growth is no longer that dispatch's evidence.
+        if task.session_evidence_closed
+            || task.session_evidence_turn_id.as_deref() != task.turn_id.as_deref()
+        {
+            return TranscriptScan::Unchanged;
+        }
+        // The identity the file must keep: the submit baseline when a file
+        // existed then, else the first observed file's bound identity. A
+        // missing-at-submit baseline stays `None` only until first sighting;
+        // afterwards the seen_* identity is the fence.
+        let baseline_identity = task
+            .session_evidence_dev
+            .zip(task.session_evidence_ino)
+            .filter(|(dev, ino)| !(*dev == 0 && *ino == 0));
+        let seen_identity = task
+            .session_evidence_seen_dev
+            .zip(task.session_evidence_seen_ino)
+            .filter(|(dev, ino)| !(*dev == 0 && *ino == 0));
+        let identity = baseline_identity.or(seen_identity);
+        let reference_btime = task
+            .session_evidence_btime_ns
+            .or(task.session_evidence_seen_btime_ns);
+        let (len, dev, ino, btime_ns) = match session_file_stat(Path::new(path)) {
+            SessionFileStat::File {
+                len,
+                dev,
+                ino,
+                btime_ns,
+            } => (len, dev, ino, btime_ns),
+            // "missing at submit" may still be created — but only while no
+            // file identity has ever been recorded. Once a file was observed
+            // (seen_* set), a missing stat is evidence of deletion and seals.
+            SessionFileStat::Missing
+                if baseline == 0
+                    && task.session_evidence_seen_dev.is_none()
+                    && identity.is_none() =>
+            {
+                return TranscriptScan::Unchanged;
+            }
+            SessionFileStat::Missing | SessionFileStat::Unreadable => {
+                task.session_evidence_closed = true;
+                return TranscriptScan::Observed;
+            }
+        };
+        if len < baseline
+            || task
+                .session_evidence_seen_len
+                .is_some_and(|seen| len < seen)
+        {
+            task.session_evidence_closed = true;
+            return TranscriptScan::Observed;
+        }
+        if task
+            .session_evidence_seen_len
+            .is_some_and(|seen| seen < baseline && len > seen && len > baseline)
+        {
+            // The file was observed shorter than the submit baseline and then
+            // grew past it. Those bytes are a rewrite, not this dispatch.
+            task.session_evidence_closed = true;
+            return TranscriptScan::Observed;
+        }
+        if let Some((expected_dev, expected_ino)) = identity
+            && (dev != expected_dev || ino != expected_ino)
+        {
+            task.session_evidence_closed = true;
+            return TranscriptScan::Observed;
+        }
+        if identity.is_none() && baseline > 0 {
+            // A file that already had bytes but no device identity cannot
+            // prove later bytes are the same file.
+            task.session_evidence_closed = true;
+            return TranscriptScan::Observed;
+        }
+        if baseline == 0 {
+            // Empty-baseline evidence needs a dev/ino identity fence plus
+            // the bound creation stamp to separate an append from a
+            // delete+recreate. A first sighting records `seen_*` below and
+            // a later sighting must keep both. Creation stamps alone are
+            // NOT identity: two different files can share one (they can be
+            // set equal), so a platform that cannot prove dev/ino (non-Unix
+            // `file_identity` yields `(0,0)`) must seal the first sighting
+            // itself — a replacement with a forged-equal stamp would
+            // otherwise be admitted and its growth wrongly recover the
+            // task (Codex 7038569024). A file with neither identity nor
+            // stamp seals the same way.
+            let provable_identity = dev != 0 || ino != 0;
+            let admissible = provable_identity
+                && match (reference_btime, btime_ns) {
+                    (Some(expected), Some(current)) => expected == current,
+                    // First sighting: `register_task` seeds `seen_dev` only
+                    // when a file existed at submit, so `seen_dev = None`
+                    // means this dispatch never bound any file identity;
+                    // the scan binds this stamp below as the fence.
+                    (None, Some(_)) => task.session_evidence_seen_dev.is_none(),
+                    _ => false,
+                };
+            if !admissible {
+                task.session_evidence_closed = true;
+                return TranscriptScan::Observed;
+            }
+        }
+        // Same device and inode is not enough: unlink plus recreate can reuse
+        // the inode and still be a different file. The captured prefix must
+        // still sit at the start.
+        if baseline > 0
+            && let Some(expected) = task.session_evidence_prefix.as_deref()
+        {
+            // Hash only the bytes that existed at submit. An append past that
+            // length must not change the digest.
+            let current = file_prefix_digest(Path::new(path), baseline as usize);
+            match current {
+                Some(current) if current == expected => {}
+                _ => {
+                    task.session_evidence_closed = true;
+                    return TranscriptScan::Observed;
+                }
+            }
+        } else if baseline > 0 {
+            task.session_evidence_closed = true;
+            return TranscriptScan::Observed;
+        }
+        let observed_changed = task.session_evidence_seen_dev != Some(dev)
+            || task.session_evidence_seen_ino != Some(ino)
+            || task.session_evidence_seen_len != Some(len)
+            || task.session_evidence_seen_btime_ns != btime_ns;
+        task.session_evidence_seen_dev = Some(dev);
+        task.session_evidence_seen_ino = Some(ino);
+        task.session_evidence_seen_len = Some(len);
+        task.session_evidence_seen_btime_ns = btime_ns;
+        // Bytes after the next same-path dispatch's baseline belong to that
+        // later task. The window stamp is taken before `agent.prompt`, so a
+        // slow registration cannot hide the later submit.
+        // A window-query failure cannot prove growth, but the freshly bound
+        // identity must still persist: returning `Unchanged` here would drop
+        // the first-sighting record and let a later replacement pose as the
+        // file this dispatch observed (Codex 7038274368).
+        let Ok(next) = self.next_session_baseline(task, path) else {
+            return if observed_changed {
+                TranscriptScan::Observed
+            } else {
+                TranscriptScan::Unchanged
+            };
+        };
+        let end = next.unwrap_or(len).min(len);
+        if end > baseline {
+            TranscriptScan::Grew
+        } else if observed_changed {
+            TranscriptScan::Observed
+        } else {
+            TranscriptScan::Unchanged
+        }
+    }
+
+    /// Smallest baseline of a later submit on the same session file.
+    fn next_session_baseline(
+        &self,
+        task: &PromptTaskRecord,
+        path: &str,
+    ) -> Result<Option<u64>, String> {
+        let mut next = None;
+        let now = self.now_ms();
+        let tasks = self
+            .list_active_tasks()?
+            .into_iter()
+            .chain(self.list_terminal_tasks()?);
+        for other in tasks {
+            if other.task_id == task.task_id {
+                continue;
+            }
+            if other.session_evidence_path.as_deref() != Some(path) {
+                continue;
+            }
+            let Some(other_baseline) = other.session_evidence_bytes else {
+                continue;
+            };
+            if !session_window_is_later(&other, task) {
+                continue;
+            }
+            next = Some(next.map_or(other_baseline, |current: u64| current.min(other_baseline)));
+        }
+        let open = self.open_session_windows()?;
+        for window in open {
+            if window.task_id == task.task_id
+                || window.path != path
+                || now.saturating_sub(window.published_at_ms) >= SESSION_WINDOW_TTL_MS
+            {
+                continue;
+            }
+            let later = task
+                .session_window_seq
+                .is_none_or(|current| window.seq > current);
+            if !later {
+                continue;
+            }
+            next = Some(next.map_or(window.bytes, |current: u64| current.min(window.bytes)));
+        }
+        Ok(next)
     }
 
     /// Applies one ordered cache window to a task record that is neither
@@ -2739,7 +3254,7 @@ impl PromptRegistry {
             return Ok(false);
         }
         let mut changed = if cursor.saturating_sub(task.last_cursor) > 2048 {
-            mark_delivery_uncertain(task, now_ms(), "event_history_gap")
+            self.seal_uncertain(task, "event_history_gap")
         } else {
             apply_events_with_final_excerpt(self.inner.client.as_ref(), Some(self), task, events)?
         };
@@ -3026,6 +3541,20 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "superseded_by",
     "foreground_blocker",
     "audit",
+    "session_evidence_path",
+    "session_evidence_bytes",
+    "session_evidence_turn_id",
+    "session_evidence_dev",
+    "session_evidence_ino",
+    "session_evidence_prefix",
+    "session_window_seq",
+    "session_evidence_closed",
+    "session_evidence_seen_dev",
+    "session_evidence_seen_ino",
+    "session_evidence_seen_len",
+    "session_evidence_btime_ns",
+    "session_evidence_seen_btime_ns",
+    "delivery_uncertain_reason",
 ];
 
 /// Overlay `new_json` onto the row's stored `result_json`, keeping only keys
@@ -3034,6 +3563,59 @@ const KNOWN_TASK_KEYS: &[&str] = &[
 /// instead of being dropped (#332 B-1 review P2). Known keys always come from
 /// the fresh serialization, so a cleared Option is never resurrected from the
 /// stale row. A stored payload that is not a JSON object is replaced whole.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+const SESSION_WINDOW_LEDGER_ID: &str = "op:prompt:session-windows";
+const SESSION_WINDOW_LEDGER_KIND: &str = "herdr_prompt_session_window";
+
+const SESSION_WINDOW_TTL_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SessionWindow {
+    task_id: String,
+    pane_id: Option<String>,
+    path: String,
+    bytes: u64,
+    dev: Option<u64>,
+    ino: Option<u64>,
+    seq: u64,
+    #[serde(default)]
+    published_at_ms: u64,
+}
+
+fn load_session_windows(store: &StateStore) -> Result<Vec<SessionWindow>, String> {
+    let Some(record) = store.operation_ledger(SESSION_WINDOW_LEDGER_ID)? else {
+        return Ok(Vec::new());
+    };
+    let Some(json) = record.result_json.as_deref() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(json).map_err(|error| format!("cannot decode session windows: {error}"))
+}
+
+fn save_session_windows(
+    store: &mut StateStore,
+    windows: &[SessionWindow],
+    now_ms: u64,
+) -> Result<(), String> {
+    let json = serde_json::to_string(windows)
+        .map_err(|error| format!("cannot encode session windows: {error}"))?;
+    let now = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    store.put_operation_ledger(OperationLedgerInput {
+        op_id: SESSION_WINDOW_LEDGER_ID,
+        kind: SESSION_WINDOW_LEDGER_KIND,
+        idempotency_key: None,
+        request_hash: None,
+        phase: "open",
+        state: "open",
+        result_json: json.as_str(),
+        now_ms: now,
+        expires_at: None,
+    })
+}
+
 fn merge_task_json(stored: Option<&str>, new_json: String) -> String {
     let Some(stored) = stored else {
         return new_json;
@@ -3066,6 +3648,9 @@ fn mark_delivery_uncertain(task: &mut PromptTaskRecord, now_ms: u64, reason: &st
     task.terminal_at_ms = Some(now_ms);
     task.notification_state = "pending".to_owned();
     task.notification_error = Some(reason.to_owned());
+    if reason == "activity_start_timeout" {
+        task.delivery_uncertain_reason = Some(reason.to_owned());
+    }
     task.updated_at_ms = now_ms;
     update_steering(task);
     true
@@ -3556,6 +4141,274 @@ fn task_event_type(event: &Value) -> String {
         .replace('.', "_")
 }
 
+/// `activity_start_timeout` is the only `delivery_uncertain` reason a later
+/// same-dispatch observation may leave. Boot changes and history gaps stay
+/// fail-closed: their cursors are not evidence for this prompt.
+/// The timeout itself is still open. A pending gate does not close it:
+/// reports must seal and check the turn before recording worker_done.
+fn activity_timeout_open(task: &PromptTaskRecord) -> bool {
+    if task.lifecycle != PromptTaskLifecycle::DeliveryUncertain {
+        return false;
+    }
+    match task.delivery_uncertain_reason.as_deref() {
+        Some("activity_start_timeout") => true,
+        None => {
+            task.notification_state == "pending"
+                && task.notification_error.as_deref() == Some("activity_start_timeout")
+        }
+        _ => false,
+    }
+}
+
+fn delivery_timeout_can_recover(task: &PromptTaskRecord) -> bool {
+    task.gate.is_none() && activity_timeout_open(task)
+}
+
+/// Submit order on one session file. The window stamp is published before
+/// `agent.prompt`. Rows that predate the stamp fall back to registration time.
+fn session_window_is_later(other: &PromptTaskRecord, task: &PromptTaskRecord) -> bool {
+    match (other.session_window_seq, task.session_window_seq) {
+        (Some(later), Some(earlier)) => later > earlier,
+        _ => {
+            other.created_at_ms > task.created_at_ms
+                || (other.created_at_ms == task.created_at_ms && other.task_id > task.task_id)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SessionEvidence {
+    path: Option<String>,
+    bytes: Option<u64>,
+    dev: Option<u64>,
+    ino: Option<u64>,
+    btime_ns: Option<u64>,
+    prefix: Option<String>,
+}
+
+impl SessionEvidence {
+    fn none() -> Self {
+        Self {
+            path: None,
+            bytes: None,
+            dev: None,
+            ino: None,
+            btime_ns: None,
+            prefix: None,
+        }
+    }
+
+    fn missing_file(path: impl Into<String>) -> Self {
+        Self {
+            path: Some(path.into()),
+            bytes: Some(0),
+            dev: None,
+            ino: None,
+            btime_ns: None,
+            prefix: None,
+        }
+    }
+
+    fn known(path: impl Into<String>, len: u64, dev: u64, ino: u64, btime_ns: Option<u64>) -> Self {
+        let path = path.into();
+        let prefix = file_prefix_digest(Path::new(&path), len as usize);
+        Self {
+            path: Some(path),
+            bytes: Some(len),
+            dev: Some(dev),
+            ino: Some(ino),
+            btime_ns,
+            prefix,
+        }
+    }
+}
+
+/// Result of one transcript scan, ordered by how strong the signal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptScan {
+    /// Nothing durable changed and the file did not grow past the baseline.
+    Unchanged,
+    /// The recorded file identity or seal state moved; persist it, but the
+    /// scan did not prove this dispatch produced new bytes.
+    Observed,
+    /// The file identity held and the window grew past the baseline: the
+    /// dispatch's transcript delivered.
+    Grew,
+}
+
+enum SessionFileStat {
+    Missing,
+    Unreadable,
+    File {
+        len: u64,
+        dev: u64,
+        ino: u64,
+        btime_ns: Option<u64>,
+    },
+}
+
+fn session_file_stat(path: &Path) -> SessionFileStat {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            let (dev, ino) = file_identity(&meta);
+            SessionFileStat::File {
+                len: meta.len(),
+                dev,
+                ino,
+                btime_ns: file_created_ns(&meta),
+            }
+        }
+        Ok(_) => SessionFileStat::Unreadable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionFileStat::Missing,
+        Err(_) => SessionFileStat::Unreadable,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test override for `file_created_ns`: `None` simulates a platform that
+    /// reports no creation stamp at all. Thread-local so parallel tests are
+    /// unaffected.
+    static TEST_FILE_CREATED_NS: core::cell::Cell<Option<Option<u64>>> = const { core::cell::Cell::new(None) };
+    /// Test override for `file_identity`: `Some((dev, ino))` replaces the
+    /// platform identity. `Some((0, 0))` simulates a platform without a
+    /// device/inode identity (the `#[cfg(not(unix))]` shape).
+    static TEST_FILE_IDENTITY: core::cell::Cell<Option<(u64, u64)>> = const { core::cell::Cell::new(None) };
+}
+
+/// File creation stamp in nanos since epoch. `Metadata::created` uses
+/// `statx` btime where the filesystem reports it; a filesystem that cannot
+/// prove creation returns None and the caller fails closed.
+fn file_created_ns(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(stamp) = TEST_FILE_CREATED_NS.get() {
+        return stamp;
+    }
+    meta.created()
+        .ok()
+        .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as u64)
+}
+
+const SESSION_PREFIX_BYTES: usize = 64;
+
+fn file_prefix_digest(path: &Path, baseline: usize) -> Option<String> {
+    let limit = baseline.min(SESSION_PREFIX_BYTES);
+    if limit == 0 {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut prefix = vec![0_u8; limit];
+    let count = std::io::Read::read(&mut file, &mut prefix).ok()?;
+    if count == 0 {
+        return None;
+    }
+    Some(format!("{:x}", Sha256::digest(&prefix[..count])))
+}
+
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(test)]
+    if let Some(identity) = TEST_FILE_IDENTITY.get() {
+        return identity;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
+/// Monotonic submit-window stamp. `created_at_ms` is registration time and
+/// can tie; this advances even when two submits share a millisecond.
+fn reserve_session_window_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0) as u64;
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.max(tick).saturating_add(1))
+    })
+    .unwrap_or(tick.saturating_add(1))
+}
+
+fn identity_mismatch(task: &PromptTaskRecord, value: &Value) -> bool {
+    value
+        .get("dispatch_id")
+        .and_then(Value::as_str)
+        .is_some_and(|dispatch_id| dispatch_id != task.dispatch_id)
+        || value
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .is_some_and(|turn_id| {
+                task.turn_id
+                    .as_deref()
+                    .is_some_and(|current| current != turn_id)
+            })
+}
+
+fn event_identity<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
+    event
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            event
+                .get("pane")
+                .and_then(|pane| pane.get(key))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// Recoverable timeout events must name this dispatch and this turn.
+/// Missing identity is not evidence the status belongs to the timed-out prompt.
+fn recoverable_event_names_this_turn(task: &PromptTaskRecord, event: &Value) -> bool {
+    let Some(dispatch_id) = event_identity(event, "dispatch_id") else {
+        return false;
+    };
+    let Some(turn_id) = event_identity(event, "turn_id") else {
+        return false;
+    };
+    dispatch_id == task.dispatch_id && task.turn_id.as_deref() == Some(turn_id)
+}
+
+/// True when the event names a different dispatch or turn than this task.
+fn event_names_other_turn(task: &PromptTaskRecord, event: &Value) -> bool {
+    identity_mismatch(task, event)
+        || event
+            .get("pane")
+            .is_some_and(|pane| identity_mismatch(task, pane))
+}
+
+/// Session growth proved the prompt reached the agent. Clear the timeout hold
+/// and keep the dispatch turn id already stored on the task.
+fn clear_receipt_for_recovery(task: &mut PromptTaskRecord) {
+    task.acknowledged_at_ms = None;
+    task.notification_attempts = 0;
+    task.notification_at_ms = None;
+}
+
+fn note_transcript_delivery(task: &mut PromptTaskRecord, now_ms: u64) {
+    clear_receipt_for_recovery(task);
+    task.activity_observed = true;
+    task.lifecycle = PromptTaskLifecycle::Running;
+    task.terminal_status = None;
+    task.terminal_cursor = None;
+    task.terminal_at_ms = None;
+    task.notification_error = None;
+    task.delivery_uncertain_reason = None;
+    task.notification_state = "pending".to_owned();
+    task.updated_at_ms = now_ms;
+    update_steering(task);
+}
+
 fn event_matches_task_pane(task: &PromptTaskRecord, event: &Value) -> bool {
     let pane_id = event.get("pane_id").and_then(Value::as_str).or_else(|| {
         event
@@ -3568,16 +4421,33 @@ fn event_matches_task_pane(task: &PromptTaskRecord, event: &Value) -> bool {
 
 fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
     let cursor = event.get("cursor").and_then(Value::as_u64).unwrap_or(0);
-    if task.is_terminal() || cursor <= task.start_cursor || cursor <= task.last_cursor {
+    let recoverable = delivery_timeout_can_recover(task);
+    if (!recoverable && task.is_terminal())
+        || cursor <= task.start_cursor
+        || cursor <= task.last_cursor
+    {
         return false;
     }
     if !event_matches_task_pane(task, event) {
+        return false;
+    }
+    // A recoverable timeout only accepts an event that names this dispatch
+    // and turn. A later task's pane status has no such identity.
+    if recoverable {
+        if !recoverable_event_names_this_turn(task, event) {
+            return false;
+        }
+    } else if event_names_other_turn(task, event) {
         return false;
     }
 
     let kind = task_event_type(event);
     let now = now_ms();
     if matches!(kind.as_str(), "pane_closed" | "pane_exited") {
+        // A closed pane is not evidence that the timed-out prompt arrived.
+        if recoverable {
+            return false;
+        }
         task.lifecycle = PromptTaskLifecycle::Failed;
         task.terminal_status = Some(kind);
         task.terminal_cursor = Some(cursor);
@@ -3604,6 +4474,15 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
 
     match status {
         "working" => {
+            if recoverable {
+                clear_receipt_for_recovery(task);
+                task.terminal_status = None;
+                task.terminal_cursor = None;
+                task.terminal_at_ms = None;
+                task.notification_error = None;
+                task.delivery_uncertain_reason = None;
+                task.notification_state = "pending".to_owned();
+            }
             task.activity_observed = true;
             task.lifecycle = PromptTaskLifecycle::Running;
             if task.turn_id.is_none() {
@@ -3623,6 +4502,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
             update_steering(task);
             true
         }
+        "blocked" if recoverable => false,
         "blocked" => {
             if !task.activity_observed {
                 task.activity_observed = true;
@@ -3642,6 +4522,7 @@ fn apply_task_event(task: &mut PromptTaskRecord, event: &Value) -> bool {
             update_steering(task);
             true
         }
+        "idle" | "done" if recoverable => false,
         "idle" | "done" if task.activity_observed => {
             task.lifecycle = PromptTaskLifecycle::Completed;
             task.terminal_status = Some(status.to_owned());
@@ -3916,11 +4797,7 @@ fn logical_excerpt_from_agent_session(
         return None;
     }
     let agent = response.get("agent").unwrap_or(&response);
-    let session = agent.get("agent_session")?;
-    if session.get("kind").and_then(Value::as_str) != Some("path") {
-        return None;
-    }
-    let path = session.get("value").and_then(Value::as_str)?;
+    let path = session_path_from_agent_value(agent)?;
     let text = read_session_tail_text(Path::new(path))?;
     let excerpt = shape_final_excerpt(&text);
     if excerpt.trim().is_empty() {
@@ -3951,6 +4828,17 @@ fn pane_still_serves_capture(
             && state.state_change_seq == Some(capture_seq)
             && state.agent_status.as_deref() == terminal_status
     })
+}
+
+/// `agent_session` path value. Shared by the narrow-pane excerpt and the
+/// activity-start delivery check so both read the same transcript.
+fn session_path_from_agent_value(agent: &Value) -> Option<&str> {
+    let session = agent.get("agent_session")?;
+    if session.get("kind").and_then(Value::as_str) != Some("path") {
+        return None;
+    }
+    let path = session.get("value").and_then(Value::as_str)?;
+    (!path.is_empty()).then_some(path)
 }
 
 /// Last assistant message text from the tail of a JSONL agent transcript.
@@ -4180,8 +5068,20 @@ fn begin_persisted(
                 .task_operation_ids_by_key_digest(PROMPT_TASK_OPERATION_KIND, &digest, now_i64)
                 .and_then(|mut ids| {
                     if ids.is_empty() {
-                        // Before this release, task rows were not indexed by key.
-                        // Their deterministic task_id still guards exact retries.
+                        // #665 legacy fallback: task rows written before the
+                        // key-digest index existed are not returned by
+                        // `task_operation_ids_by_key_digest`. Their
+                        // deterministic `task_id` still guards exact retries,
+                        // so we probe `dispatch_id(key, fingerprint)` directly.
+                        //
+                        // TTL淘汰条件（此分支自身即为淘汰边界）：
+                        // - `record.expires_at` 为 None 的旧行永不视为已淘汰
+                        //   （旧写入路径不记录 TTL，保守视为仍拥有该 key）；
+                        // - `expires_at <= now_i64` 的行已过期，不推入
+                        //   `ids`，key 可重新保留；
+                        // - `expires_at > now_i64` 的行仍然有效，阻止重放。
+                        // 该分支在 #980 B2 下保留：只要存在 `expires_at` 为
+                        // None 或未过期的旧行，删除它会放开对旧 key 的防护。
                         let old_id = dispatch_id(Some(key), fingerprint);
                         if let Some(record) = store.operation_ledger(&old_id)?
                             && record.kind == PROMPT_TASK_OPERATION_KIND
@@ -5468,11 +6368,14 @@ pub fn run_with_parent_session(
     let mut dispatch_text = injection
         .as_ref()
         .map_or_else(|| text.to_owned(), |injection| injection.text.clone());
+    let turn_for_report = runtime_turn_id(task_id, "dispatch");
     if inject_task_identity {
         // Runtime-generated ids are bounded and contain no caller/session data.
         // Keep this after fingerprinting and the replay return above.
+        // The turn id is the same value register_task stores before any
+        // activity advances the turn, so a late worker_done can name it.
         dispatch_text.push_str(&format!(
-            "\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
+            "\n[herdr-task task_id={task_id} dispatch_id={dispatch_id} turn_id={turn_for_report}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --turn-id {turn_for_report} --kind worker_done. For long tasks, report --kind heartbeat periodically."
         ));
     }
     // Native Herdr 0.9.x wait is lifecycle/status based and cannot identify the
@@ -5482,6 +6385,22 @@ pub fn run_with_parent_session(
         "target": target,
         "text": dispatch_text,
     });
+    // Stat the session before the submit. Bytes written while `agent.prompt`
+    // is in flight must stay above this baseline or a fast first token is
+    // classified as never delivered.
+    let pre_submit = registry.observe_session_evidence(pane_id);
+    // Publish the window before the RPC. A concurrent reconcile of an older
+    // task on this file can see this baseline while agent.prompt is in flight.
+    // A submit that never leaves this process drops the reservation.
+    if let Err(error) = registry.publish_session_window(task_id, pane_id, &pre_submit) {
+        return json!({
+            "ok": false,
+            "code": "agent_task_store_unavailable",
+            "message": error,
+            "delivery_state": "not_delivered",
+            "retryable": true,
+        });
+    }
 
     // A spawn dispatch submits its prompt with only what is left of the chain
     // the caller is waiting for; every other dispatch keeps the default budget.
@@ -5501,6 +6420,9 @@ pub fn run_with_parent_session(
         ),
         Err(error) => prompt_failure(client, target, before.as_ref(), false, error, task_id),
     };
+    if dispatch_definitely_not_delivered(&result) {
+        let _ = registry.take_session_window(task_id);
+    }
     if let Some(audit) = dispatch_audit.as_mut() {
         let root = audit
             .get("project_root")
@@ -5630,6 +6552,7 @@ pub fn run_with_parent_session(
         request_id,
         foreground_blocker,
         audit: dispatch_audit.clone(),
+        pre_submit_session: Some(pre_submit),
     }) {
         Ok(Some(task)) => {
             if let Some(object) = result.as_object_mut() {
@@ -8666,10 +9589,11 @@ mod tests {
 
     #[test]
     fn idempotency_registry_prevents_parallel_and_conflicting_reuse() {
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         assert!(matches!(
             registry.begin("k", "fp-1").unwrap(),
-            BeginPrompt::Reserved(None)
+            BeginPrompt::Reserved(Some(_))
         ));
         assert_eq!(
             registry.begin("k", "fp-1").unwrap_err()["code"],
@@ -8891,9 +9815,10 @@ mod tests {
             server.join().unwrap();
             let task_id = first["task_id"].as_str().unwrap();
             let dispatch_id = first["dispatch_id"].as_str().unwrap();
+            let turn_id = runtime_turn_id(task_id, "dispatch");
             let expected = if inject {
                 format!(
-                    "original text\n\n[herdr-task task_id={task_id} dispatch_id={dispatch_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
+                    "original text\n\n[herdr-task task_id={task_id} dispatch_id={dispatch_id} turn_id={turn_id}]\nReport completion exactly once: herdr-mcp agent report --task-id {task_id} --dispatch-id {dispatch_id} --turn-id {turn_id} --kind worker_done. For long tasks, report --kind heartbeat periodically."
                 )
             } else {
                 "original text\n".to_owned()
@@ -9213,6 +10138,7 @@ mod tests {
                 request_id: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .expect("store present, so the task is registered");
@@ -11061,7 +11987,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
@@ -11204,7 +12129,8 @@ mod tests {
             }
         });
         let client = HerdrClient::new(&socket);
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         let args = json!({
             "target": "pi",
             "text": "do work",
@@ -11384,6 +12310,7 @@ mod tests {
                 on_budget: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .unwrap();
@@ -11585,6 +12512,7 @@ mod tests {
                 on_budget: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .unwrap();
@@ -11615,6 +12543,1947 @@ mod tests {
         fs::remove_file(&db_path).ok();
         fs::remove_file(db_path.with_extension("sqlite-wal")).ok();
         fs::remove_file(db_path.with_extension("sqlite-shm")).ok();
+    }
+
+    fn registry_with_snapshot(
+        tag: &str,
+        snapshot: Value,
+    ) -> (PathBuf, PromptRegistry, Arc<EventCache>) {
+        let db_path = env::temp_dir().join(format!(
+            "herdr-mcp-agent-task-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(Mutex::new(StateStore::open(&db_path).unwrap()));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(snapshot));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
+                clock: None,
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: Some(Arc::clone(&cache)),
+                client: None,
+            }),
+        };
+        (db_path, registry, cache)
+    }
+
+    fn register_idle_task(
+        registry: &PromptRegistry,
+        task_id: &str,
+        pane_id: &str,
+    ) -> PromptTaskRecord {
+        let idle = AgentState {
+            pane_id: Some(pane_id.to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(1),
+            kind: None,
+        };
+        registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target: "child",
+                requested_target: None,
+                fingerprint: task_id,
+                idempotency_key: None,
+                before: Some(&idle),
+                after: Some(&idle),
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+                stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
+                foreground_blocker: None,
+                audit: None,
+                pre_submit_session: None,
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    fn age_for_activity_timeout(registry: &PromptRegistry, task_id: &str) {
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        task.updated_at_ms = registry
+            .now_ms()
+            .saturating_sub(PROMPT_TASK_ACTIVITY_START_TIMEOUT_MS + 1);
+        registry.save_task(&task, None).unwrap();
+    }
+
+    fn status_event(pane_id: &str, status: &str, dispatch_id: &str, turn_id: &str) -> Value {
+        json!({
+            "event": "pane.agent_status_changed",
+            "type": "pane.agent_status_changed",
+            "pane_id": pane_id,
+            "agent_status": status,
+            "dispatch_id": dispatch_id,
+            "turn_id": turn_id,
+            "state_change_seq": 21,
+        })
+    }
+
+    /// user dispatcher | Given a prompt that already timed out waiting for
+    /// activity | When a later same-dispatch working event arrives out of
+    /// order | Then the task leaves delivery_uncertain and runs on its
+    /// original turn. A different pane, a blocked status, or another turn
+    /// does not recover it, and a boot-mismatch hold stays fail-closed.
+    #[test]
+    fn late_working_recovers_only_the_same_dispatch_turn() {
+        let (db_path, registry, cache) =
+            registry_with_snapshot("late-working", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:late-working";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert_eq!(
+            uncertain.notification_error.as_deref(),
+            Some("activity_start_timeout")
+        );
+        assert!(uncertain.is_terminal());
+
+        let mut untouched = uncertain.clone();
+        assert!(
+            !apply_task_event(
+                &mut untouched,
+                &json!({"cursor": 0, "pane_id": "w1:p1", "agent_status": "working", "dispatch_id": task_id, "turn_id": turn_id})
+            ),
+            "a cursor at or before submit is not late progress"
+        );
+        assert!(
+            !apply_task_event(
+                &mut untouched,
+                &json!({"cursor": 50, "pane_id": "w1:p1", "type": "pane.closed", "dispatch_id": task_id, "turn_id": turn_id})
+            ),
+            "pane closure is not delivery evidence"
+        );
+        assert_eq!(untouched.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+
+        cache.inject_event_for_test(status_event("w9:p9", "working", task_id, &turn_id));
+        cache.inject_event_for_test(status_event("w1:p1", "blocked", task_id, &turn_id));
+        cache.inject_event_for_test(status_event(
+            "w1:p1",
+            "working",
+            "dispatch:prompt:other",
+            &turn_id,
+        ));
+        cache.inject_event_for_test(status_event("w1:p1", "working", task_id, "turn:other"));
+        cache.inject_event_for_test(json!({
+            "event": "pane.agent_status_changed",
+            "type": "pane.agent_status_changed",
+            "pane_id": "w1:p1",
+            "agent_status": "working",
+        }));
+        let still = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(still.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert_eq!(
+            still.delivery_uncertain_reason.as_deref(),
+            Some("activity_start_timeout")
+        );
+
+        // Parent notification reuses and clears notification_error. Recovery
+        // must still see the durable reason.
+        let mut notified = still;
+        notified.notification_error = None;
+        notified.notification_state = "delivered".to_owned();
+        registry.save_task(&notified, None).unwrap();
+
+        cache.inject_event_for_test(status_event("w1:p1", "working", task_id, &turn_id));
+        let recovered = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(recovered.activity_observed);
+        assert!(!recovered.is_terminal());
+        assert_eq!(recovered.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert!(recovered.terminal_status.is_none());
+        assert!(recovered.notification_error.is_none());
+        let status = registry.task_status(task_id);
+        assert_eq!(status["task"]["lifecycle"], "running");
+        assert_eq!(status["task"]["terminal"], false);
+
+        let mut fenced = recovered.clone();
+        fenced.task_id = "dispatch:prompt:boot-holds".to_owned();
+        fenced.dispatch_id = fenced.task_id.clone();
+        fenced.lifecycle = PromptTaskLifecycle::DeliveryUncertain;
+        fenced.terminal_status = Some("delivery_uncertain".to_owned());
+        fenced.notification_error = Some("runtime_boot_changed".to_owned());
+        fenced.activity_observed = false;
+        fenced.turn_id = Some(runtime_turn_id(&fenced.task_id, "dispatch"));
+        registry.save_task(&fenced, None).unwrap();
+        cache.inject_event_for_test(status_event(
+            "w1:p1",
+            "working",
+            &fenced.dispatch_id,
+            fenced.turn_id.as_deref().unwrap(),
+        ));
+        let held = registry.reconcile_task(&fenced.task_id).unwrap().unwrap();
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert_eq!(
+            held.notification_error.as_deref(),
+            Some("runtime_boot_changed")
+        );
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given the working event is already in the cache when
+    /// the activity window elapses | When reconcile runs once | Then the task
+    /// is running, not left delivery_uncertain.
+    #[test]
+    fn out_of_order_working_event_avoids_a_stuck_delivery_uncertain() {
+        let (db_path, registry, cache) =
+            registry_with_snapshot("out-of-order-working", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:out-of-order-working";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        cache.inject_event_for_test(status_event("w1:p1", "working", task_id, &turn_id));
+
+        let reconciled = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(reconciled.lifecycle, PromptTaskLifecycle::Running);
+        assert!(reconciled.activity_observed);
+        assert!(!reconciled.is_terminal());
+        assert_eq!(reconciled.turn_id.as_deref(), Some(turn_id.as_str()));
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user worker | Given a prompt held as activity_start_timeout | When the
+    /// same dispatch reports worker_done | Then the task completes. A
+    /// different dispatch, a different turn, a heartbeat, or a boot-mismatch
+    /// hold does not.
+    #[test]
+    fn late_worker_done_recovers_only_the_same_dispatch() {
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("late-worker-done", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:late-worker-done";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+
+        let report = |params| {
+            task_call_with_parent_session(&registry, AGENT_TASK_REPORT_METHOD, &params, None)
+        };
+        assert_eq!(
+            report(json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "kind": "heartbeat"
+            }))["code"],
+            "agent_task_terminal"
+        );
+        assert_eq!(
+            report(json!({
+                "task_id": task_id,
+                "dispatch_id": "dispatch:prompt:other",
+                "kind": "worker_done"
+            }))["code"],
+            "task_identity_mismatch"
+        );
+        assert_eq!(
+            report(json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": "turn:other",
+                "kind": "worker_done"
+            }))["code"],
+            "task_identity_mismatch"
+        );
+        let unchanged = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(unchanged.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(unchanged.worker_done_at_ms.is_none());
+        assert_eq!(
+            unchanged.delivery_uncertain_reason.as_deref(),
+            Some("activity_start_timeout")
+        );
+        let mut notified = unchanged;
+        notified.notification_error = None;
+        notified.notification_state = "delivered".to_owned();
+        registry.save_task(&notified, None).unwrap();
+
+        let done = report(json!({
+            "task_id": task_id,
+            "dispatch_id": task_id,
+            "turn_id": turn_id,
+            "kind": "worker_done",
+            "summary": "finished after the timeout"
+        }));
+        assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(done["task"]["lifecycle"], "completed");
+        assert_eq!(done["task"]["terminal_status"], "worker_done");
+        assert_eq!(done["task"]["terminal"], true);
+        assert!(done["task"]["notification_error"].is_null());
+        let stored = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(stored.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(stored.terminal_status.as_deref(), Some("worker_done"));
+        assert!(stored.notification_error.is_none());
+        assert_eq!(
+            stored.worker_done_summary.as_deref(),
+            Some("finished after the timeout")
+        );
+
+        let mut boot = stored.clone();
+        boot.task_id = "dispatch:prompt:boot-report".to_owned();
+        boot.dispatch_id = boot.task_id.clone();
+        boot.lifecycle = PromptTaskLifecycle::DeliveryUncertain;
+        boot.terminal_status = Some("delivery_uncertain".to_owned());
+        boot.notification_error = Some("runtime_boot_changed".to_owned());
+        boot.worker_done_at_ms = None;
+        boot.worker_done_summary = None;
+        boot.turn_id = Some(runtime_turn_id(&boot.task_id, "dispatch"));
+        registry.save_task(&boot, None).unwrap();
+        let refused = report(json!({
+            "task_id": boot.task_id,
+            "dispatch_id": boot.dispatch_id,
+            "turn_id": boot.turn_id,
+            "kind": "worker_done"
+        }));
+        assert_eq!(refused["ok"], true, "{refused}");
+        assert_eq!(refused["task"]["lifecycle"], "delivery_uncertain");
+        assert_eq!(
+            refused["task"]["notification_error"],
+            "runtime_boot_changed"
+        );
+        let held = registry.load_task(&boot.task_id).unwrap().unwrap();
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(held.worker_done_at_ms.is_some());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    fn session_snapshot(path: &std::path::Path) -> Value {
+        json!({
+            "agents": [{
+                "pane_id": "w1:p1",
+                "agent_session": {
+                    "kind": "path",
+                    "value": path.to_string_lossy()
+                }
+            }]
+        })
+    }
+
+    /// user dispatcher | Given a submitted prompt whose session JSONL grows
+    /// before the activity window elapses | When reconcile hits the start
+    /// timeout | Then the task is running and is not marked delivery_uncertain.
+    /// An unchanged transcript, including one that already had bytes at
+    /// submit, stays delivery_uncertain.
+    #[test]
+    fn session_growth_is_delivery_evidence_and_a_quiet_transcript_is_not() {
+        let grew_path = env::temp_dir().join(format!(
+            "herdr-mcp-session-grew-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let quiet_path = env::temp_dir().join(format!(
+            "herdr-mcp-session-quiet-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let created_path = env::temp_dir().join(format!(
+            "herdr-mcp-session-created-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&grew_path, initial).unwrap();
+        fs::write(&quiet_path, initial).unwrap();
+
+        let (grew_db, grew_registry, _) =
+            registry_with_snapshot("jsonl-grew", session_snapshot(&grew_path));
+        let grew_id = "dispatch:prompt:jsonl-grew";
+        let grew = register_idle_task(&grew_registry, grew_id, "w1:p1");
+        assert_eq!(grew.session_evidence_bytes, Some(initial.len() as u64));
+        assert_eq!(
+            grew.session_evidence_path.as_deref(),
+            Some(grew_path.to_string_lossy().as_ref())
+        );
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&grew_path)
+            .unwrap();
+        writeln!(
+            file,
+            "{{\"message\":{{\"role\":\"assistant\",\"content\":\"late token\"}}}}"
+        )
+        .unwrap();
+        drop(file);
+        age_for_activity_timeout(&grew_registry, grew_id);
+        let recovered = grew_registry.reconcile_task(grew_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(recovered.activity_observed);
+        assert!(!recovered.is_terminal());
+        assert!(recovered.notification_error.is_none());
+        assert_eq!(
+            grew_registry.task_status(grew_id)["task"]["lifecycle"],
+            "running"
+        );
+
+        let (quiet_db, quiet_registry, _) =
+            registry_with_snapshot("jsonl-quiet", session_snapshot(&quiet_path));
+        let quiet_id = "dispatch:prompt:jsonl-quiet";
+        let quiet = register_idle_task(&quiet_registry, quiet_id, "w1:p1");
+        assert_eq!(quiet.session_evidence_bytes, Some(initial.len() as u64));
+        age_for_activity_timeout(&quiet_registry, quiet_id);
+        let uncertain = quiet_registry.reconcile_task(quiet_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert_eq!(
+            uncertain.notification_error.as_deref(),
+            Some("activity_start_timeout")
+        );
+        assert!(uncertain.is_terminal());
+
+        let (created_db, created_registry, _) =
+            registry_with_snapshot("jsonl-created", session_snapshot(&created_path));
+        let created_id = "dispatch:prompt:jsonl-created";
+        let created = register_idle_task(&created_registry, created_id, "w1:p1");
+        assert_eq!(created.session_evidence_bytes, Some(0));
+        fs::write(&created_path, initial).unwrap();
+        age_for_activity_timeout(&created_registry, created_id);
+        let created_task = created_registry
+            .reconcile_task(created_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(created_task.lifecycle, PromptTaskLifecycle::Running);
+        assert!(!created_task.is_terminal());
+
+        drop(grew_registry);
+        drop(quiet_registry);
+        drop(created_registry);
+        for path in [&grew_db, &quiet_db, &created_db] {
+            remove_escalation_db(path);
+        }
+        for path in [&grew_path, &quiet_path, &created_path] {
+            fs::remove_file(path).ok();
+        }
+    }
+
+    /// user dispatcher | Given a prompt already marked activity_start_timeout
+    /// | When its session JSONL grows afterwards | Then the next reconcile
+    /// recovers it. Growth of a different file does not.
+    #[test]
+    fn session_growth_after_timeout_recovers_and_other_files_do_not() {
+        use std::io::Write;
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-late-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let other = env::temp_dir().join(format!(
+            "herdr-mcp-session-other-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        fs::write(&other, initial).unwrap();
+        let (db_path, registry, _) = registry_with_snapshot("jsonl-late", session_snapshot(&path));
+        let task_id = "dispatch:prompt:jsonl-late";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&other)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"nope\"}}\n")
+            .unwrap();
+        let still = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(still.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"late\"}}\n")
+            .unwrap();
+        let recovered = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(recovered.activity_observed);
+        assert!(!recovered.is_terminal());
+        assert!(recovered.notification_error.is_none());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+        fs::remove_file(&other).ok();
+    }
+
+    /// user dispatcher | Given two prompts share one session file | When the
+    /// later prompt's bytes arrive after its own baseline | Then only that
+    /// later prompt recovers. Bytes written before the later baseline still
+    /// belong to the earlier prompt.
+    #[test]
+    fn session_growth_after_a_later_dispatch_does_not_recover_the_earlier_task() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-shared-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("jsonl-shared", session_snapshot(&path));
+        let earlier_id = "dispatch:prompt:jsonl-earlier";
+        let later_id = "dispatch:prompt:jsonl-later";
+        register_idle_task(&registry, earlier_id, "w1:p1");
+        register_idle_task(&registry, later_id, "w1:p1");
+        let mut earlier = registry.load_task(earlier_id).unwrap().unwrap();
+        let mut later = registry.load_task(later_id).unwrap().unwrap();
+        earlier.created_at_ms = 1;
+        later.created_at_ms = 2;
+        earlier.session_window_seq = Some(1);
+        later.session_window_seq = Some(2);
+        later.session_evidence_bytes = earlier.session_evidence_bytes;
+        registry.save_task(&earlier, None).unwrap();
+        registry.save_task(&later, None).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later task\"}}\n")
+            .unwrap();
+
+        age_for_activity_timeout(&registry, earlier_id);
+        let timed_out = registry.reconcile_task(earlier_id).unwrap().unwrap();
+        assert_eq!(
+            timed_out.lifecycle,
+            PromptTaskLifecycle::DeliveryUncertain,
+            "later dispatch bytes must not revive the earlier task"
+        );
+
+        age_for_activity_timeout(&registry, later_id);
+        let owner = registry.reconcile_task(later_id).unwrap().unwrap();
+        assert_eq!(owner.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given the earlier prompt's own bytes landed before
+    /// the next dispatch stat | When the earlier task times out | Then those
+    /// bytes still count as its delivery evidence.
+    #[test]
+    fn session_bytes_before_the_next_baseline_still_recover_the_earlier_task() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-window-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("jsonl-window", session_snapshot(&path));
+        let earlier_id = "dispatch:prompt:jsonl-window-earlier";
+        let later_id = "dispatch:prompt:jsonl-window-later";
+        register_idle_task(&registry, earlier_id, "w1:p1");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"earlier\"}}\n")
+            .unwrap();
+        register_idle_task(&registry, later_id, "w1:p1");
+        let mut earlier = registry.load_task(earlier_id).unwrap().unwrap();
+        let mut later = registry.load_task(later_id).unwrap().unwrap();
+        earlier.created_at_ms = 1;
+        later.created_at_ms = 2;
+        earlier.session_window_seq = Some(1);
+        later.session_window_seq = Some(2);
+        assert!(later.session_evidence_bytes.unwrap() > earlier.session_evidence_bytes.unwrap());
+        registry.save_task(&earlier, None).unwrap();
+        registry.save_task(&later, None).unwrap();
+        age_for_activity_timeout(&registry, earlier_id);
+        let recovered = registry.reconcile_task(earlier_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(!recovered.is_terminal());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a baseline captured before submit | When the
+    /// agent writes before register_task stats the file | Then the stored
+    /// baseline stays at the pre-submit length and later growth is visible.
+    #[test]
+    fn pre_submit_session_baseline_is_not_replaced_by_a_fast_first_token() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-presubmit-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("jsonl-presubmit", session_snapshot(&path));
+        let task_id = "dispatch:prompt:jsonl-presubmit";
+        let idle = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(1),
+            kind: None,
+        };
+        let path_string = path.to_string_lossy().into_owned();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"fast\"}}\n")
+            .unwrap();
+        let task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target: "child",
+                requested_target: None,
+                fingerprint: task_id,
+                idempotency_key: None,
+                before: Some(&idle),
+                after: Some(&idle),
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+                stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
+                foreground_blocker: None,
+                audit: None,
+                pre_submit_session: Some({
+                    let meta = fs::metadata(&path).unwrap();
+                    let (dev, ino) = file_identity(&meta);
+                    let btime_ns = file_created_ns(&meta);
+                    SessionEvidence::known(
+                        path_string.clone(),
+                        initial.len() as u64,
+                        dev,
+                        ino,
+                        btime_ns,
+                    )
+                }),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.session_evidence_bytes, Some(initial.len() as u64));
+        assert_eq!(task.session_evidence_turn_id, task.turn_id);
+        age_for_activity_timeout(&registry, task_id);
+        let recovered = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(!recovered.is_terminal());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given an activity timeout and then a different runtime
+    /// boot | When the session file grows and a matching working event arrives
+    /// | Then the task stays delivery_uncertain and recovery is sealed.
+    #[test]
+    fn user_delivery_recovery_stays_closed_after_boot_mismatch() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-boot-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, cache) =
+            registry_with_snapshot("boot-seal", session_snapshot(&path));
+        let task_id = "dispatch:prompt:boot-seal";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        let mut restarted = uncertain;
+        restarted.boot_epoch = Some("previous-boot".to_owned());
+        registry.save_task(&restarted, None).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"after restart\"}}\n")
+            .unwrap();
+        cache.inject_event_for_test(status_event("w1:p1", "working", task_id, &turn_id));
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert_eq!(
+            sealed.delivery_uncertain_reason.as_deref(),
+            Some("recovery_closed")
+        );
+        assert_eq!(
+            sealed.notification_error.as_deref(),
+            Some("runtime_boot_changed")
+        );
+        assert!(!delivery_timeout_can_recover(&sealed));
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given an activity timeout and then an event-history
+    /// gap | When the session grows or a matching worker_done arrives | Then
+    /// the timeout cannot recover.
+    #[test]
+    fn user_delivery_recovery_stays_closed_after_history_gap() {
+        let (db_path, registry, cache) =
+            registry_with_snapshot("gap-seal", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:gap-seal";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            uncertain.delivery_uncertain_reason.as_deref(),
+            Some("activity_start_timeout")
+        );
+        let mut gapped = uncertain;
+        gapped.boot_epoch = Some(cache.boot_id().to_owned());
+        gapped.last_cursor = 0;
+        registry.save_task(&gapped, None).unwrap();
+        for cursor in 1..=2049 {
+            cache.inject_event_for_test(json!({
+                "event": "pane.agent_status_changed",
+                "type": "pane.agent_status_changed",
+                "pane_id": "w9:p9",
+                "agent_status": "idle",
+                "cursor": cursor,
+            }));
+        }
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            sealed.delivery_uncertain_reason.as_deref(),
+            Some("recovery_closed")
+        );
+        assert_eq!(
+            sealed.notification_error.as_deref(),
+            Some("event_history_gap")
+        );
+        let done = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(done["task"]["lifecycle"], "delivery_uncertain", "{done}");
+        assert_eq!(done["task"]["delivery_uncertain_reason"], "recovery_closed");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given the captured session file is replaced or
+    /// truncated | When reconcile looks for growth | Then the timeout stays
+    /// closed. Bytes appended to the original file still recover.
+    #[test]
+    fn user_delivery_recovery_rejects_rotated_or_truncated_transcripts() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-rotate-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"hi\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) = registry_with_snapshot("rotate-seal", session_snapshot(&path));
+        let task_id = "dispatch:prompt:rotate-seal";
+        register_idle_task(&registry, task_id, "w1:p1");
+        let original = registry.load_task(task_id).unwrap().unwrap();
+        assert!(original.session_evidence_dev.is_some());
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"other file\"}}\n",
+        )
+        .unwrap();
+        // Linux can hand the new file the inode that was just released. Store
+        // that identity before reconcile, so the prefix check is what rejects
+        // the rotation even when the inode did not change.
+        let mut same_inode = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        same_inode.session_evidence_dev = Some(dev);
+        same_inode.session_evidence_ino = Some(ino);
+        registry.save_task(&same_inode, None).unwrap();
+        let rotated = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(rotated.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert_eq!(
+            rotated.delivery_uncertain_reason.as_deref(),
+            Some("activity_start_timeout")
+        );
+        fs::write(&path, b"x").unwrap();
+        let truncated = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(truncated.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+
+        let grown_id = "dispatch:prompt:rotate-grown";
+        let grown_path = env::temp_dir().join(format!(
+            "herdr-mcp-session-rotate-grown-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&grown_path, initial).unwrap();
+        let (grown_db, grown_registry, _) =
+            registry_with_snapshot("rotate-grown", session_snapshot(&grown_path));
+        register_idle_task(&grown_registry, grown_id, "w1:p1");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&grown_path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"same file\"}}\n")
+            .unwrap();
+        age_for_activity_timeout(&grown_registry, grown_id);
+        let recovered = grown_registry.reconcile_task(grown_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        drop(grown_registry);
+        remove_escalation_db(&db_path);
+        remove_escalation_db(&grown_db);
+        fs::remove_file(&path).ok();
+        fs::remove_file(&grown_path).ok();
+    }
+
+    /// user dispatcher | Given a session file that was missing at submit |
+    /// When the first reconcile still finds nothing and a later pass finds
+    /// the transcript created | Then recovery still follows the grown file.
+    #[test]
+    fn user_session_file_missing_at_submit_can_be_created_later() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-missing-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) =
+            registry_with_snapshot("missing-later", session_snapshot(&path));
+        let task_id = "dispatch:prompt:missing-later";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        // First reconcile while the file is still absent must NOT seal the
+        // evidence: the task enters the recoverable delivery_uncertain and
+        // stays open for the file appearing later.
+        let first = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(first.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(!first.session_evidence_closed);
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later\"}}\n")
+            .unwrap();
+        let recovered = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(!recovered.is_terminal());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a session file that existed empty at submit |
+    /// When it is deleted and recreated before reconcile | Then the evidence
+    /// stays sealed; a recreated file at the same path is not the dispatch.
+    #[test]
+    fn user_empty_baseline_recreated_file_stays_sealed() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-empty-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, b"").unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("empty-rotate", session_snapshot(&path));
+        let task_id = "dispatch:prompt:empty-rotate";
+        register_idle_task(&registry, task_id, "w1:p1");
+        let baseline = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(baseline.session_evidence_bytes, Some(0));
+        assert!(baseline.session_evidence_dev.is_some());
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"other\"}}\n",
+        )
+        .unwrap();
+        // Even when Linux hands the recreated file the same inode, the
+        // creation stamp differs. Forcing the recorded identity to the new
+        // file's makes the creation check the only fence, so the outcome is
+        // deterministic regardless of inode reuse.
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        task.session_evidence_dev = Some(dev);
+        task.session_evidence_ino = Some(ino);
+        registry.save_task(&task, None).unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a session file missing at submit that was then
+    /// observed empty | When it is deleted and replaced by a grown file |
+    /// Then the bound first-sighting identity seals the recovery: the new
+    /// file's bytes are not this dispatch's evidence (Codex 7037362769).
+    #[test]
+    fn user_first_sighting_binds_identity_and_a_replacement_stays_sealed() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-bind-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("bind-sight", session_snapshot(&path));
+        let task_id = "dispatch:prompt:bind-sight";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        // The file appears empty after the timeout but before any bytes are
+        // flushed: the scan binds (dev, ino, btime_ns, len=0) as the observed
+        // identity AND persists it — no growth yet, so the task stays
+        // delivery_uncertain with open evidence.
+        fs::write(&path, b"").unwrap();
+        let bound = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(bound.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(!bound.session_evidence_closed);
+        assert!(bound.session_evidence_seen_dev.is_some());
+        assert_eq!(bound.session_evidence_seen_len, Some(0));
+
+        // The observed file is deleted and a new file is created at the same
+        // path with content. Even when the filesystem reuses the inode, the
+        // new file has a different creation stamp; a different inode fails
+        // the identity check directly. Either way the bound identity seals.
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"other\"}}\n",
+        )
+        .unwrap();
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        // Force the observed identity to the replacement's inode so the
+        // creation stamp is the only remaining fence, making the outcome
+        // deterministic regardless of inode reuse.
+        task.session_evidence_seen_dev = Some(dev);
+        task.session_evidence_seen_ino = Some(ino);
+        registry.save_task(&task, None).unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a session file missing at submit that was
+    /// observed and then deleted | When reconcile runs while it is absent |
+    /// Then the bound identity treats the missing stat as deletion and seals
+    /// — a still-missing file is only open while nothing was ever sighted.
+    #[test]
+    fn user_observed_then_deleted_missing_at_submit_seals() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-seen-gone-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("seen-gone", session_snapshot(&path));
+        let task_id = "dispatch:prompt:seen-gone";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        fs::write(&path, b"").unwrap();
+        let bound = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert!(!bound.session_evidence_closed);
+        fs::remove_file(&path).unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user tracker | Given a recoverable timeout older than 512 newer
+    /// tasks | When the periodic/tracker pass runs | Then the windowed-out
+    /// task is still reconciled and recovered by transcript growth.
+    #[test]
+    fn user_recoverable_timeout_beyond_the_recent_window_still_recovers() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-window-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, _) = registry_with_snapshot("window-old", session_snapshot(&path));
+        let task_id = "dispatch:prompt:window-old";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        // 600 newer tasks push the recoverable row outside list_tasks(512)'s
+        // updated_at window. They use a different pane so no session baseline
+        // claims the grown bytes.
+        for index in 0..600 {
+            register_idle_task(
+                &registry,
+                &format!("dispatch:prompt:filler-{index}"),
+                "w1:p2",
+            );
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"late\"}}\n")
+            .unwrap();
+        registry.reconcile_recoverable_timeouts();
+        let recovered = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given the session-window ledger is corrupt when the
+    /// first file sighting binds | When the sighting is written and a
+    /// replacement later appears | Then the persisted identity still seals
+    /// the recovery instead of treating the replacement as the first file
+    /// (Codex 7038274368).
+    #[test]
+    fn user_first_sighting_survives_a_failed_window_query() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-winfail-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("win-fail", session_snapshot(&path));
+        let task_id = "dispatch:prompt:win-fail";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        // Drain the pending apply_task_window batch first so the corrupted
+        // scan below is the ONLY change signal — otherwise the window
+        // application alone flips `changed` and persists the in-memory
+        // identity even when the scan returns `Unchanged` (pi 7038974347:
+        // the regression must isolate the fix).
+        registry.reconcile_task(task_id).unwrap();
+        // Corrupt the session-window ledger so `next_session_baseline` fails
+        // inside the scan; `put_operation_ledger` on the task itself still
+        // works, so the bound identity must persist.
+        {
+            let store = Arc::clone(registry.inner.store.as_ref().unwrap());
+            let mut store = store.lock().unwrap();
+            store
+                .put_operation_ledger(OperationLedgerInput {
+                    op_id: SESSION_WINDOW_LEDGER_ID,
+                    kind: SESSION_WINDOW_LEDGER_KIND,
+                    idempotency_key: None,
+                    request_hash: None,
+                    phase: "open",
+                    state: "open",
+                    result_json: "not-valid-json",
+                    now_ms: now_ms() as i64,
+                    expires_at: None,
+                })
+                .unwrap();
+        }
+        fs::write(&path, b"").unwrap();
+        let sighted = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert!(
+            sighted.session_evidence_seen_dev.is_some(),
+            "the failed window query must still persist the bound identity"
+        );
+        assert!(!sighted.session_evidence_closed);
+        // Restore the ledger, then replace the file: the bound first-sighting
+        // identity (not a fresh sighting of the replacement) must seal.
+        {
+            let store = Arc::clone(registry.inner.store.as_ref().unwrap());
+            let mut store = store.lock().unwrap();
+            save_session_windows(&mut store, &[], now_ms()).unwrap();
+        }
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        // The persisted record — not just the in-memory one — must carry
+        // the bound identity; assert before aligning it below.
+        assert!(
+            task.session_evidence_seen_dev.is_some(),
+            "the failed window query must persist the first-sighting identity"
+        );
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        // Align the bound identity to the replacement so the creation stamp
+        // is the only remaining fence — deterministic under inode reuse.
+        task.session_evidence_seen_dev = Some(dev);
+        task.session_evidence_seen_ino = Some(ino);
+        registry.save_task(&task, None).unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a platform that proves neither file identity
+    /// nor a creation stamp | When a file first appears | Then the very
+    /// first sighting seals — every later path (delete, recreate, grow) is
+    /// unreachable once sealed (Codex 7038274368).
+    #[test]
+    fn user_zero_identity_platform_seals_recovery() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-noid-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("no-identity", session_snapshot(&path));
+        let task_id = "dispatch:prompt:no-identity";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        TEST_FILE_IDENTITY.set(Some((0, 0)));
+        TEST_FILE_CREATED_NS.set(Some(None));
+        // First sighting with no provable identity and no stamp seals
+        // immediately — anything later at this path is indistinguishable
+        // from the file this dispatch observed.
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        TEST_FILE_IDENTITY.set(None);
+        TEST_FILE_CREATED_NS.set(None);
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a platform with no dev/ino identity but a
+    /// creation stamp | When a file appears, is replaced, or grows | Then
+    /// every sighting seals — an equal creation stamp is forgeable and is
+    /// not an identity fence (Codex 7038569024).
+    #[test]
+    fn user_stamp_only_platform_still_fences_replacements() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-stamp-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) = registry_with_snapshot("stamp-only", session_snapshot(&path));
+        let task_id = "dispatch:prompt:stamp-only";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        TEST_FILE_IDENTITY.set(Some((0, 0)));
+        TEST_FILE_CREATED_NS.set(Some(Some(1_000_000)));
+        // First sighting seals even though a stamp exists: without dev/ino,
+        // a replacement created with the same stamp is indistinguishable.
+        fs::write(&path, b"").unwrap();
+        let first = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(first.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(first.session_evidence_closed);
+        // A replacement reporting an identical stamp must not recover the
+        // task — equal stamps are not identity.
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"x\"}}\n",
+        )
+        .unwrap();
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        TEST_FILE_IDENTITY.set(None);
+        TEST_FILE_CREATED_NS.set(None);
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user tracker | Given a delivery_uncertain task whose transcript then
+    /// grows | When the tracker pass runs without an inbox request | Then it
+    /// recovers the task instead of waiting for the next status poll.
+    #[test]
+    fn user_tracker_pass_recovers_a_recoverable_timeout() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-tracker-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("tracker-recover", session_snapshot(&path));
+        let task_id = "dispatch:prompt:tracker-recover";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"late\"}}\n")
+            .unwrap();
+        registry.reconcile_active_tasks();
+        let recovered = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a later submit has reserved its window before
+    /// the earlier timeout is reconciled | When the file grows to that later
+    /// baseline | Then the earlier task does not claim those bytes.
+    #[test]
+    fn user_delivery_recovery_honors_a_window_reserved_before_registration() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-reserve-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("window-reserve", session_snapshot(&path));
+        let earlier_id = "dispatch:prompt:window-earlier";
+        let later_id = "dispatch:prompt:window-later";
+        register_idle_task(&registry, earlier_id, "w1:p1");
+        let earlier = registry.load_task(earlier_id).unwrap().unwrap();
+        let mut later = earlier.clone();
+        later.task_id = later_id.to_owned();
+        later.dispatch_id = later_id.to_owned();
+        later.turn_id = Some(runtime_turn_id(later_id, "dispatch"));
+        later.session_evidence_turn_id = later.turn_id.clone();
+        later.session_window_seq = Some(earlier.session_window_seq.unwrap().saturating_add(1));
+        later.created_at_ms = earlier.created_at_ms;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later\"}}\n")
+            .unwrap();
+        later.session_evidence_bytes = earlier.session_evidence_bytes;
+        registry.save_task(&later, None).unwrap();
+        age_for_activity_timeout(&registry, earlier_id);
+        let held = registry.reconcile_task(earlier_id).unwrap().unwrap();
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        age_for_activity_timeout(&registry, later_id);
+        let owner = registry.reconcile_task(later_id).unwrap().unwrap();
+        assert_eq!(owner.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user worker | Given an activity-start timeout | When worker_done omits
+    /// the turn or the stored row has no turn | Then the task stays
+    /// delivery_uncertain. The matching turn still completes it.
+    #[test]
+    fn user_late_worker_done_requires_the_stored_turn() {
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("late-turn", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:late-turn";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        assert_eq!(
+            registry.reconcile_task(task_id).unwrap().unwrap().lifecycle,
+            PromptTaskLifecycle::DeliveryUncertain
+        );
+        let report = |params| {
+            task_call_with_parent_session(&registry, AGENT_TASK_REPORT_METHOD, &params, None)
+        };
+        let omitted = report(json!({
+            "task_id": task_id,
+            "dispatch_id": task_id,
+            "kind": "worker_done"
+        }));
+        assert_eq!(omitted["ok"], false, "{omitted}");
+        assert_eq!(omitted["code"], "worker_done_turn_required");
+        assert_eq!(omitted["task"]["lifecycle"], "delivery_uncertain");
+        assert!(omitted["task"]["worker_done_at_ms"].is_null());
+        let stored = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(stored.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(stored.worker_done_at_ms.is_none());
+
+        let mut blank = stored.clone();
+        blank.task_id = "dispatch:prompt:late-turn-blank".to_owned();
+        blank.dispatch_id = blank.task_id.clone();
+        blank.turn_id = None;
+        blank.session_evidence_turn_id = None;
+        registry.save_task(&blank, None).unwrap();
+        let blank_report = report(json!({
+            "task_id": blank.task_id,
+            "dispatch_id": blank.dispatch_id,
+            "kind": "worker_done"
+        }));
+        assert_eq!(blank_report["ok"], false, "{blank_report}");
+        assert_eq!(blank_report["code"], "worker_done_turn_required");
+        assert_eq!(blank_report["task"]["lifecycle"], "delivery_uncertain");
+        assert!(blank_report["task"]["worker_done_at_ms"].is_null());
+        let held = registry.load_task(&blank.task_id).unwrap().unwrap();
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+
+        let matched = report(json!({
+            "task_id": task_id,
+            "dispatch_id": task_id,
+            "turn_id": turn_id,
+            "kind": "worker_done"
+        }));
+        assert_eq!(matched["task"]["lifecycle"], "completed", "{matched}");
+        assert_eq!(matched["task"]["terminal_status"], "worker_done");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given an upgraded row whose timeout reason is only
+    /// notification_error | When the same turn reports worker_done | Then the
+    /// task completes. A row whose notification_error was already cleared
+    /// stays delivery_uncertain.
+    #[test]
+    fn user_legacy_timeout_row_recovers_until_its_reason_is_cleared() {
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("legacy-reason", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:legacy-reason";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let mut legacy = registry.reconcile_task(task_id).unwrap().unwrap();
+        legacy.delivery_uncertain_reason = None;
+        assert_eq!(
+            legacy.notification_error.as_deref(),
+            Some("activity_start_timeout")
+        );
+        registry.save_task(&legacy, None).unwrap();
+        let recovered = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(recovered["task"]["lifecycle"], "completed", "{recovered}");
+
+        let mut cleared = legacy;
+        cleared.task_id = "dispatch:prompt:legacy-cleared".to_owned();
+        cleared.dispatch_id = cleared.task_id.clone();
+        cleared.turn_id = Some(runtime_turn_id(&cleared.task_id, "dispatch"));
+        cleared.notification_error = None;
+        cleared.worker_done_at_ms = None;
+        registry.save_task(&cleared, None).unwrap();
+        let held = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": cleared.task_id,
+                "dispatch_id": cleared.dispatch_id,
+                "turn_id": cleared.turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(held["ok"], true, "{held}");
+        assert_eq!(held["task"]["lifecycle"], "delivery_uncertain");
+        assert!(held["task"]["worker_done_at_ms"].is_u64());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given task B has published its session window but
+    /// has not finished agent.prompt | When task A reconciles the shared
+    /// transcript | Then B's bytes do not recover A.
+    #[test]
+    fn user_inflight_session_window_keeps_later_bytes_from_the_earlier_task() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-inflight-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("inflight-window", session_snapshot(&path));
+        let earlier_id = "dispatch:prompt:inflight-earlier";
+        let later_id = "dispatch:prompt:inflight-later";
+        register_idle_task(&registry, earlier_id, "w1:p1");
+        let earlier = registry.load_task(earlier_id).unwrap().unwrap();
+        let evidence = SessionEvidence::known(
+            path.to_string_lossy().to_string(),
+            earlier.session_evidence_bytes.unwrap(),
+            earlier.session_evidence_dev.unwrap(),
+            earlier.session_evidence_ino.unwrap(),
+            earlier.session_evidence_btime_ns,
+        );
+        registry
+            .publish_session_window(later_id, Some("w1:p1"), &evidence)
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later\"}}\n")
+            .unwrap();
+        age_for_activity_timeout(&registry, earlier_id);
+        let held = registry.reconcile_task(earlier_id).unwrap().unwrap();
+        assert_eq!(held.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(
+            registry
+                .open_session_windows()
+                .unwrap()
+                .iter()
+                .any(|window| {
+                    window.task_id == later_id && window.seq > earlier.session_window_seq.unwrap()
+                })
+        );
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given the same inode is observed shorter than the
+    /// baseline and later grows past it | When reconcile runs again | Then the
+    /// earlier task stays delivery_uncertain.
+    #[test]
+    fn user_truncation_then_regrowth_does_not_recover_the_old_dispatch() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-truncate-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("truncate-regrow", session_snapshot(&path));
+        let task_id = "dispatch:prompt:truncate-regrow";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        fs::write(&path, b"x").unwrap();
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        let truncated = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert!(truncated.session_evidence_closed);
+        assert_eq!(truncated.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"after truncate\"}}\n")
+            .unwrap();
+        let still = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(still.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(still.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user worker | Given an activity timeout and then a boot change | When
+    /// the matching worker_done arrives before the next reconcile | Then the
+    /// report does not complete the task.
+    #[test]
+    fn user_worker_done_before_reconcile_cannot_cross_a_boot_change() {
+        let (db_path, registry, cache) =
+            registry_with_snapshot("report-before-boot", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:report-before-boot";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let mut uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        uncertain.boot_epoch = Some("previous-boot".to_owned());
+        registry.save_task(&uncertain, None).unwrap();
+        let _ = cache.boot_id();
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "delivery_uncertain");
+        assert_eq!(
+            report["task"]["delivery_uncertain_reason"],
+            "recovery_closed"
+        );
+        let stored = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            stored.delivery_uncertain_reason.as_deref(),
+            Some("recovery_closed")
+        );
+        assert_ne!(stored.lifecycle, PromptTaskLifecycle::Completed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given a timeout whose digest already holds working
+    /// and then done | When the session file has also grown | Then the task
+    /// settles completed instead of staying running.
+    #[test]
+    fn user_transcript_growth_still_applies_the_same_event_batch() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-batch-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, cache) =
+            registry_with_snapshot("growth-batch", session_snapshot(&path));
+        let task_id = "dispatch:prompt:growth-batch";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"done\"}}\n")
+            .unwrap();
+        cache.inject_event_for_test(status_event("w1:p1", "working", task_id, &turn_id));
+        cache.inject_event_for_test(json!({
+            "event": "pane.agent_status_changed",
+            "type": "pane.agent_status_changed",
+            "pane_id": "w1:p1",
+            "agent_status": "done",
+            "dispatch_id": task_id,
+            "turn_id": turn_id,
+            "state_change_seq": 22,
+        }));
+        let settled = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(settled.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(settled.terminal_status.as_deref(), Some("done"));
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user parent | Given an acknowledged delivery_uncertain receipt | When
+    /// the same turn later reports worker_done | Then the new completion is
+    /// unacknowledged and visible in the default inbox.
+    #[test]
+    fn user_recovered_completion_is_visible_after_the_uncertain_receipt_was_acked() {
+        let (db_path, registry, _cache) =
+            registry_with_snapshot("acked-recovery", json!({"panes": [], "agents": []}));
+        let task_id = "dispatch:prompt:acked-recovery";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let mut uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        uncertain.acknowledged_at_ms = Some(uncertain.updated_at_ms);
+        uncertain.notification_state = "delivered".to_owned();
+        registry.save_task(&uncertain, None).unwrap();
+        let done = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(done["task"]["lifecycle"], "completed", "{done}");
+        assert_eq!(done["task"]["acknowledged"], false);
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        let rows = inbox["tasks"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["task_id"] == task_id && row["lifecycle"] == "completed"),
+            "{inbox}"
+        );
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user parent | Given only an inbox poll | When the timed-out task's
+    /// session file grows | Then the inbox shows running without a separate
+    /// status call.
+    #[test]
+    fn user_inbox_poll_reconciles_a_recoverable_timeout() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-inbox-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("inbox-recover", session_snapshot(&path));
+        let task_id = "dispatch:prompt:inbox-recover";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"late\"}}\n")
+            .unwrap();
+        let inbox = registry.task_inbox(None, Some("parent"), None, false, false, 10);
+        assert_eq!(inbox["summary"]["running"], 1, "{inbox}");
+        assert_eq!(inbox["summary"]["uncertain"], 0, "{inbox}");
+        let stored = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(stored.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user worker | Given agent.prompt already shows working | When the
+    /// injected report command names the dispatch turn | Then the task
+    /// completes instead of rejecting the turn.
+    #[test]
+    fn user_injected_report_matches_the_turn_saved_after_a_working_response() {
+        let (db_path, registry) = escalation_registry("working-turn");
+        let task_id = "dispatch:prompt:working-turn";
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(1),
+            kind: None,
+        };
+        let after = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("working".to_owned()),
+            state_change_seq: Some(4),
+            kind: None,
+        };
+        let task = registry
+            .register_task(RegisterTaskInput {
+                task_id,
+                target: "child",
+                requested_target: None,
+                fingerprint: task_id,
+                idempotency_key: None,
+                before: Some(&before),
+                after: Some(&after),
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: Some("parent"),
+                parent_session_ref: None,
+                stall_after_ms: None,
+                request_id: None,
+                max_runtime_ms: None,
+                on_budget: None,
+                foreground_blocker: None,
+                audit: None,
+                pre_submit_session: None,
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.lifecycle, PromptTaskLifecycle::Running);
+        let injected = runtime_turn_id(task_id, "dispatch");
+        assert_eq!(task.turn_id.as_deref(), Some(injected.as_str()));
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": injected,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "completed");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user worker | Given a store-only registry with no event cache | When a
+    /// matching worker_done arrives after activity_start_timeout | Then the
+    /// task stays delivery_uncertain.
+    #[test]
+    fn user_store_only_report_does_not_recover_an_unverified_timeout() {
+        let (db_path, registry) = escalation_registry("store-only-report");
+        let task_id = "dispatch:prompt:store-only-report";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "turn_id": turn_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "delivery_uncertain");
+        assert_eq!(
+            report["task"]["delivery_uncertain_reason"],
+            "recovery_closed"
+        );
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user worker | Given an activity timeout that also has an open gate |
+    /// When worker_done omits the turn | Then the report is refused and the
+    /// gate release does not complete it.
+    #[test]
+    fn user_gated_timeout_report_still_requires_the_stored_turn() {
+        let (db_path, registry) = escalation_registry("gated-report");
+        let task_id = "dispatch:prompt:gated-report";
+        let _task = register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let mut uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        uncertain.gate = Some(crate::state_store::decision_gates::DecisionGate {
+            gate_id: "gate-1".to_owned(),
+            task_id: task_id.to_owned(),
+            question: "continue?".to_owned(),
+            options: vec!["yes".to_owned()],
+            status: "open".to_owned(),
+            resolution: None,
+            resolved_by: None,
+            created_at_ms: 1,
+            resolved_at_ms: None,
+            creator_parent_session_ref: None,
+        });
+        assert!(activity_timeout_open(&uncertain));
+        assert!(!delivery_timeout_can_recover(&uncertain));
+        registry.save_task(&uncertain, None).unwrap();
+        // This registry has no event cache, so the report first seals the
+        // timeout. The missing turn is then a normal terminal report.
+        let report = task_call_with_parent_session(
+            &registry,
+            AGENT_TASK_REPORT_METHOD,
+            &json!({
+                "task_id": task_id,
+                "dispatch_id": task_id,
+                "kind": "worker_done"
+            }),
+            None,
+        );
+        assert_eq!(report["ok"], true, "{report}");
+        assert_eq!(report["task"]["lifecycle"], "delivery_uncertain");
+        assert_eq!(
+            report["task"]["delivery_uncertain_reason"],
+            "recovery_closed"
+        );
+        let held = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(
+            held.delivery_uncertain_reason.as_deref(),
+            Some("recovery_closed")
+        );
+        assert_ne!(held.lifecycle, PromptTaskLifecycle::Completed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user dispatcher | Given a timeout whose digest contains only done or
+    /// only pane_closed | When the session file grew | Then that event settles
+    /// the task.
+    #[test]
+    fn user_transcript_growth_applies_a_terminal_event_without_a_working_event() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-done-only-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, cache) =
+            registry_with_snapshot("done-only", session_snapshot(&path));
+        let task_id = "dispatch:prompt:done-only";
+        let task = register_idle_task(&registry, task_id, "w1:p1");
+        let turn_id = task.turn_id.clone().unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"done\"}}\n")
+            .unwrap();
+        cache.inject_event_for_test(json!({
+            "event": "pane.agent_status_changed",
+            "type": "pane.agent_status_changed",
+            "pane_id": "w1:p1",
+            "agent_status": "done",
+            "dispatch_id": task_id,
+            "turn_id": turn_id,
+        }));
+        let settled = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(settled.lifecycle, PromptTaskLifecycle::Completed);
+        assert_eq!(settled.terminal_status.as_deref(), Some("done"));
+
+        let closed_path = env::temp_dir().join(format!(
+            "herdr-mcp-session-closed-only-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &closed_path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (closed_db, closed_registry, closed_cache) =
+            registry_with_snapshot("closed-only", session_snapshot(&closed_path));
+        let closed_id = "dispatch:prompt:closed-only";
+        let closed = register_idle_task(&closed_registry, closed_id, "w1:p1");
+        let closed_turn = closed.turn_id.clone().unwrap();
+        age_for_activity_timeout(&closed_registry, closed_id);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&closed_path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"closed\"}}\n")
+            .unwrap();
+        closed_cache.inject_event_for_test(json!({
+            "event": "pane.closed",
+            "type": "pane.closed",
+            "pane_id": "w1:p1",
+            "dispatch_id": closed_id,
+            "turn_id": closed_turn,
+        }));
+        let failed = closed_registry.reconcile_task(closed_id).unwrap().unwrap();
+        assert_eq!(failed.lifecycle, PromptTaskLifecycle::Failed);
+        assert_eq!(failed.terminal_status.as_deref(), Some("pane_closed"));
+
+        drop(registry);
+        drop(closed_registry);
+        remove_escalation_db(&db_path);
+        remove_escalation_db(&closed_db);
+        fs::remove_file(&path).ok();
+        fs::remove_file(&closed_path).ok();
+    }
+
+    /// user dispatcher | Given a published session window older than its TTL |
+    /// When the earlier task's file grows | Then the stale window does not
+    /// cap that growth.
+    #[test]
+    fn user_expired_session_window_does_not_cap_earlier_growth() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-expired-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let initial = b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
+        fs::write(&path, initial).unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("expired-window", session_snapshot(&path));
+        let earlier_id = "dispatch:prompt:expired-earlier";
+        register_idle_task(&registry, earlier_id, "w1:p1");
+        let earlier = registry.load_task(earlier_id).unwrap().unwrap();
+        let evidence = SessionEvidence::known(
+            path.to_string_lossy().to_string(),
+            earlier.session_evidence_bytes.unwrap(),
+            earlier.session_evidence_dev.unwrap(),
+            earlier.session_evidence_ino.unwrap(),
+            earlier.session_evidence_btime_ns,
+        );
+        registry
+            .publish_session_window("dispatch:prompt:expired-later", Some("w1:p1"), &evidence)
+            .unwrap();
+        let store = registry.inner.store.as_ref().unwrap().lock().unwrap();
+        let mut windows = load_session_windows(&store).unwrap();
+        drop(store);
+        windows[0].published_at_ms = registry.now_ms().saturating_sub(SESSION_WINDOW_TTL_MS + 1);
+        let mut store = registry.inner.store.as_ref().unwrap().lock().unwrap();
+        save_session_windows(&mut store, &windows, registry.now_ms()).unwrap();
+        drop(store);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later\"}}\n")
+            .unwrap();
+        age_for_activity_timeout(&registry, earlier_id);
+        let recovered = registry.reconcile_task(earlier_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -11707,7 +14576,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(Arc::clone(&store)),
                 cache: Some(Arc::clone(&cache)),
@@ -11745,6 +14613,7 @@ mod tests {
                 on_budget: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .unwrap();
@@ -11879,6 +14748,20 @@ mod tests {
             superseded_by: None,
             foreground_blocker: None,
             audit: None,
+            session_evidence_path: None,
+            session_evidence_bytes: None,
+            session_evidence_turn_id: None,
+            session_evidence_dev: None,
+            session_evidence_ino: None,
+            session_evidence_prefix: None,
+            session_window_seq: None,
+            session_evidence_closed: false,
+            session_evidence_seen_dev: None,
+            session_evidence_seen_ino: None,
+            session_evidence_seen_len: None,
+            session_evidence_btime_ns: None,
+            session_evidence_seen_btime_ns: None,
+            delivery_uncertain_reason: None,
         }
     }
 
@@ -13064,7 +15947,8 @@ mod tests {
     /// read | Then the call is rejected with the existing invalid-params style.
     #[test]
     fn inbox_rejects_wait_ms_outside_the_bounded_range() {
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         for wait_ms in [
             json!(0),
             json!(60_001),
@@ -13217,7 +16101,8 @@ mod tests {
     /// Then the call is rejected with the existing invalid-params style.
     #[test]
     fn inbox_rejects_an_unknown_view() {
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         let inbox = task_call_with_parent_session(
             &registry,
             AGENT_TASK_INBOX_METHOD,
@@ -13426,7 +16311,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -13572,6 +16456,20 @@ mod tests {
             superseded_by: None,
             foreground_blocker: None,
             audit: None,
+            session_evidence_path: None,
+            session_evidence_bytes: None,
+            session_evidence_turn_id: None,
+            session_evidence_dev: None,
+            session_evidence_ino: None,
+            session_evidence_prefix: None,
+            session_window_seq: None,
+            session_evidence_closed: false,
+            session_evidence_seen_dev: None,
+            session_evidence_seen_ino: None,
+            session_evidence_seen_len: None,
+            session_evidence_seen_btime_ns: None,
+            session_evidence_btime_ns: None,
+            delivery_uncertain_reason: None,
         }
     }
 
@@ -14579,7 +17477,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -14765,7 +17662,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: None,
@@ -14835,6 +17731,7 @@ mod tests {
                 on_budget: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .unwrap();
@@ -14871,6 +17768,7 @@ mod tests {
                 on_budget: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .unwrap();
@@ -14979,6 +17877,7 @@ mod tests {
             on_budget: None,
             foreground_blocker: None,
             audit: None,
+            pre_submit_session: None,
         };
 
         crate::state_store::test_hooks::inject_ledger_batch_failure_after(Some(1));
@@ -15055,6 +17954,7 @@ mod tests {
                 on_budget: None,
                 foreground_blocker: None,
                 audit: None,
+                pre_submit_session: None,
             })
             .unwrap()
             .unwrap();
@@ -15255,6 +18155,14 @@ mod tests {
         task.steering_state = Some("x".to_owned());
         task.superseded_by = Some("x".to_owned());
         task.foreground_blocker = Some(json!({"pane_id": "w1:p1"}));
+        task.session_evidence_path = Some("session.jsonl".to_owned());
+        task.session_evidence_bytes = Some(1);
+        task.session_evidence_turn_id = Some("turn".to_owned());
+        task.session_evidence_dev = Some(1);
+        task.session_evidence_ino = Some(1);
+        task.session_window_seq = Some(1);
+        task.session_evidence_closed = false;
+        task.delivery_uncertain_reason = Some("activity_start_timeout".to_owned());
         let value: Value = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
         let keys = value.as_object().unwrap();
         for key in keys.keys() {
@@ -15724,7 +18632,7 @@ mod tests {
             "a rejected dispatch must not write a task row"
         );
         assert!(
-            registry.inner.records.lock().unwrap().is_empty(),
+            !registry.dispatch_key_already_known("guard-self-1"),
             "a rejected dispatch must not reserve idempotency state"
         );
 
@@ -15781,7 +18689,7 @@ mod tests {
             2,
             "a rejected dispatch must not write a task row"
         );
-        assert!(registry.inner.records.lock().unwrap().is_empty());
+        assert!(!registry.dispatch_key_already_known("guard-depth-1"));
 
         // Web planner → supervisor → worker is the allowed depth: the planner is
         // a browser session, not another active task in the ledger.
@@ -15936,7 +18844,6 @@ mod tests {
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
                 #[cfg(test)]
                 clock: None,
-                records: Mutex::new(HashMap::new()),
                 handoff_injected_panes: Mutex::new(HashSet::new()),
                 store: Some(store),
                 cache: Some(cache),
@@ -16886,7 +19793,8 @@ mod tests {
         let socket = temp_socket();
         let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
         let listener = refused_spawn_server(&socket);
-        let registry = PromptRegistry::new();
+        let registry =
+            PromptRegistry::with_store(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap())));
         let client = HerdrClient::new(&socket);
         for (key, value) in [
             ("max_runtime_ms", json!(1000)),
