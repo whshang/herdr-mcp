@@ -5242,6 +5242,11 @@ mod tests {
                 .cloned()
                 .collect();
             assert_eq!(
+                matches.len(),
+                1,
+                "{id} must appear exactly once: {matches:?}"
+            );
+            assert_eq!(
                 matches[0]["evidence"], expected,
                 "the single entry must be the persisted projection carrying evidence: {matches:?}"
             );
