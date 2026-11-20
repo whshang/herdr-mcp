@@ -1191,30 +1191,10 @@ impl ExecRegistry {
             .map(|sessions| sessions.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         let mut views = sessions.iter().map(session_view).collect::<Vec<_>>();
-        if let Ok(recovered) = self.inner.recovered.lock() {
-            // A recovered session already rebuilt into the resident map (a
-            // boot-loaded spool or an earlier read) must not be listed twice
-            // — once as a real view and once as a recovery tombstone.
-            views.extend(
-                recovered
-                    .iter()
-                    .filter(|(id, _)| !sessions.iter().any(|session| session.id == **id))
-                    .map(|(id, state)| {
-                        json!({
-                            "session_id": id,
-                            "cwd": Value::Null,
-                            "command": Value::Null,
-                            "started_at": Value::Null,
-                            "running": false,
-                            "exit_code": Value::Null,
-                            "signal": Value::Null,
-                            "truncated": false,
-                            "recovered": true,
-                            "recovery_state": state,
-                        })
-                    }),
-            );
-        }
+        let mut listed = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<std::collections::HashSet<_>>();
         if let Ok(store) = self.inner.state_store.lock()
             && let Ok(rows) =
                 store.closed_before_restart_exec_sessions(now_ms(), RECOVERY_MAX_ENTRIES)
@@ -1224,14 +1204,14 @@ impl ExecRegistry {
             // in-process recovery map after a further restart — but the row
             // still proves the session existed and its evidence state must
             // stay listable (Codex 7038349860 P2). Rows already resident
-            // keep their full session view instead of a tombstone.
+            // keep their full session view instead of a tombstone, and this
+            // persisted projection wins over an in-process `recovered`
+            // tombstone for the same id (Codex 7038637903 P2): it carries
+            // real timestamps plus the evidence state the bare recovery
+            // state lacks.
             views.extend(
                 rows.iter()
-                    .filter(|record| {
-                        !sessions
-                            .iter()
-                            .any(|session| session.id == record.session_id)
-                    })
+                    .filter(|record| listed.insert(record.session_id.clone()))
                     .map(|record| {
                         let probe =
                             load_session_from_spool_or_record(&self.inner.state_dir, record);
@@ -1258,6 +1238,31 @@ impl ExecRegistry {
                             "recovered": true,
                             "recovery_state": "closed_before_restart",
                             "evidence": evidence,
+                        })
+                    }),
+            );
+        }
+        if let Ok(recovered) = self.inner.recovered.lock() {
+            // A session already projected — resident, or as a persisted
+            // closed_before_restart tombstone above — must not appear twice
+            // (Codex 7038637903 P2: on the settling boot the same missing /
+            // corrupt row would otherwise list once per source).
+            views.extend(
+                recovered
+                    .iter()
+                    .filter(|(id, _)| listed.insert((*id).clone()))
+                    .map(|(id, state)| {
+                        json!({
+                            "session_id": id,
+                            "cwd": Value::Null,
+                            "command": Value::Null,
+                            "started_at": Value::Null,
+                            "running": false,
+                            "exit_code": Value::Null,
+                            "signal": Value::Null,
+                            "truncated": false,
+                            "recovered": true,
+                            "recovery_state": state,
                         })
                     }),
             );
@@ -2043,7 +2048,19 @@ fn new_session_id() -> String {
     format!("es_{:x}-{:x}-{:x}", std::process::id(), now_ms(), seq)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test override for `now_ms`: `Some(ms)` freezes the clock for prune /
+    /// recovery bookkeeping on this thread. Thread-local so parallel tests
+    /// keep the wall clock.
+    static TEST_NOW_MS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+
 fn now_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = TEST_NOW_MS.get() {
+        return ms;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4536,14 +4553,16 @@ mod tests {
         assert_eq!(view["text"], "kept-spool\n");
         assert!(view["finished_at"].is_null(), "{view}");
         drop(first);
-
-        // Second restart: the in-process recovery map is empty. Simulated
-        // TTL expiry must NOT delete the only committed spool — the durable
-        // row still carries no persisted retention window.
+        // Second restart: the in-process recovery map is empty. Now advance
+        // the test clock past SESSION_TTL_MS and prune — a true TTL
+        // crossing, not an immediate re-prune (Codex 7038637903 P2). The
+        // only committed spool must still survive: the durable row carries
+        // no persisted retention window, so no eviction clock may arm.
         let second = ExecRegistry::new(path.clone()).unwrap();
         let again = second.read("es_double_fail", "stdout", 0, 64);
         assert_eq!(again["ok"], true, "{again}");
         assert_eq!(again["text"], "kept-spool\n");
+        TEST_NOW_MS.set(Some(now_ms().saturating_add(SESSION_TTL_MS + 1_000)));
         second.prune();
         second.prune();
         let spool_path = exec_spool_path(&path, "es_double_fail");
@@ -4551,6 +4570,7 @@ mod tests {
             spool_path.exists(),
             "an unconfirmed eviction clock must never delete committed evidence"
         );
+        TEST_NOW_MS.set(None);
         let still = second.read("es_double_fail", "stdout", 0, 64);
         assert_eq!(still["ok"], true, "{still}");
         assert_eq!(still["text"], "kept-spool\n");
@@ -5211,6 +5231,21 @@ mod tests {
         let corrupt = first.read("es_corrupt", "stdout", 0, 64);
         assert_eq!(corrupt["ok"], false, "{corrupt}");
         assert_eq!(corrupt["reason"], "session_spool_corrupt", "{corrupt}");
+        // On this settling boot the same dead row exists in BOTH the
+        // recovered map and the persisted ledger — the list must merge the
+        // sources, not emit the id twice (Codex 7038637903 P2).
+        for (id, expected) in [("es_corrupt", "corrupt"), ("es_missing", "missing")] {
+            let matches: Vec<_> = first
+                .list_views()
+                .iter()
+                .filter(|entry| entry["session_id"] == id)
+                .cloned()
+                .collect();
+            assert_eq!(
+                matches[0]["evidence"], expected,
+                "the single entry must be the persisted projection carrying evidence: {matches:?}"
+            );
+        }
         let settled = first
             .inner
             .state_store
