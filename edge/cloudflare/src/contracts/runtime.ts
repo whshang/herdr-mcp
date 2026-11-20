@@ -11,25 +11,25 @@ export const EPOCH4_RUNTIME_EXECUTION_CONTRACT = {
 } as const;
 
 /**
- * Previous workstation/runtime execution contract (epoch 5).
+ * Previous workstation/runtime execution contract (epoch 6).
  *
- * This remains accepted for 1.1.1 workstations during the epoch-6 rollout.
+ * This remains accepted for pre-upgrade workstations during the epoch-7
+ * rollout.
  */
 export const PREVIOUS_RUNTIME_EXECUTION_CONTRACT = {
-  contract_epoch: 5,
-  contract_hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+  contract_epoch: 6,
+  contract_hash: "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e",
   tool_count: 18,
 } as const;
 
 /**
- * Current workstation/runtime execution contract (epoch 6).
+ * Current workstation/runtime execution contract (epoch 7).
  *
- * Epoch 6 is the frozen epoch-2 catalog with only `herdr_exec` execution
- * metadata shaped to neutral, factual capability wording, the
- * machine-decidable execution-evidence contract, and the two opt-in
- * `inputSchema.properties` entries (`intent`, `idempotency_key`) for durable
- * idempotent replay
- * (`contracts/runtime-exec-v6.json` is the programmatic descriptor; the
+ * Epoch 7 keeps the epoch-6 catalog and adds three additive optional
+ * inputs — `herdr_inspect` `{workspace, since_cursor, view}`,
+ * `herdr_exec.max_output_bytes`, and `herdr_fs_read.reads[]` (which also
+ * lifts `inputSchema.required` so batch-only calls validate)
+ * (`contracts/runtime-exec-v7.json` is the programmatic descriptor; the
  * deterministic hash is pinned in Rust `relay::contract`). The Edge only needs
  * the identity here: it forwards calls under this contract and never re-serves
  * the runtime tool catalog, which is why this is a slim identity rather than a
@@ -40,18 +40,37 @@ export const PREVIOUS_RUNTIME_EXECUTION_CONTRACT = {
  * runtime to implement fleet-control semantics.
  */
 export const RUNTIME_EXECUTION_CONTRACT = {
-  contract_epoch: 6,
-  contract_hash: "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e",
+  contract_epoch: 7,
+  contract_hash: "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1",
   tool_count: 18,
 } as const;
 
 /**
- * Workstation hello acceptance window: epoch 6, the epoch-5 1.1.1 runtime,
- * the epoch-4 rollback basis, and the frozen epoch-2 catalog.
+ * Published runtime execution contract epoch 5.
+ *
+ * Retained in the hello window for staged-deploy skew only: while this
+ * bump rolls out (or rolls back), edge PoPs may still serve a `/health`
+ * payload advertising the previous {6,5} pair, letting an epoch-5-era
+ * Link pass its precheck and then reach hello here. Once the deploy
+ * converges, `/health` advertises only the `PREVIOUS` identity (epoch 6)
+ * plus the frozen epoch-2 catalog — a v1.1.1-era Link that hard-gates on
+ * epochs 5/4 at the precheck stage can no longer reach hello.
+ */
+export const EPOCH5_RUNTIME_EXECUTION_CONTRACT = {
+  contract_epoch: 5,
+  contract_hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+  tool_count: 18,
+} as const;
+
+/**
+ * Workstation hello acceptance window: epoch 7, the epoch-6 previous
+ * runtime, the published epoch-5 runtime, the epoch-4 rollback basis, and
+ * the frozen epoch-2 catalog.
  */
 export const COMPATIBLE_RUNTIME_CONTRACTS = [
   RUNTIME_EXECUTION_CONTRACT,
   PREVIOUS_RUNTIME_EXECUTION_CONTRACT,
+  EPOCH5_RUNTIME_EXECUTION_CONTRACT,
   EPOCH4_RUNTIME_EXECUTION_CONTRACT,
   EPOCH2_CONTRACT,
 ] as const;

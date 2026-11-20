@@ -6,12 +6,12 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 export const CONTRACT_HASH =
-  "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e";
-export const CONTRACT_EPOCH = 6;
+  "sha256:6fa3ce18830cacf928fd9b5a22bcbead949510dea33c3d2e799e2c9cbad075e1";
+export const CONTRACT_EPOCH = 7;
 /// Previous runtime baselines accepted while an Edge rollout is in flight.
 export const PREVIOUS_CONTRACT_HASH =
-  "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030";
-export const PREVIOUS_CONTRACT_EPOCH = 5;
+  "sha256:9221eb8c46009ed68f447b00fd3581ad7c9bd02d69053bd799f541937047ba6e";
+export const PREVIOUS_CONTRACT_EPOCH = 6;
 export const REQUIRED_TOOL_COUNT = 18;
 export const RUNTIME_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
