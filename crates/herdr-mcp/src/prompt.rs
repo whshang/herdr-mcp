@@ -13599,6 +13599,12 @@ mod tests {
         let task_id = "dispatch:prompt:win-fail";
         register_idle_task(&registry, task_id, "w1:p1");
         age_for_activity_timeout(&registry, task_id);
+        // Drain the pending apply_task_window batch first so the corrupted
+        // scan below is the ONLY change signal — otherwise the window
+        // application alone flips `changed` and persists the in-memory
+        // identity even when the scan returns `Unchanged` (pi 7038974347:
+        // the regression must isolate the fix).
+        registry.reconcile_task(task_id).unwrap();
         // Corrupt the session-window ledger so `next_session_baseline` fails
         // inside the scan; `put_operation_ledger` on the task itself still
         // works, so the bound identity must persist.
@@ -13640,6 +13646,12 @@ mod tests {
         )
         .unwrap();
         let mut task = registry.load_task(task_id).unwrap().unwrap();
+        // The persisted record — not just the in-memory one — must carry
+        // the bound identity; assert before aligning it below.
+        assert!(
+            task.session_evidence_seen_dev.is_some(),
+            "the failed window query must persist the first-sighting identity"
+        );
         let meta = fs::metadata(&path).unwrap();
         let (dev, ino) = file_identity(&meta);
         // Align the bound identity to the replacement so the creation stamp
@@ -13657,9 +13669,9 @@ mod tests {
     }
 
     /// user dispatcher | Given a platform that proves neither file identity
-    /// nor a creation stamp | When a file first appears, is deleted, is
-    /// recreated, or grows | Then every path seals instead of trusting
-    /// unprovable bytes (Codex 7038274368).
+    /// nor a creation stamp | When a file first appears | Then the very
+    /// first sighting seals — every later path (delete, recreate, grow) is
+    /// unreachable once sealed (Codex 7038274368).
     #[test]
     fn user_zero_identity_platform_seals_recovery() {
         let path = env::temp_dir().join(format!(
