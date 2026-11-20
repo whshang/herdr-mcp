@@ -44,7 +44,9 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
             Ok(value) => value,
             Err(error) => return error,
         };
-    if let Some(error) = fs_security::reject_operational_root_mutation(&topology, &root_path.root) {
+    if let Some(error) =
+        fs_security::reject_operational_root_mutation(snapshot, &topology, &root_path.root)
+    {
         return error;
     }
     if !root_path.real.is_dir() {
