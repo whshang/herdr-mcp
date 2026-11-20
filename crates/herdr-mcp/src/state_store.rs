@@ -9600,6 +9600,60 @@ impl StateStore {
         Ok(result)
     }
 
+    /// `closed_before_restart` rows whose retention window is still open —
+    /// settled-dead sessions that must stay listable and readable across
+    /// further restarts (Codex 7038025777 P2). Live-fence states
+    /// (`reaped_on_restart`, `detached_unverified`) are not matched.
+    pub fn closed_before_restart_exec_sessions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<ClosedExecSessionRecord>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE state = 'closed_before_restart'
+                   AND (expires_at IS NULL OR expires_at > ?1)
+                 ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, session_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare recovered exec sessions query: {error}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![now_i64, limit], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query recovered exec sessions: {error}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                row.map_err(|error| format!("cannot decode recovered exec sessions row: {error}"))?;
+            let started_at_ms = u64::try_from(started_at).unwrap_or(0);
+            let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
+            let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
+            result.push(ClosedExecSessionRecord {
+                session_id,
+                started_at_ms,
+                ended_at_ms,
+                exit_code,
+                signal,
+                expires_at_ms,
+            });
+        }
+        Ok(result)
+    }
+
     pub fn unexpired_exec_session_ids(
         &self,
         now_ms: u64,

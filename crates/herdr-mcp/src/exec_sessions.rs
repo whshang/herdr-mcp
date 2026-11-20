@@ -670,17 +670,24 @@ impl ExecRegistry {
             .unwrap_or_default();
         clean_expired_spools(&state_dir, &unexpired_ids);
 
-        let closed_records = state_store
+        let mut closed_records = state_store
             .closed_exec_sessions(now, RECOVERY_MAX_ENTRIES)
             .unwrap_or_default();
+        // Settled-dead recovered rows stay listable/readable on this and
+        // later boots (Codex 7038025777 P2); live-fence states stay out.
+        closed_records.extend(
+            state_store
+                .closed_before_restart_exec_sessions(now, RECOVERY_MAX_ENTRIES)
+                .unwrap_or_default(),
+        );
 
         let mut initial_sessions = HashMap::new();
         for record in &closed_records {
             let session = load_session_from_spool_or_record(&state_dir, record);
             // A row-only recovery (`.spool` missing/corrupt) stays out of the
             // resident map: `session()` rebuilds it on demand, so a spool that
-            // commits late is picked up instead of being shadowed by a stale
-            // empty projection.
+            // commits late or is repaired is picked up instead of being
+            // shadowed by a stale projection.
             if !session.evidence_missing {
                 initial_sessions.insert(record.session_id.clone(), session);
             }
@@ -1185,20 +1192,28 @@ impl ExecRegistry {
             .unwrap_or_default();
         let mut views = sessions.iter().map(session_view).collect::<Vec<_>>();
         if let Ok(recovered) = self.inner.recovered.lock() {
-            views.extend(recovered.iter().map(|(id, state)| {
-                json!({
-                    "session_id": id,
-                    "cwd": Value::Null,
-                    "command": Value::Null,
-                    "started_at": Value::Null,
-                    "running": false,
-                    "exit_code": Value::Null,
-                    "signal": Value::Null,
-                    "truncated": false,
-                    "recovered": true,
-                    "recovery_state": state,
-                })
-            }));
+            // A recovered session already rebuilt into the resident map (a
+            // boot-loaded spool or an earlier read) must not be listed twice
+            // — once as a real view and once as a recovery tombstone.
+            views.extend(
+                recovered
+                    .iter()
+                    .filter(|(id, _)| !sessions.iter().any(|session| session.id == **id))
+                    .map(|(id, state)| {
+                        json!({
+                            "session_id": id,
+                            "cwd": Value::Null,
+                            "command": Value::Null,
+                            "started_at": Value::Null,
+                            "running": false,
+                            "exit_code": Value::Null,
+                            "signal": Value::Null,
+                            "truncated": false,
+                            "recovered": true,
+                            "recovery_state": state,
+                        })
+                    }),
+            );
         }
         views.sort_by(|left, right| {
             left.get("started_at")
@@ -1316,18 +1331,38 @@ impl ExecRegistry {
             .ok()
             .and_then(|recovered| recovered.get(id).cloned());
         let mut record = match state {
-            Some(state)
-                if state == "closed_before_restart" || state.starts_with("settle_failed") =>
-            {
-                ClosedExecSessionRecord {
-                    session_id: id.to_owned(),
-                    started_at_ms: now_ms(),
-                    ended_at_ms: Some(now_ms()),
-                    exit_code: None,
-                    signal: None,
-                    expires_at_ms: Some(now_ms().saturating_add(SESSION_TTL_MS)),
-                }
+            Some(state) if state == "closed_before_restart" => {
+                // Prefer the persisted row: its settle time is the honest
+                // `ended_at` and must not drift per read (Codex 7038025777
+                // P2). Without a row to prove it, `ended_at` stays unknown
+                // rather than being fabricated from read time.
+                self.inner
+                    .state_store
+                    .lock()
+                    .ok()
+                    .and_then(|store| {
+                        store
+                            .get_closed_before_restart_exec_session(id, now_ms())
+                            .ok()
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| ClosedExecSessionRecord {
+                        session_id: id.to_owned(),
+                        started_at_ms: now_ms(),
+                        ended_at_ms: None,
+                        exit_code: None,
+                        signal: None,
+                        expires_at_ms: Some(now_ms().saturating_add(SESSION_TTL_MS)),
+                    })
             }
+            Some(state) if state.starts_with("settle_failed") => ClosedExecSessionRecord {
+                session_id: id.to_owned(),
+                started_at_ms: now_ms(),
+                ended_at_ms: Some(now_ms()),
+                exit_code: None,
+                signal: None,
+                expires_at_ms: Some(now_ms().saturating_add(SESSION_TTL_MS)),
+            },
             Some(_) => return None,
             None => self.inner.state_store.lock().ok().and_then(|store| {
                 store
@@ -1353,7 +1388,19 @@ impl ExecRegistry {
         // `session_spool_corrupt` — hiding it behind
         // `session_recovered_after_restart` would lose the distinction
         // (Codex 7037326311 P2). Only a wholly absent artifact falls through.
-        (!session.evidence_missing || session.spool_corrupt).then_some(session)
+        let serveable = !session.evidence_missing || session.spool_corrupt;
+        if serveable
+            && !session.spool_corrupt
+            && let Ok(mut sessions) = self.inner.sessions.lock()
+        {
+            // Keep the recovered session resident so `list_views` agrees
+            // with id-based reads (Codex 7038025777 P2). Its `ended_at`
+            // bounds residency by SESSION_TTL_MS like any completed row. A
+            // corrupt artifact is served but never cached — a repaired
+            // spool must still be picked up by the next read.
+            sessions.insert(id.to_owned(), Arc::clone(&session));
+        }
+        serveable.then_some(session)
     }
 
     fn recovered_or_missing(&self, id: &str) -> Value {
@@ -5003,7 +5050,18 @@ mod tests {
         store
             .record_exec_running("es_twice", 99_000, None, started)
             .unwrap();
+        // A second dead session whose spool is committed only later — kept
+        // out of the boot-load so its read exercises the persisted-row path
+        // rather than a resident buffer.
+        store
+            .record_exec_running("es_corrupt", 99_001, None, started)
+            .unwrap();
         let session = unpersisted_closed_session("es_twice", "twice-restart\n");
+        // `es_expired` never gets a committed spool, so it stays
+        // non-resident — the right vehicle for the expiry-boundary check.
+        store
+            .record_exec_running("es_expired", 99_002, None, started)
+            .unwrap();
         write_session_spool(&path, &session).unwrap();
         drop(store);
 
@@ -5026,15 +5084,44 @@ mod tests {
         // (pi 7037465609).
         assert_eq!(view["started_at"], iso_from_ms(started), "{view}");
 
+        // finished_at is the persisted settle time and must not drift across
+        // repeated reads or restarts (Codex 7038025777 P2).
+        let finished_at = view["finished_at"].clone();
+        assert!(!finished_at.is_null(), "{view}");
+        assert_eq!(
+            view["finished_at"], first_view["finished_at"],
+            "finished_at must be identical across restarts"
+        );
+        let again = second.read("es_twice", "stdout", 0, 64);
+        assert_eq!(again["finished_at"], finished_at, "{again}");
+
+        // The settled-dead row stays listable after the second restart
+        // (Codex 7038025777 P2): readable by id AND present in list_views.
+        assert!(
+            second
+                .list_views()
+                .iter()
+                .any(|entry| entry["session_id"] == "es_twice"),
+            "the second-restart registry must list the persisted dead session"
+        );
+
         // A corrupt spool is surfaced, never hidden behind a generic
-        // recovery refusal.
-        fs::write(exec_spool_path(&path, "es_twice"), b"corrupt-not-json").unwrap();
-        let corrupt = second.read("es_twice", "stdout", 0, 64);
+        // recovery refusal. `es_corrupt` was never boot-loaded (no spool at
+        // restart), so this read goes through the persisted-row path.
+        fs::write(exec_spool_path(&path, "es_corrupt"), b"corrupt-not-json").unwrap();
+        let corrupt = second.read("es_corrupt", "stdout", 0, 64);
         assert_eq!(corrupt["ok"], false, "{corrupt}");
         assert_eq!(corrupt["reason"], "session_spool_corrupt", "{corrupt}");
+        // ...and a legal spool committed later is still picked up.
+        let recovered_session = unpersisted_closed_session("es_corrupt", "late-corrupt\n");
+        write_session_spool(&path, &recovered_session).unwrap();
+        let late = second.read("es_corrupt", "stdout", 0, 64);
+        assert_eq!(late["ok"], true, "{late}");
+        assert_eq!(late["text"], "late-corrupt\n");
 
-        // Expiry boundary: past the persisted retention window the row is
-        // gone from the read path entirely.
+        // Expiry boundary, resident path: `es_twice` is resident, so its
+        // memory buffers remain servable until SESSION_TTL_MS — the
+        // resident-session contract — even after the row is expired.
         second
             .inner
             .state_store
@@ -5042,13 +5129,29 @@ mod tests {
             .unwrap()
             .expire_exec_session_for_test("es_twice", 1)
             .unwrap();
+        let resident_expired = second.read("es_twice", "stdout", 0, 64);
+        assert_eq!(resident_expired["ok"], true, "{resident_expired}");
+        assert_eq!(resident_expired["text"], "twice-restart\n");
+
+        // Expiry boundary, non-resident path: past the persisted retention
+        // window a never-loaded row is gone from the read path entirely.
+        second
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .expire_exec_session_for_test("es_expired", 1)
+            .unwrap();
         second.prune();
         // Restore a legal spool so only the expiry gate can refuse.
-        write_session_spool(&path, &session).unwrap();
-        let expired = second.read("es_twice", "stdout", 0, 64);
+        write_session_spool(
+            &path,
+            &unpersisted_closed_session("es_expired", "expired\n"),
+        )
+        .unwrap();
+        let expired = second.read("es_expired", "stdout", 0, 64);
         assert_eq!(expired["ok"], false, "{expired}");
         assert_eq!(expired["reason"], "session_not_found", "{expired}");
-
         drop(second);
         let _ = fs::remove_dir_all(&path);
     }
