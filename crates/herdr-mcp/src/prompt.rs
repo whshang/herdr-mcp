@@ -5188,6 +5188,21 @@ pub fn run_with_parent_session(
         Ok(value) => value,
         Err(error) => return error,
     };
+    // `cr:` is the reserved bridged namespace (`cr:` + sha256 of the durable
+    // caller scope and client_request_id). A caller-supplied key in that
+    // space could equal a bridged value exactly and silently replay another
+    // request's record; the bridged path itself is the only exception and is
+    // marked by an internal flag set when the durable ledger injects the key.
+    if idempotency_key.is_some_and(|key| key.starts_with("cr:"))
+        && args
+            .get(crate::mcp::BRIDGED_CLIENT_REQUEST_FLAG)
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return invalid(
+            "idempotency_key must not start with the reserved 'cr:' prefix (bridged client_request_id namespace)",
+        );
+    }
     if spawn.is_some() && idempotency_key.is_none() {
         return spawn_invalid(
             "idempotency_key is required with spawn: a replay must never create a second pane, tab or agent",

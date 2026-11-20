@@ -123,6 +123,24 @@ pub(crate) fn client_request_tool_kind(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The narrower set that actually wraps a dispatch in a durable
+/// `client_request_id` reservation: `herdr_call` keeps its dedicated earlier
+/// path, and `herdr_exec`'s kind is reserved but deliberately *not* wired —
+/// mapping the tool name here only decides status lookups and silent-drop
+/// checks, never ledger wrapping. Keeping the two maps separate means a
+/// `client_request_id` on `herdr_exec` is rejected as unsupported instead of
+/// being silently recorded with a hard-coded write intent or sharing two
+/// idempotency slots.
+pub(crate) fn client_request_dispatch_tool_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "herdr_fs_write" => Some(HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+        "herdr_fs_edit" => Some(HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+        "herdr_fs_patch" => Some(HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+        "herdr_prompt" => Some(HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        _ => None,
+    }
+}
+
 /// The kind embedded in a client-request `op_id` (`op:{kind}:{digest}`).
 /// This relies on kind names never containing `:` — every entry of
 /// `CLIENT_REQUEST_KINDS` is a dotted `*.client_request.v1` identifier, so
@@ -793,14 +811,16 @@ pub fn durable_client_request_status(
                 .flatten()
         })
         .collect::<Vec<_>>();
-    if let Some(record) = store
-        .client_request_record_for_request_id(key)
+    for record in store
+        .client_request_records_for_request_id(key)
         .ok()
-        .flatten()
-        .filter(|record| kind_matches(kind_from_op_id(&record.op_id)))
-        && !matches.iter().any(|seen| seen.op_id == record.op_id)
+        .unwrap_or_default()
     {
-        matches.push(record);
+        if kind_matches(kind_from_op_id(&record.op_id))
+            && !matches.iter().any(|seen| seen.op_id == record.op_id)
+        {
+            matches.push(record);
+        }
     }
     let matches = matches
         .into_iter()
@@ -1584,10 +1604,10 @@ mod tests {
             durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
         }
         let store = open_store(&dir);
-        let record = store
-            .client_request_record_for_request_id("req_write_restart")
+        let records = store
+            .client_request_records_for_request_id("req_write_restart")
             .unwrap();
-        assert!(record.is_some(), "request_id row must survive restart");
+        assert_eq!(records.len(), 1, "request_id row must survive restart");
         let status =
             durable_client_request_status(&store, "req_write_restart", SCOPE_A, None).unwrap();
         assert_eq!(status["found"], true, "{status}");
@@ -1624,6 +1644,133 @@ mod tests {
         drop(breaker);
         let settled = durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
         assert_eq!(settled, DurableSettle::PersistFailed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given one request_id carried by records in different
+    /// scopes and kinds | When request.status resolves the id | Then every
+    /// scope sees its own record, a same-scope cross-kind pair reports
+    /// ambiguity, and a tool hint disambiguates — a foreign row never
+    /// shadows the caller's.
+    #[test]
+    fn user_status_given_request_id_shared_across_scopes_then_each_scope_finds_own() {
+        let dir = temp_state_dir();
+        let params = json!({});
+        let mut store = open_store(&dir);
+        // Scope A holds the id under two kinds (genuinely ambiguous); scope B
+        // under one. Scope B must use a different raw key — the key digest is
+        // scope-blind, so reusing scope A's key would hit idempotency_conflict
+        // at reservation time. Before collecting all candidates the first
+        // scanned row could shadow the caller's own.
+        for (kind, scope, key, req) in [
+            (
+                HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                SCOPE_A,
+                KEY,
+                "req_shared",
+            ),
+            (HERDR_PROMPT_CLIENT_REQUEST_KIND, SCOPE_A, KEY, "req_shared"),
+            (
+                HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                SCOPE_B,
+                "key-b",
+                "req_shared",
+            ),
+        ] {
+            let ids = client_request_ids(kind, scope, METHOD, &params, key, req, false);
+            expect_execute(durable_begin_or_replay(
+                &mut store, &ids, key, scope, METHOD, &params, false, 1_000,
+            ));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        // Scope B: exactly one candidate under its scope — found, not
+        // shadowed by scope A's earlier rows.
+        let status_b = durable_client_request_status(&store, "req_shared", SCOPE_B, None).unwrap();
+        assert_eq!(status_b["found"], true, "{status_b}");
+        assert_ne!(status_b["ambiguous"], true, "{status_b}");
+        // Scope A: both kinds match — reported ambiguous, then a tool hint
+        // resolves to the fs_write record.
+        let status_a = durable_client_request_status(&store, "req_shared", SCOPE_A, None).unwrap();
+        assert_eq!(status_a["found"], true, "{status_a}");
+        assert_eq!(status_a["ambiguous"], true, "{status_a}");
+        let hinted =
+            durable_client_request_status(&store, "req_shared", SCOPE_A, Some("herdr_fs_write"))
+                .unwrap();
+        assert_eq!(hinted["found"], true, "{hinted}");
+        assert_ne!(hinted["ambiguous"], true, "{hinted}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given first-class write-tool rows filling the ledger |
+    /// When the shared capacity limit is reached | Then the next
+    /// reservation is refused — the new kinds count toward the same
+    /// 1024-row budget and are not exempt from pruning or compaction.
+    #[test]
+    fn user_reservation_given_new_kinds_fill_capacity_then_refused() {
+        let dir = temp_state_dir();
+        let params = json!({});
+        let mut store = open_store(&dir);
+        for i in 0..CLIENT_REQUEST_LEDGER_MAX_ROWS {
+            let kind = CLIENT_REQUEST_KINDS[(i as usize) % CLIENT_REQUEST_KINDS.len()];
+            let key = format!("cap-key-{i}");
+            let ids = client_request_ids(kind, SCOPE_A, METHOD, &params, &key, "req_cap", false);
+            match durable_begin_or_replay(
+                &mut store, &ids, &key, SCOPE_A, METHOD, &params, false, 1_000,
+            ) {
+                ClientRequestOutcome::Execute { .. } => {}
+                ClientRequestOutcome::Replay(v) => panic!("row {i} replayed: {v}"),
+                ClientRequestOutcome::Respond(v) => panic!("row {i} responded: {v}"),
+            }
+        }
+        let ids = ids_for(SCOPE_A, &params, "req_cap_over", false);
+        let body = respond_body(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        assert_eq!(body["code"], "client_request_ledger_full", "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a settled first-class write-tool summary past its
+    /// deadline | When the next reservation triggers cleanup | Then the
+    /// new-kind row compacts to the same hash-only tombstone as herdr_call.
+    #[test]
+    fn user_retry_given_expired_summary_on_write_tool_kind_then_tombstoned() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        let ids = client_request_ids(
+            HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+            SCOPE_A,
+            "herdr_fs_write",
+            &params,
+            KEY,
+            "req_t_fw",
+            false,
+        );
+        expect_execute(durable_begin_or_replay(
+            &mut store,
+            &ids,
+            KEY,
+            SCOPE_A,
+            "herdr_fs_write",
+            &params,
+            false,
+            1_000,
+        ));
+        durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+
+        // A later reservation (any kind) must run the same compaction pass
+        // over the fs_write row.
+        let past = 1_100 + CLIENT_REQUEST_SUMMARY_TTL_MS + 1;
+        let other = ids_for(SCOPE_A, &params, "req_t_other", false);
+        let _ = begin(&mut store, &other, SCOPE_A, &params, false, past);
+        let record = store
+            .client_request_record(HERDR_FS_WRITE_CLIENT_REQUEST_KIND, &ids.key_digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state.as_deref(), Some("complete"));
+        assert_eq!(record.expires_at, None, "tombstone must stay unprunable");
+        let result = record.result();
+        assert_eq!(result["expired"], true, "{result}");
+        assert_eq!(result["outcome"], "expired", "{result}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

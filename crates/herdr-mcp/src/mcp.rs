@@ -1452,7 +1452,24 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // arrives undeclared inside `params.arguments` (option (b), no epoch/hash
     // change). `herdr_prompt` additionally keeps its native `idempotency_key`;
     // D-1 means one call never holds both idempotency slots.
-    if let Some(kind) = crate::durable_request_ledger::client_request_tool_kind(name) {
+    // `herdr_exec`'s ledger kind is reserved but deliberately not wired into
+    // dispatch: its schema does not declare `client_request_id`, so accepting
+    // one here would silently drop the key or record a read-only call with a
+    // hard-coded write intent. Fail closed the same way the wrapped-inner-key
+    // check does until the exec dedupe contract lands.
+    if name == "herdr_exec" && arguments.get("client_request_id").is_some() {
+        return Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "client_request_id is not supported on herdr_exec yet; its schema does not declare the key and it would silently skip dedupe",
+            }),
+            true,
+        ));
+    }
+    if let Some(kind) = crate::durable_request_ledger::client_request_dispatch_tool_kind(name) {
         if name == "herdr_prompt"
             && arguments.get("client_request_id").is_some()
             && arguments.get("idempotency_key").is_some()
@@ -1489,14 +1506,26 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
 }
 
 /// The inner `idempotency_key` a bridged `client_request_id` maps to inside
-/// `herdr_prompt`: `cr:` + sha256 of the raw key. Keeping the bridged value
-/// out of the caller's native key space means an `idempotency_key=K` prompt
-/// and a `client_request_id=K` prompt are independent requests in either
-/// order; a bounded digest also means any length caller key stays within
+/// `herdr_prompt`: `cr:` + sha256 of the durable caller scope and the raw
+/// key. Binding the scope into the digest means two caller scopes sharing a
+/// `client_request_id` map to *different* inner keys, and reserving the
+/// `cr:` prefix in the prompt arg parser means a native `idempotency_key=K`
+/// prompt and a `client_request_id=K` prompt are independent requests in
+/// either order. A bounded digest also keeps any length caller key within
 /// `idempotency_key` hygiene limits.
-pub(crate) fn bridged_prompt_idempotency_key(client_request_id: &str) -> String {
-    format!("cr:{}", browser_sha256(client_request_id))
+pub(crate) fn bridged_prompt_idempotency_key(scope: &str, client_request_id: &str) -> String {
+    format!(
+        "cr:{}",
+        browser_sha256(&format!("{scope}:{client_request_id}"))
+    )
 }
+
+/// Internal args flag marking a bridged `idempotency_key` so the prompt arg
+/// parser can distinguish it from a caller-supplied `cr:`-prefixed key (the
+/// reserved namespace is rejected otherwise). A forged flag is inert: it can
+/// only replay the scope-bound bridged record the same caller's legitimate
+/// retry would replay anyway.
+pub(crate) const BRIDGED_CLIENT_REQUEST_FLAG: &str = "_bridged_client_request_key";
 
 /// `client_request_id` on a first-class write tool goes through the same
 /// durable `operations` ledger as `herdr_call` — D-2: writes without a
@@ -1541,8 +1570,9 @@ fn write_tool_with_request_ledger(
         if name == "herdr_prompt" && object.get("idempotency_key").is_none() {
             object.insert(
                 "idempotency_key".to_owned(),
-                json!(bridged_prompt_idempotency_key(client_request_id)),
+                json!(bridged_prompt_idempotency_key(&scope, client_request_id)),
             );
+            object.insert(BRIDGED_CLIENT_REQUEST_FLAG.to_owned(), json!(true));
         }
     }
     let ids = crate::durable_request_ledger::client_request_ids(
@@ -35477,6 +35507,112 @@ mod durable_client_request_tests {
             crate::durable_request_ledger::client_request_tool_kind("totally_unknown"),
             None
         );
+        // Dispatch eligibility is narrower than the status map: only the
+        // four first-class write tools wrap a call in a durable reservation.
+        // herdr_call has its dedicated earlier path and herdr_exec's kind is
+        // reserved-but-unwired — both reject rather than wrap.
+        use crate::durable_request_ledger::client_request_dispatch_tool_kind;
+        for (tool, kind) in [
+            ("herdr_fs_write", ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+            ("herdr_fs_edit", ledger::HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+            ("herdr_fs_patch", ledger::HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+            ("herdr_prompt", ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        ] {
+            assert_eq!(
+                client_request_dispatch_tool_kind(tool),
+                Some(kind),
+                "{tool}"
+            );
+        }
+        for non_dispatch in ["herdr_call", "herdr_exec", "herdr_fs_read"] {
+            assert_eq!(
+                client_request_dispatch_tool_kind(non_dispatch),
+                None,
+                "{non_dispatch}"
+            );
+        }
+    }
+
+    /// user caller | Given client_request_id on herdr_exec | When the call
+    /// dispatches | Then it is refused as unsupported — the key must never
+    /// be silently dropped or wrapped with a hard-coded write intent.
+    #[test]
+    fn user_exec_given_client_request_id_then_refused_as_unsupported() {
+        let root = temp_dir("execreid");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(state_store.clone());
+        let skill = SkillService::new();
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+        let request = json!({"params": {"name": "herdr_exec", "arguments": {
+            "op": "status",
+            "client_request_id": "cr-exec-1"
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "invalid_params", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("client_request_id"),
+            "{body}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given a native idempotency_key in the reserved `cr:`
+    /// namespace | When the prompt dispatches | Then it is refused — a
+    /// caller key can never equal a bridged client_request_id value.
+    #[test]
+    fn user_prompt_given_native_key_in_bridged_namespace_then_refused() {
+        let root = temp_dir("crspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(state_store.clone());
+        let skill = SkillService::new();
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+        // The exact shape a bridged key takes — rejected as a native key.
+        let forged = bridged_prompt_idempotency_key("local:edge-device-1", "victim-key");
+        assert!(forged.starts_with("cr:"), "{forged}");
+        let request = json!({"params": {"name": "herdr_prompt", "arguments": {
+            "target": "pi",
+            "text": "work",
+            "idempotency_key": forged
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// user caller | Given a herdr_prompt keyed by client_request_id | When
@@ -35556,7 +35692,7 @@ mod durable_client_request_tests {
         // dispatch's task is queryable by the bridged key even though the
         // caller never passed one.
         let status = prompt.task_status_by_idempotency(
-            &bridged_prompt_idempotency_key("cr-preplay"),
+            &bridged_prompt_idempotency_key("local:edge-device-1", "cr-preplay"),
             "pi",
             None,
         );
