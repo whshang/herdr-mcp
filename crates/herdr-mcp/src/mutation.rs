@@ -277,44 +277,76 @@ impl AtomicStage {
     }
 }
 
-pub fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+/// Failure of an atomic commit. `rollback_failed` is a structured signal —
+/// not a substring callers must sniff — that staged mutations may be
+/// partially applied because undoing them errored too, so a retry without
+/// inspecting the tree is unsafe.
+#[derive(Debug)]
+pub struct AtomicCommitError {
+    pub message: String,
+    pub rollback_failed: bool,
+}
+
+impl AtomicCommitError {
+    fn clean(message: String) -> Self {
+        Self {
+            message,
+            rollback_failed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AtomicCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AtomicCommitError {}
+
+pub fn atomic_write(path: &Path, content: &[u8]) -> Result<(), AtomicCommitError> {
     commit_atomic(&[AtomicStage::write(path.to_path_buf(), content.to_vec())])
 }
 
-pub fn commit_atomic(stages: &[AtomicStage]) -> Result<(), String> {
+pub fn commit_atomic(stages: &[AtomicStage]) -> Result<(), AtomicCommitError> {
     commit_atomic_inner(stages, None)
 }
 
-fn commit_atomic_inner(stages: &[AtomicStage], fail_after: Option<usize>) -> Result<(), String> {
+fn commit_atomic_inner(
+    stages: &[AtomicStage],
+    fail_after: Option<usize>,
+) -> Result<(), AtomicCommitError> {
     if stages.is_empty() {
         return Ok(());
     }
     let mut seen = HashSet::new();
     for stage in stages {
         if !seen.insert(stage.path.clone()) {
-            return Err(format!("duplicate atomic target: {}", stage.path.display()));
+            return Err(AtomicCommitError::clean(format!(
+                "duplicate atomic target: {}",
+                stage.path.display()
+            )));
         }
-        let parent = stage
-            .path
-            .parent()
-            .ok_or_else(|| format!("target has no parent: {}", stage.path.display()))?;
+        let parent = stage.path.parent().ok_or_else(|| {
+            AtomicCommitError::clean(format!("target has no parent: {}", stage.path.display()))
+        })?;
         if !parent.is_dir() {
-            return Err(format!(
+            return Err(AtomicCommitError::clean(format!(
                 "target parent is not a directory: {}",
                 parent.display()
-            ));
+            )));
         }
         if stage.path.is_dir() {
-            return Err(format!(
+            return Err(AtomicCommitError::clean(format!(
                 "atomic file stage cannot target a directory: {}",
                 stage.path.display()
-            ));
+            )));
         }
         if stage.content.is_none() && !stage.path.is_file() {
-            return Err(format!(
+            return Err(AtomicCommitError::clean(format!(
                 "delete target does not exist as a file: {}",
                 stage.path.display()
-            ));
+            )));
         }
     }
 
@@ -329,7 +361,12 @@ fn commit_atomic_inner(stages: &[AtomicStage], fail_after: Option<usize>) -> Res
             .path
             .file_name()
             .and_then(|value| value.to_str())
-            .ok_or_else(|| format!("target has invalid filename: {}", stage.path.display()))?;
+            .ok_or_else(|| {
+                AtomicCommitError::clean(format!(
+                    "target has invalid filename: {}",
+                    stage.path.display()
+                ))
+            })?;
         let temporary = parent.join(format!(".{name}.herdr-mcp-{transaction}-{index}.tmp"));
         let previous_permissions = fs::metadata(&stage.path)
             .ok()
@@ -342,7 +379,9 @@ fn commit_atomic_inner(stages: &[AtomicStage], fail_after: Option<usize>) -> Res
             Ok(file) => file,
             Err(error) => {
                 cleanup_prepared(&prepared);
-                return Err(format!("cannot create temporary file: {error}"));
+                return Err(AtomicCommitError::clean(format!(
+                    "cannot create temporary file: {error}"
+                )));
             }
         };
         if let Some(permissions) = previous_permissions
@@ -350,12 +389,16 @@ fn commit_atomic_inner(stages: &[AtomicStage], fail_after: Option<usize>) -> Res
         {
             let _ = fs::remove_file(&temporary);
             cleanup_prepared(&prepared);
-            return Err(format!("cannot preserve target permissions: {error}"));
+            return Err(AtomicCommitError::clean(format!(
+                "cannot preserve target permissions: {error}"
+            )));
         }
         if let Err(error) = file.write_all(content).and_then(|_| file.sync_all()) {
             let _ = fs::remove_file(&temporary);
             cleanup_prepared(&prepared);
-            return Err(format!("cannot prepare atomic file: {error}"));
+            return Err(AtomicCommitError::clean(format!(
+                "cannot prepare atomic file: {error}"
+            )));
         }
         drop(file);
         prepared.push((stage.path.clone(), temporary));
@@ -439,9 +482,12 @@ fn commit_atomic_inner(stages: &[AtomicStage], fail_after: Option<usize>) -> Res
         }
         cleanup_prepared(&prepared);
         return Err(if rollback_errors.is_empty() {
-            error
+            AtomicCommitError::clean(error)
         } else {
-            format!("{error}; rollback errors: {}", rollback_errors.join("; "))
+            AtomicCommitError {
+                message: format!("{error}; rollback errors: {}", rollback_errors.join("; ")),
+                rollback_failed: true,
+            }
         });
     }
 
@@ -654,7 +700,8 @@ mod tests {
             AtomicStage::write(created.clone(), b"created".to_vec()),
         ];
         let error = commit_atomic_inner(&stages, Some(1)).unwrap_err();
-        assert!(error.contains("injected atomic commit failure"));
+        assert!(error.message.contains("injected atomic commit failure"));
+        assert!(!error.rollback_failed);
         assert_eq!(fs::read_to_string(&existing).unwrap(), "original");
         assert!(!created.exists());
         assert!(

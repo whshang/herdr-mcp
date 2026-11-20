@@ -80,12 +80,18 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
         }
     }
     let next = old.replacen(old_string, new_string, 1);
-    if let Err(message) = mutation::atomic_write(&target.real, next.as_bytes()) {
-        return crate::macos_permissions::io_message_to_fs_value(
+    if let Err(error) = mutation::atomic_write(&target.real, next.as_bytes()) {
+        let mut value = crate::macos_permissions::io_message_to_fs_value(
             "write_failed",
             &target.resolved,
-            message,
+            error.message,
         );
+        if error.rollback_failed {
+            // Same structured signal as PATCH_COMMIT_FAILED: the durable
+            // client-request ledger must treat delivery as unknown.
+            value["rollback_failed"] = json!(true);
+        }
+        return value;
     }
     success_with_working(
         json!({
@@ -181,12 +187,16 @@ pub(crate) fn write_bytes(
             }
         }
     }
-    if let Err(message) = mutation::atomic_write(&target.real, content) {
-        return crate::macos_permissions::io_message_to_fs_value(
+    if let Err(error) = mutation::atomic_write(&target.real, content) {
+        let mut value = crate::macos_permissions::io_message_to_fs_value(
             "write_failed",
             &target.resolved,
-            message,
+            error.message,
         );
+        if error.rollback_failed {
+            value["rollback_failed"] = json!(true);
+        }
+        return value;
     }
     projects::invalidate_git_status_cache(&target.root);
     success_with_working(

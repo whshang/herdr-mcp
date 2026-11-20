@@ -99,10 +99,35 @@ impl RequestLedgerState {
     }
 }
 
+/// True when the result carries evidence that external spawn resources
+/// (pane/worktree/agent) were created — regardless of `resumable`. A
+/// resumable checkpoint may already have created a worktree or pane; its
+/// ownership must stay bound to the scope that created it rather than
+/// releasing the key for a different caller to inherit the resources.
+fn result_spawn_resource_marks(result: &Value) -> bool {
+    result.get("reclaim").is_some()
+        || result.pointer("/spawn/created").and_then(Value::as_bool) == Some(true)
+        || result
+            .pointer("/spawn/worktree/created")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+/// True when a `not_delivered`-shaped result already created external spawn
+/// resources (pane/worktree/agent) that outlive the ledger key. A resumable
+/// checkpoint is excluded on purpose: releasing the key is what lets the
+/// same-key retry resume the persisted spawn through the prompt registry.
+pub(crate) fn result_created_spawn_resources(result: &Value) -> bool {
+    result.get("resumable").and_then(Value::as_bool) != Some(true)
+        && result_spawn_resource_marks(result)
+}
+
 /// Map an execution result to a ledger state.
 ///
 /// - `ok:true` -> `applied`.
-/// - `ok:false` with `delivery_state == "not_delivered"` -> `not_delivered`.
+/// - `ok:false` with `delivery_state == "not_delivered"` -> `not_delivered`,
+///   unless the result already created external spawn resources (-> `unknown`,
+///   keeping a terminal record of what was left behind).
 /// - `ok:false` with `delivery_state == "delivery_unknown"`, or a retryable
 ///   timeout-shaped failure -> `unknown` (the write may have been applied).
 /// - every other `ok:false` -> `rejected` (admission/schema/policy failure;
@@ -111,8 +136,41 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         return RequestLedgerState::Applied;
     }
+    // Anything that already left evidence of delivery or external resources
+    // is the "maybe applied" class regardless of how the failure was framed:
+    // `delivery_uncertain` is a boolean field (not a `code`), `submitted`
+    // claims the request reached the agent, and spawn resource marks outlive
+    // the key — including on `resumable` checkpoints, where created
+    // resources stay bound to the owning scope instead of being released
+    // for a foreign scope to inherit (a resource-free resumable checkpoint
+    // still releases so the same-key retry resumes it). Releasing any of
+    // these would let a blind same-key retry re-execute, so they keep a
+    // terminal `unknown` record.
+    if result.get("delivery_uncertain").and_then(Value::as_bool) == Some(true)
+        || result.get("submitted").and_then(Value::as_bool) == Some(true)
+        || result_spawn_resource_marks(result)
+    {
+        return RequestLedgerState::Unknown;
+    }
     match result.get("delivery_state").and_then(Value::as_str) {
-        Some("not_delivered") => return RequestLedgerState::NotDelivered,
+        // `not_delivered` releases the key unless the result already left
+        // external spawn resources behind. A *resource-free* resumable
+        // checkpoint still releases: retrying then re-enters herdr_prompt,
+        // where the (bridged or caller) `idempotency_key` reaches the
+        // DispatchReservation::Known path and resumes the pane/agent the
+        // first attempt created. A resumable checkpoint carrying resource
+        // marks was already hoisted to `unknown` above so its created
+        // pane/worktree stays bound to the owning scope; a non-resumable
+        // spawn failure with created resources keeps a terminal record here
+        // too, so `request.status` retains the stranded worktree/pane (with
+        // its reclaim instructions) instead of reporting a miss while the
+        // inner prompt ledger alone remembers the key.
+        Some("not_delivered") => {
+            if result_created_spawn_resources(result) {
+                return RequestLedgerState::Unknown;
+            }
+            return RequestLedgerState::NotDelivered;
+        }
         Some("delivery_unknown") => return RequestLedgerState::Unknown,
         _ => {}
     }
@@ -122,6 +180,20 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
         result.get("code").and_then(Value::as_str),
         Some("request_timeout") | Some("local_mcp_timeout") | Some("delivery_uncertain")
     ) {
+        return RequestLedgerState::Unknown;
+    }
+    // A commit failure whose rollback itself errored may have left staged
+    // mutations partially applied. The mutation layer reports that as the
+    // structured `rollback_failed` field; the message-substring check is a
+    // legacy fallback for pre-marker payloads. That outcome cannot prove a
+    // clean rollback, so it is the "maybe applied" class too — releasing
+    // the reservation here would let a blind retry re-execute.
+    if result.get("rollback_failed").and_then(Value::as_bool) == Some(true)
+        || result
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("rollback errors"))
+    {
         return RequestLedgerState::Unknown;
     }
     RequestLedgerState::Rejected
@@ -543,6 +615,70 @@ mod tests {
         );
         assert_eq!(
             classify_result_state(&json!({"ok": false, "code": "request_timeout"})),
+            RequestLedgerState::Unknown
+        );
+        // Structured rollback-failure marker (primary signal) and the legacy
+        // message substring (pre-marker payloads) both classify as unknown.
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "rollback_failed": true})),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(
+                &json!({"ok": false, "message": "stage failed; rollback errors: x"})
+            ),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "rollback_failed": false})),
+            RequestLedgerState::Rejected
+        );
+        // A spawn checkpoint carries not_delivered *and* evidence of created
+        // external resources: still releases — the prompt layer resumes the
+        // spawned pane/agent by idempotency key on the same-key retry, so a
+        // durable tombstone would only block the designed resume path.
+        assert_eq!(
+            classify_result_state(&json!({
+                "ok": false,
+                "delivery_state": "not_delivered",
+                "resumable": true,
+                "spawn": {"pane_id": "w1:p1"}
+            })),
+            RequestLedgerState::NotDelivered
+        );
+        // A not_delivered refusal with no resource evidence still releases.
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "delivery_state": "not_delivered"})),
+            RequestLedgerState::NotDelivered
+        );
+        // `delivery_uncertain` is a boolean result field — not a `code` — so
+        // it must be caught directly: an uncertain submission may already
+        // have been delivered and releasing the key would allow a blind
+        // retry. Same for a claimed submission and for external spawn
+        // resources reported without a delivery_state.
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "delivery_uncertain": true})),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "submitted": true})),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "spawn": {"created": true}})),
+            RequestLedgerState::Unknown
+        );
+        // A *resumable* checkpoint that already created resources keeps the
+        // record too: its pane/worktree stays bound to the owning scope
+        // instead of being released for a foreign caller to inherit. Only a
+        // resource-free resumable checkpoint releases for resume-by-retry.
+        assert_eq!(
+            classify_result_state(&json!({
+                "ok": false,
+                "delivery_state": "not_delivered",
+                "resumable": true,
+                "spawn": {"created": true, "pane_id": "w1:p1"}
+            })),
             RequestLedgerState::Unknown
         );
     }
