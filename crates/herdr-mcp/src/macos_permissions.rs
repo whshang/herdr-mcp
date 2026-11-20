@@ -1156,6 +1156,10 @@ pub fn io_error_to_fs_value(fallback_reason: &str, path: &Path, error: std::io::
             "reason": fallback_reason,
             "path": path.to_string_lossy(),
             "message": error.to_string(),
+            // Structured errno so callers can distinguish "not found" from
+            // other stat/read failures without parsing message text; older
+            // peers simply omit the field and fail closed.
+            "os_error": error.raw_os_error(),
         })
     }
 }

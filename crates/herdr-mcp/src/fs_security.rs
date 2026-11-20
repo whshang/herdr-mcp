@@ -1,6 +1,7 @@
 use crate::projects::{self, ProjectTopology};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct ManagedPath {
@@ -10,7 +11,7 @@ pub struct ManagedPath {
 }
 
 pub fn managed_roots(snapshot: &Value) -> Vec<PathBuf> {
-    managed_roots_from(&projects::derive_routing(snapshot))
+    managed_roots_from(&projects::derive_routing_cached(snapshot))
 }
 
 /// Unified validated-root access surface: managed Git roots plus vcs-less
@@ -74,15 +75,135 @@ pub fn is_operational_root(topology: &ProjectTopology, root: &Path) -> bool {
 /// Deterministic fail-closed guard for mutations whose safety depends on
 /// Git-dirty confirmation. Returns the error value when `root` is an
 /// operational root, otherwise `None`.
-pub fn reject_operational_root_mutation(topology: &ProjectTopology, root: &Path) -> Option<Value> {
-    is_operational_root(topology, root).then(|| {
-        json!({
+///
+/// The topology may be a cached projection, so a root classified Git-backed
+/// is re-verified at this write boundary: if its `.git` marker (a directory
+/// for a plain clone, a file for a linked worktree) has been removed or
+/// renamed inside the cache TTL, the root is effectively vcs-less and the
+/// mutation is refused instead of trusting the stale classification.
+///
+/// The re-verification distinguishes "marker gone" from "probe failed":
+/// macOS privacy-protected roots (Documents/Desktop/Downloads) are listed
+/// through the stable TCC broker — the authorized client for those folders —
+/// because the rotating runtime must never probe them itself (a direct stat
+/// would make the runtime the TCC requester and could park the control path
+/// behind a consent prompt). Any broker failure, missing broker, truncated
+/// listing, or permission error is reported as `git_root_vcs_unverifiable`,
+/// never folded into `git_root_vcs_disappeared` (a real repo would otherwise
+/// be misreported as stripped of its VCS marker).
+pub fn reject_operational_root_mutation(
+    snapshot: &Value,
+    topology: &ProjectTopology,
+    root: &Path,
+) -> Option<Value> {
+    if is_operational_root(topology, root) {
+        return Some(json!({
             "ok": false,
             "reason": "operational_root_mutation_unsupported",
             "root": root.to_string_lossy(),
             "hint": "this vcs-less operational root has no Git dirty state to confirm against; write inside a Git-backed project root, or restrict this change to reading it",
-        })
-    })
+        }));
+    }
+    let probe = topology
+        .projects
+        .get(root)
+        .and_then(root_kind_of)
+        .and_then(|(git_root, kind)| {
+            (kind == RootKind::Git).then(|| git_marker_probe(snapshot, &git_root))
+        });
+    match probe {
+        Some(GitMarkerProbe::Gone) => Some(json!({
+            "ok": false,
+            "reason": "git_root_vcs_disappeared",
+            "root": root.to_string_lossy(),
+            "hint": "this root was Git-managed when the routing topology was derived but .git is no longer present; write confirmation cannot be trusted — retry after refreshing herdr_inspect",
+        })),
+        Some(GitMarkerProbe::Inconclusive) => Some(json!({
+            "ok": false,
+            "reason": "git_root_vcs_unverifiable",
+            "root": root.to_string_lossy(),
+            "hint": "the .git marker could not be verified (permission denied, consent prompt pending, or probe timeout); write confirmation cannot be trusted — retry after refreshing herdr_inspect",
+        })),
+        Some(GitMarkerProbe::Present) | None => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitMarkerProbe {
+    Present,
+    /// Marker definitively absent — the cached Git classification is stale.
+    Gone,
+    /// Probe could not decide (permission denied, consent prompt, I/O
+    /// error). Must never be reported as "gone".
+    Inconclusive,
+}
+
+fn git_marker_probe(snapshot: &Value, git_root: &Path) -> GitMarkerProbe {
+    let marker = git_root.join(".git");
+    if crate::macos_permissions::runtime_must_not_probe(&marker) {
+        protected_git_marker_probe(snapshot, git_root)
+    } else {
+        match marker.try_exists() {
+            Ok(true) => GitMarkerProbe::Present,
+            Ok(false) => GitMarkerProbe::Gone,
+            Err(_) => GitMarkerProbe::Inconclusive,
+        }
+    }
+}
+
+/// Ask the authorized stable broker to read the marker path itself and
+/// decide presence from the `fs_read` result contract. `fs_list` cannot be
+/// used here: its walker deliberately skips `.git` entries, so a listing can
+/// never observe the marker. A plain clone's `.git` directory answers
+/// `not_a_file`, a linked worktree's `.git` file answers `ok`, a missing
+/// marker answers `stat_failed` carrying errno `ENOENT` (`os_error`), and
+/// every other failure — permission, read error, broker unavailable, or an
+/// older broker that does not emit `os_error` — is
+/// [`GitMarkerProbe::Inconclusive`] so the write stays fail-closed without
+/// the runtime becoming the TCC requester.
+#[cfg(target_os = "macos")]
+fn protected_git_marker_probe(snapshot: &Value, git_root: &Path) -> GitMarkerProbe {
+    match crate::tcc_broker::fs_read_via_stable_broker(snapshot, &git_root.join(".git"), 64) {
+        Ok(result) => git_marker_from_marker_read(&result),
+        Err(_) => GitMarkerProbe::Inconclusive,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn protected_git_marker_probe(_snapshot: &Value, _git_root: &Path) -> GitMarkerProbe {
+    // Nothing is privacy-protected off macOS, so production never reaches
+    // this arm; keep it fail-closed for tests that force the protected
+    // classification.
+    GitMarkerProbe::Inconclusive
+}
+
+/// Decide marker presence from a broker `fs_read` of `<root>/.git`. Covers
+/// both `.git` spellings: a successful read is the linked-worktree file and
+/// `not_a_file` is the plain-clone directory. Only `stat_failed` with errno
+/// `ENOENT` proves the marker is gone — a missing `os_error` field (broker
+/// older than the `io_error_to_fs_value` addition) or any other failure is
+/// Inconclusive.
+#[cfg(any(target_os = "macos", test))]
+fn git_marker_from_marker_read(result: &Value) -> GitMarkerProbe {
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return GitMarkerProbe::Present;
+    }
+    // Mirrors the real `fs_tools::read` failure contract: `not_found` is the
+    // validate-existing refusal for a missing/canonicalize-unresolvable path
+    // (the common missing-.git case), `stat_failed` covers a path that
+    // vanished between validation and stat. `outside_managed_roots` only says
+    // the root no longer admits the probe — the marker may or may not exist —
+    // so it stays inconclusive rather than Gone.
+    match result.get("reason").and_then(Value::as_str) {
+        Some("not_a_file") => GitMarkerProbe::Present,
+        Some("not_found") | Some("stat_failed") => {
+            match result.get("os_error").and_then(Value::as_i64) {
+                Some(code) if code == libc::ENOENT as i64 => GitMarkerProbe::Gone,
+                _ => GitMarkerProbe::Inconclusive,
+            }
+        }
+        _ => GitMarkerProbe::Inconclusive,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,48 +245,94 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     };
     let guard = HomeGuard::new(home);
     let root = &project.root;
-    if !root.is_absolute() || guard.rejects(root) || denied_secret_path(root) {
+    if !root.is_absolute() {
+        return false;
+    }
+    // Everything in this classification must be probe-free until the
+    // delegation decision is made: `HomeGuard::rejects` stats the candidate
+    // for a device+inode match, so calling it on a protected
+    // Documents/Desktop/Downloads path would make the rotating runtime a TCC
+    // requester (or block) before it could delegate. Lexical normalization
+    // and the secret-path guard touch no filesystem and run for every
+    // candidate; the delegation check then splits the policy — delegated
+    // roots get only the lexical HOME-boundary check here and the authorized
+    // broker verifies identity/symlinks, while every other path keeps the
+    // full metadata-backed HomeGuard probe.
+    let normalized = normalize_lexical(root);
+    if denied_secret_path(&normalized) {
+        return false;
+    }
+    let delegated = must_delegate_probe(&normalized, home);
+    if delegated {
+        if guard.rejects_lexically(&normalized) {
+            return false;
+        }
+    } else if guard.rejects(&normalized) {
         return false;
     }
     // "canonical existing directory": the live cwd must resolve to a real
     // directory, and that real directory must itself survive the HOME-ancestry
     // and secret-path guards, so a symlinked cwd cannot escape them.
-    let root_real = match std::fs::canonicalize(root) {
-        Ok(real) => {
-            if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
-                return false;
+    // The rotating runtime is deliberately not the macOS TCC client:
+    // Documents/Desktop/Downloads roots are classified before any in-process
+    // canonicalize, and their existence/symlink resolution is verified by the
+    // stable broker (`herdr_fs_*`) or the delegated utility pane
+    // (`herdr_exec`) — the same route the pre-existing protected-root command
+    // preflight already uses. Every other unresolvable path is refused.
+    // `must_delegate_probe` carries the full protected-path contract
+    // (Documents/Desktop/Downloads, the /System/Volumes/Data firmlink
+    // spelling, APFS case variants) *and* the broker-child exemption on the
+    // caller's `home` context: inside the stable TCC broker it returns false,
+    // so the authorized child still runs the complete canonicalize +
+    // HomeGuard + secret-path validation instead of inheriting the rotating
+    // runtime's delegation shortcut.
+    let root_real = if delegated {
+        None
+    } else {
+        match std::fs::canonicalize(&normalized) {
+            Ok(real) => {
+                if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
+                    return false;
+                }
+                Some(real)
             }
-            Some(real)
+            Err(_) => return false,
         }
-        // The rotating runtime is deliberately not the macOS TCC client, so
-        // Documents/Desktop/Downloads existence, symlink resolution, and real
-        // paths are verified by the stable broker (`herdr_fs_*`) or the
-        // delegated utility pane (`herdr_exec`) instead — the same route the
-        // pre-existing protected-root command preflight already uses. Every
-        // other unresolvable path is refused.
-        Err(_) if tcc_delegated_root(home, root) => None,
-        Err(_) => return false,
     };
     // Exactly proven by live cwd: every cwd attached to this project resolves
     // to this root's real directory (or, when the real path is delegated to
     // TCC, must be this exact cwd). A sibling outside the group therefore
-    // cannot borrow this root's authority.
-    project
-        .cwds
-        .iter()
-        .all(|cwd| match (&root_real, std::fs::canonicalize(cwd)) {
-            (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
-            _ => cwd == root,
-        })
+    // cannot borrow this root's authority. A delegated-root cwd is likewise
+    // never probed in-process; only an exact match carries authority.
+    project.cwds.iter().all(|cwd| {
+        if must_delegate_probe(cwd, home) {
+            normalize_lexical(cwd) == normalized
+        } else {
+            match (&root_real, std::fs::canonicalize(cwd)) {
+                (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
+                _ => normalize_lexical(cwd) == normalized,
+            }
+        }
+    })
 }
 
-/// macOS Documents/Desktop/Downloads roots are executed/read through the TCC
-/// broker or utility pane, which can verify what this runtime cannot.
-fn tcc_delegated_root(home: &Path, candidate: &Path) -> bool {
-    cfg!(target_os = "macos")
-        && ["Documents", "Desktop", "Downloads"]
-            .iter()
-            .any(|name| candidate.starts_with(home.join(name)))
+/// Whether `path` under `home` must not be probed by the rotating runtime:
+/// the lexical protected-path contract (Documents/Desktop/Downloads, firmlink
+/// spelling, APFS case variants) plus the broker-child exemption — identical
+/// to `runtime_must_not_probe`, but driven by the caller's `home` context
+/// instead of the process `HOME` env so tests and custom-home callers get
+/// the same classification the probe guards rely on.
+fn must_delegate_probe(path: &Path, home: &Path) -> bool {
+    #[cfg(any(target_os = "macos", test))]
+    {
+        crate::macos_permissions::is_protected_user_path_lexical_for_home(path, home)
+            && !crate::tcc_broker::is_broker_child_process()
+    }
+    #[cfg(not(any(target_os = "macos", test)))]
+    {
+        let _ = (path, home);
+        false
+    }
 }
 
 /// Stable filesystem identity of an existing path: `(device, inode)` on Unix.
@@ -237,21 +404,25 @@ impl HomeGuard {
         }
     }
 
-    fn rejects(&self, candidate: &Path) -> bool {
+    /// The probe-free portion of `rejects`: lexical ancestry against both
+    /// spellings of HOME. Callers that must not touch the filesystem for a
+    /// candidate (delegated TCC-protected roots) use this layer alone; the
+    /// authorized broker runs the full check.
+    fn rejects_lexically(&self, candidate: &Path) -> bool {
         let mut candidates = vec![candidate.to_path_buf()];
         if let Some(primary) = firmlink_primary_spelling(candidate) {
             candidates.push(primary);
         }
-        for candidate in &candidates {
-            if self
-                .spellings
+        candidates.iter().any(|candidate| {
+            self.spellings
                 .iter()
                 .any(|home| home == candidate || home.starts_with(candidate))
-            {
-                return true;
-            }
-        }
-        path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
+        })
+    }
+
+    fn rejects(&self, candidate: &Path) -> bool {
+        self.rejects_lexically(candidate)
+            || path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
     }
 }
 
@@ -265,6 +436,23 @@ const FIRMLINK_DATA_PREFIX: &str = "/System/Volumes/Data";
 fn firmlink_primary_spelling(candidate: &Path) -> Option<PathBuf> {
     let rest = candidate.strip_prefix(FIRMLINK_DATA_PREFIX).ok()?;
     Some(Path::new("/").join(rest))
+}
+
+/// Whether a canonical real path still spells the declared topology root.
+///
+/// The protected exec path delegates `cd` into the declared root; this is the
+/// identity check proving that the `cd` target is that same directory and not
+/// a symlink that was swapped in afterwards. Both spellings are compared after
+/// lexical normalization and under the Data-volume firmlink alias — a real
+/// path reported as `/System/Volumes/Data/<rest>` is the same object as the
+/// declared `/<rest>` — while any other divergence (a symlinked root, a
+/// renamed leaf, a different case) fails closed.
+pub(crate) fn same_declared_spelling(real: &Path, declared: &Path) -> bool {
+    let real = normalize_lexical(real);
+    let declared = normalize_lexical(declared);
+    real == declared
+        || firmlink_primary_spelling(&real).as_deref() == Some(declared.as_path())
+        || firmlink_primary_spelling(&declared).as_deref() == Some(real.as_path())
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -283,6 +471,7 @@ pub fn validate_existing(snapshot: &Value, input: &str) -> Result<ManagedPath, V
         input,
         &managed_roots(snapshot),
         default_worktrees_root().as_deref(),
+        None,
     )
 }
 
@@ -296,15 +485,16 @@ fn validate_existing_scoped(
     input: &str,
     roots: &[PathBuf],
     worktrees_root: Option<&Path>,
+    topology: Option<&ProjectTopology>,
 ) -> Result<ManagedPath, Value> {
     if let Ok(resolved) = resolve_input(input)
         && let Some(root) = worktrees_root.and_then(|worktrees_root| {
             target_scoped_worktree_root_under(snapshot, &resolved, worktrees_root)
         })
     {
-        return validate_existing_with_roots(&[root], input);
+        return validate_existing_with_roots(&[root], input, None);
     }
-    validate_existing_with_roots(roots, input)
+    validate_existing_with_roots(roots, input, topology)
 }
 
 fn default_worktrees_root() -> Option<PathBuf> {
@@ -377,12 +567,79 @@ fn validate_existing_validated_with_worktrees_root(
     input: &str,
     worktrees_root: Option<PathBuf>,
 ) -> Result<ManagedPath, Value> {
+    let topology = projects::derive_routing_cached(snapshot);
     validate_existing_scoped(
         snapshot,
         input,
-        &validated_roots_from(&projects::derive_routing(snapshot)),
+        &validated_roots_cached(snapshot),
         worktrees_root.as_deref(),
+        Some(&topology),
     )
+}
+
+struct ValidatedRootsCacheEntry {
+    expires_at: std::time::Instant,
+    roots: Arc<Vec<PathBuf>>,
+}
+
+impl projects::TimedCacheEntry for ValidatedRootsCacheEntry {
+    fn expires_at(&self) -> std::time::Instant {
+        self.expires_at
+    }
+}
+
+static VALIDATED_ROOTS_CACHE: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<projects::RoutingFingerprint, ValidatedRootsCacheEntry>>,
+> = std::sync::OnceLock::new();
+
+/// [`validated_roots_from`] memoized on the routing fingerprint for
+/// [`projects::ROUTING_CACHE_TTL`]. Skips the per-call root/cwd
+/// `canonicalize` and `HomeGuard` ancestor stats inside
+/// `operational_root_eligible` during scroll churn. Filesystem changes the
+/// fingerprint cannot see (`git init` inside an existing cwd, a renamed
+/// repo, a swapped symlink) surface after the TTL. Per-request target-path
+/// canonicalize, secret-path denial, and symlink-escape checks in
+/// `validate_existing_scoped` still run live on every call.
+///
+/// The recomputation runs *outside* the cache mutex so a slow topology
+/// derivation cannot serialize unrelated fingerprints behind the lock; a
+/// racing refill wins when still fresh.
+fn validated_roots_cached(snapshot: &Value) -> Arc<Vec<PathBuf>> {
+    let fingerprint = projects::routing_fingerprint(snapshot);
+    let cache = VALIDATED_ROOTS_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = guard.get(&fingerprint)
+            && entry.expires_at > projects::cache_now()
+        {
+            return Arc::clone(&entry.roots);
+        }
+    }
+    let roots = Arc::new(validated_roots_from(&projects::derive_routing_cached(
+        snapshot,
+    )));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = projects::cache_now();
+    if let Some(entry) = guard.get(&fingerprint)
+        && entry.expires_at > now
+    {
+        return Arc::clone(&entry.roots);
+    }
+    // Deadlines are stored on the real clock so entries stay comparable
+    // across threads (see `projects::cache_now`).
+    projects::routing_cache_insert_bounded(
+        &mut guard,
+        fingerprint,
+        ValidatedRootsCacheEntry {
+            expires_at: std::time::Instant::now() + projects::ROUTING_CACHE_TTL,
+            roots: Arc::clone(&roots),
+        },
+    );
+    roots
 }
 
 /// See [`validate_existing_validated`]. Reuses one routing topology per
@@ -391,7 +648,7 @@ pub fn validate_existing_validated_with_topology(
     topology: &ProjectTopology,
     input: &str,
 ) -> Result<ManagedPath, Value> {
-    validate_existing_with_roots(&validated_roots_from(topology), input)
+    validate_existing_with_roots(&validated_roots_from(topology), input, Some(topology))
 }
 
 /// Validate that `input` is exactly one root on the unified validated-root
@@ -449,10 +706,48 @@ fn validate_exact_root_with_roots(roots: &[PathBuf], input: &str) -> Result<Mana
 /// Validate an existing path against one project root that was already
 /// validated as managed by the caller.
 pub fn validate_existing_in_root(project_root: &Path, input: &str) -> Result<ManagedPath, Value> {
-    validate_existing_with_roots(&[project_root.to_path_buf()], input)
+    validate_existing_with_roots(&[project_root.to_path_buf()], input, None)
 }
 
-fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedPath, Value> {
+/// Live re-verification for a matched Operational root.
+///
+/// The roots list may come from the routing-fingerprint cache, so an
+/// Operational root's eligibility was proven at fill time only. A lexical
+/// root swapped for a symlink inside the TTL would still satisfy the
+/// containment check below (both root and target resolve into the new
+/// location) while silently widening into HOME or secret material, because
+/// [`operational_root_eligible`] would never re-run. Authorization therefore
+/// re-runs the live identity and HOME/secret boundary instead of trusting
+/// the cached classification: for a vcs-less project, [`root_kind_of`]
+/// re-evaluates the eligibility rules live (HOME ancestry, secret path,
+/// canonical directory identity, cwd proof) and only yields `Operational`
+/// when the root still is the directory the snapshot proved. Git roots keep
+/// the pre-existing behavior: their write boundary re-verifies `.git`
+/// separately.
+fn operational_root_still_eligible(topology: Option<&ProjectTopology>, root: &Path) -> bool {
+    let Some(project) = topology.and_then(|topology| topology.projects.get(root)) else {
+        return true;
+    };
+    if project.vcs.is_some() {
+        return true;
+    }
+    matches!(root_kind_of(project), Some((_, RootKind::Operational)))
+}
+
+fn operational_root_no_longer_eligible_error(root: &Path) -> Value {
+    json!({
+        "ok": false,
+        "reason": "operational_root_no_longer_eligible",
+        "root": root.to_string_lossy(),
+        "hint": "the operational root's live identity changed since the routing snapshot was taken (swapped, removed, or it now escapes the HOME boundary); retry after refreshing herdr_inspect",
+    })
+}
+
+fn validate_existing_with_roots(
+    roots: &[PathBuf],
+    input: &str,
+    topology: Option<&ProjectTopology>,
+) -> Result<ManagedPath, Value> {
     let resolved = resolve_input(input)?;
     let Some(root) = containing_root(roots, &resolved).cloned() else {
         return Err(json!({
@@ -469,6 +764,9 @@ fn validate_existing_with_roots(roots: &[PathBuf], input: &str) -> Result<Manage
             "reason": "secret_path_denied",
             "path": resolved.to_string_lossy(),
         }));
+    }
+    if !operational_root_still_eligible(topology, &root) {
+        return Err(operational_root_no_longer_eligible_error(&root));
     }
     let real = std::fs::canonicalize(&resolved).map_err(|error| {
         crate::macos_permissions::io_error_to_fs_value("not_found", &resolved, error)
@@ -506,16 +804,20 @@ pub fn validate_target_validated_with_topology(
     topology: &ProjectTopology,
     input: &str,
 ) -> Result<ManagedPath, Value> {
-    validate_target_with_roots(&validated_roots_from(topology), input)
+    validate_target_with_roots(&validated_roots_from(topology), input, Some(topology))
 }
 
 /// Validate a writable target against one project root that was already
 /// validated as managed by the caller.
 pub fn validate_target_in_root(project_root: &Path, input: &str) -> Result<ManagedPath, Value> {
-    validate_target_with_roots(&[project_root.to_path_buf()], input)
+    validate_target_with_roots(&[project_root.to_path_buf()], input, None)
 }
 
-fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedPath, Value> {
+fn validate_target_with_roots(
+    roots: &[PathBuf],
+    input: &str,
+    topology: Option<&ProjectTopology>,
+) -> Result<ManagedPath, Value> {
     let resolved = resolve_input(input)?;
     let Some(root) = containing_root(roots, &resolved).cloned() else {
         return Err(json!({
@@ -530,6 +832,9 @@ fn validate_target_with_roots(roots: &[PathBuf], input: &str) -> Result<ManagedP
         return Err(
             json!({"ok": false, "reason": "secret_path_denied", "path": resolved.to_string_lossy()}),
         );
+    }
+    if !operational_root_still_eligible(topology, &root) {
+        return Err(operational_root_no_longer_eligible_error(&root));
     }
     let root_real = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
     let real = if resolved.exists() {
@@ -766,6 +1071,43 @@ mod tests {
         })
     }
 
+    /// Given a caller-injected home whose Documents root cannot be traversed
+    /// When operational_root_eligible classifies the live-proven project
+    /// Then the delegated arm admits it without ever stat'ing the candidate —
+    /// a probing implementation fails on the untraversable parent, so an `ok`
+    /// classification is direct evidence that no filesystem access happened.
+    /// This exercises the real call chain on every platform (the injected
+    /// `home`, not the process HOME, drives the delegation decision).
+    #[cfg(unix)]
+    #[test]
+    fn delegated_protected_root_is_classified_without_probing() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = plain_parent("delegatedlex", &[]);
+        let home = parent.join("home");
+        let documents = home.join("Documents");
+        let project = documents.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o000)).unwrap();
+        // Under an unprivileged runner metadata traversal fails, so an `ok`
+        // classification is direct evidence the delegated arm never probed.
+        // Under a privileged runner (root) that precondition does not hold —
+        // the eligibility assertions below still exercise the same arm.
+        let traversal_blocked = std::fs::metadata(&project).is_err();
+        assert!(
+            operational_root_eligible(&vcs_less_project(&project), Some(&home)),
+            "delegated arm must admit without probing (traversal_blocked={traversal_blocked})"
+        );
+        // The lexical boundary still applies on the delegated arm: the same
+        // home itself (an ancestor of every protected spelling) is refused
+        // without a probe.
+        assert!(!operational_root_eligible(
+            &vcs_less_project(&home),
+            Some(&home)
+        ));
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&parent).ok();
+    }
+
     /// A vcs-less scratch parent plus the named child directories under it.
     fn plain_parent(name: &str, children: &[&str]) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -955,9 +1297,14 @@ mod tests {
                 .expect("live-proven worktree stays readable through the fs path");
                 assert_eq!(validated.root, root);
                 // The Git-only entry point keeps the same special case.
-                let git_only =
-                    validate_existing_scoped(snapshot, path, &[], Some(worktrees_root.as_path()))
-                        .expect("git-only entry keeps the worktree special case");
+                let git_only = validate_existing_scoped(
+                    snapshot,
+                    path,
+                    &[],
+                    Some(worktrees_root.as_path()),
+                    None,
+                )
+                .expect("git-only entry keeps the worktree special case");
                 assert_eq!(git_only.root, root);
             } else {
                 assert_eq!(
@@ -1222,7 +1569,7 @@ mod tests {
 
         assert!(managed_roots_from(&topology).contains(&root));
         assert!(!is_operational_root(&topology, &root));
-        assert!(reject_operational_root_mutation(&topology, &root).is_none());
+        assert!(reject_operational_root_mutation(&snap, &topology, &root).is_none());
         let git_only = validate_existing(&snap, file.to_str().unwrap()).unwrap();
         let validated = validate_existing_validated(&snap, file.to_str().unwrap()).unwrap();
         assert_eq!(git_only.root, validated.root);
@@ -1242,10 +1589,145 @@ mod tests {
         let root = parent.join("project");
         let snap = snapshot(&root);
         let topology = projects::derive_routing(&snap);
-        let denied = reject_operational_root_mutation(&topology, &root)
+        let denied = reject_operational_root_mutation(&snap, &topology, &root)
             .expect("operational roots must fail closed for Git-dirty gates");
         assert_eq!(denied["ok"], false);
         assert_eq!(denied["reason"], "operational_root_mutation_unsupported");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn git_root_whose_vcs_marker_vanished_fails_closed_at_the_write_boundary() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        assert!(reject_operational_root_mutation(&snap, &topology, &root).is_none());
+
+        // Simulates `.git` being removed/renamed inside the routing-cache
+        // TTL: the topology still says Git, but the write boundary must not
+        // trust the stale classification.
+        fs::rename(root.join(".git"), root.join(".git-moved")).unwrap();
+        let denied = reject_operational_root_mutation(&snap, &topology, &root)
+            .expect("a Git root whose .git disappeared must fail closed");
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["reason"], "git_root_vcs_disappeared");
+
+        // A linked-worktree style .git file also counts as a VCS marker.
+        fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert!(reject_operational_root_mutation(&snap, &topology, &root).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_marker_probe_failure_is_reported_as_unverifiable_not_disappeared() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = repo();
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        assert!(reject_operational_root_mutation(&snap, &topology, &root).is_none());
+
+        // stat(<root>/.git) fails with EACCES when the root loses search
+        // permission — a probe failure, not a missing marker.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = reject_operational_root_mutation(&snap, &topology, &root)
+            .expect("an unverifiable .git probe must still fail closed");
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["reason"], "git_root_vcs_unverifiable");
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Given a broker fs_read answer for a protected root's `.git` marker
+    /// When the write boundary decides marker presence
+    /// Then both spellings are "present" (worktree file `ok`, clone
+    /// directory `not_a_file`), only `stat_failed` carrying errno ENOENT is
+    /// "gone", and every other failure — including an older broker that
+    /// does not emit `os_error` — is inconclusive so a real repo is never
+    /// misreported as stripped of its VCS marker.
+    #[test]
+    fn git_marker_from_marker_read_covers_both_spellings_and_failures() {
+        // Linked-worktree marker: `.git` is a file, readable.
+        assert_eq!(
+            git_marker_from_marker_read(&json!({"ok": true, "content": "gitdir: /x/.git/wt"})),
+            GitMarkerProbe::Present
+        );
+        // Plain-clone marker: `.git` is a directory.
+        assert_eq!(
+            git_marker_from_marker_read(&json!({"ok": false, "reason": "not_a_file"})),
+            GitMarkerProbe::Present
+        );
+        // Marker removed: real `fs_tools::read` reports `not_found` (the
+        // validate-existing refusal) or `stat_failed` when the entry vanished
+        // between validation and stat; both carry the structured errno.
+        for gone in [
+            json!({"ok": false, "reason": "not_found", "os_error": 2}),
+            json!({"ok": false, "reason": "stat_failed", "os_error": 2}),
+        ] {
+            assert_eq!(
+                git_marker_from_marker_read(&gone),
+                GitMarkerProbe::Gone,
+                "{gone}"
+            );
+        }
+        // Failures without the structured ENOENT (older broker, different
+        // errno, or a refusal that cannot prove removal) are not proof the
+        // marker is gone.
+        for failure in [
+            json!({"ok": false, "reason": "not_found"}),
+            json!({"ok": false, "reason": "not_found", "os_error": 13}),
+            json!({"ok": false, "reason": "stat_failed"}),
+            json!({"ok": false, "reason": "stat_failed", "os_error": 5}),
+            json!({"ok": false, "reason": "outside_managed_roots"}),
+            json!({"ok": false, "reason": "read_failed", "os_error": 2}),
+            json!({"ok": false, "reason": "macos_tcc_access_blocked"}),
+            json!({}),
+        ] {
+            assert_eq!(
+                git_marker_from_marker_read(&failure),
+                GitMarkerProbe::Inconclusive,
+                "{failure}"
+            );
+        }
+    }
+
+    /// Given a cached Operational root
+    /// When its lexical path is swapped for a symlink inside the cache TTL
+    /// Then authorization re-runs the live identity and HOME boundary instead
+    /// of trusting the stale classification, so the swap cannot widen reads
+    /// into an ancestor of HOME.
+    #[cfg(unix)]
+    #[test]
+    fn swapped_operational_root_is_reverified_not_trusted_from_cache() {
+        use std::os::unix::fs::symlink;
+        let parent = plain_parent("rootswap", &["project"]);
+        let root = parent.join("project");
+        let file = root.join("artifact.md");
+        fs::write(&file, "lark-cli output\n").unwrap();
+        let snap = snapshot(&root);
+
+        // First access proves and caches the operational root.
+        let topology = projects::derive_routing(&snap);
+        assert!(is_operational_root(&topology, &root));
+        assert!(validate_existing_validated(&snap, file.to_str().unwrap()).is_ok());
+
+        // Replace the directory with a symlink to an ancestor of HOME. Both
+        // the cached root and any target under it now resolve below `/`, so
+        // containment alone would still pass — the live eligibility re-check
+        // is what must fail closed.
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&root).unwrap();
+        symlink("/", &root).unwrap();
+        let denied =
+            validate_existing_validated(&snap, root.join("etc").to_str().unwrap()).unwrap_err();
+        assert_eq!(denied["reason"], "operational_root_no_longer_eligible");
+
+        // Restore the real directory: the same path authorizes again.
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(&file, "lark-cli output\n").unwrap();
+        assert!(validate_existing_validated(&snap, file.to_str().unwrap()).is_ok());
         fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1514,5 +1996,50 @@ mod tests {
         assert!(hint.contains("keep it available"));
         let _ = fs::remove_file(outside);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validated_roots_cached_reuses_roots_across_scroll_churn_and_misses_on_cwd_change() {
+        let parent = plain_parent("cached-roots", &["project"]);
+        let root = parent.join("project");
+        let snap = snapshot(&root);
+        let mut churned = snap.clone();
+        churned["panes"][0]["scrollback_offset"] = json!(42_000);
+
+        let first = validated_roots_cached(&snap);
+        let second = validated_roots_cached(&churned);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "scroll churn must reuse the cached roots"
+        );
+
+        let other = plain_parent("cached-roots-moved", &["project"]);
+        let moved = snapshot(&other.join("project"));
+        let third = validated_roots_cached(&moved);
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a cwd change must recompute roots"
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+        fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn validated_roots_cached_recomputes_after_ttl_expiry() {
+        let parent = plain_parent("cached-roots-ttl", &["project"]);
+        let snap = snapshot(&parent.join("project"));
+
+        let first = validated_roots_cached(&snap);
+        projects::advance_cache_clock(
+            projects::ROUTING_CACHE_TTL + std::time::Duration::from_millis(1),
+        );
+        let second = validated_roots_cached(&snap);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "an expired entry must recompute so fingerprint-invisible fs changes surface"
+        );
+
+        fs::remove_dir_all(parent).unwrap();
     }
 }

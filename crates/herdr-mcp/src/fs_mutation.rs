@@ -32,7 +32,9 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
         Ok(value) => value,
         Err(error) => return error,
     };
-    if let Some(error) = fs_security::reject_operational_root_mutation(&topology, &target.root) {
+    if let Some(error) =
+        fs_security::reject_operational_root_mutation(snapshot, &topology, &target.root)
+    {
         return error;
     }
     let working =
@@ -144,7 +146,9 @@ pub(crate) fn write_bytes(
         Ok(value) => value,
         Err(error) => return error,
     };
-    if let Some(error) = fs_security::reject_operational_root_mutation(&topology, &target.root) {
+    if let Some(error) =
+        fs_security::reject_operational_root_mutation(snapshot, &topology, &target.root)
+    {
         return error;
     }
     let working =

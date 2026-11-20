@@ -69,7 +69,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// path now runs it once so the upgrade installs the new subcommands before a
 /// request needs them. That costs one broker re-authorization on that upgrade,
 /// which is the same at-most-one-prompt-per-upgrade budget #844 targets.
-pub const BROKER_COMPAT_REVISION: u32 = 5;
+pub const BROKER_COMPAT_REVISION: u32 = 6;
 /// First broker revision that implements the read-only `git` identity action.
 #[cfg(target_os = "macos")]
 pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
@@ -77,6 +77,11 @@ pub(crate) const GIT_IDENTITY_MIN_COMPAT_REVISION: u32 = 3;
 /// shared validated-root boundary. This value is also used by the portable
 /// denial annotation path, so it must remain available on every target.
 pub(crate) const OPERATIONAL_ROOT_MIN_COMPAT_REVISION: u32 = 4;
+/// First broker revision that implements `real.path` — the canonical-path
+/// answer the exec path needs before it can delegate a protected root's
+/// command pane.
+#[cfg(target_os = "macos")]
+pub(crate) const REAL_PATH_MIN_COMPAT_REVISION: u32 = 6;
 /// First broker revision that can be a stable TCC parent for `herdr server`.
 #[cfg(any(target_os = "macos", test))]
 pub const HERDR_HOST_MIN_COMPAT_REVISION: u32 = 2;
@@ -93,10 +98,18 @@ pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BROKER_CHILD_ENV: &str = "HERDR_MCP_TCC_BROKER_CHILD";
 
-/// The 8 focused operations the broker may dispatch. This is the complete
+/// The 9 focused operations the broker may dispatch. This is the complete
 /// allowlist — no arbitrary operation names are accepted.
-const ALLOWED_OPS: [&str; 8] = [
-    "fs_read", "fs_list", "fs_grep", "fs_image", "fs_edit", "fs_write", "fs_patch", "git",
+const ALLOWED_OPS: [&str; 9] = [
+    "fs_read",
+    "fs_list",
+    "fs_grep",
+    "fs_image",
+    "fs_edit",
+    "fs_write",
+    "fs_patch",
+    "git",
+    "real.path",
 ];
 
 /// Stable broker path, independent of `runtime/generations`.
@@ -932,8 +945,49 @@ fn dispatch(request: &Request) -> Value {
         "fs_write" => fs_mutation::write(&request.snapshot, &request.args),
         "fs_patch" => fs_patch::apply(&request.snapshot, &request.args),
         "git" => git_tools::run(&request.snapshot, &request.args),
+        "real.path" => real_path_op(&request.snapshot, &request.args),
         // Unreachable: parse_request enforces the allowlist.
         _ => broker_error("unknown_operation", &request.op),
+    }
+}
+
+/// Resolve the canonical real path of a validated root.
+///
+/// The exec path needs an authorized answer for protected roots the rotating
+/// runtime must not canonicalize itself (a direct stat would make the runtime
+/// the TCC requester). The path must exactly match a validated root derived
+/// from the request's live snapshot — inside this authorized child the
+/// eligibility check runs the complete canonicalize + HOME-ancestry +
+/// secret-path guard — so the broker never resolves arbitrary paths the
+/// caller names, and a root swapped for a symlink escaping HOME fails the
+/// re-validation before any answer is returned.
+fn real_path_op(snapshot: &Value, args: &Value) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return broker_error("invalid_args", "real.path requires args.path");
+    };
+    let topology = crate::projects::derive_routing(snapshot);
+    if let Err(error) =
+        crate::fs_security::validate_exact_validated_root_with_topology(&topology, path)
+    {
+        return error;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(real) => json!({
+            "ok": true,
+            "path": path,
+            "real": real.to_string_lossy(),
+            "is_dir": real.is_dir(),
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "reason": if error.kind() == std::io::ErrorKind::NotFound {
+                "not_found"
+            } else {
+                "resolve_failed"
+            },
+            "path": path,
+            "os_error": error.raw_os_error(),
+        }),
     }
 }
 
@@ -1034,6 +1088,29 @@ fn annotate_operational_root_upgrade_with(value: Value, config_dir: &Path) -> Va
 pub(crate) fn installed_supports_git_identity(config_dir: &Path) -> bool {
     installed_compat_revision(config_dir)
         .is_some_and(|revision| revision >= GIT_IDENTITY_MIN_COMPAT_REVISION)
+}
+
+/// Whether the installed stable broker can answer `real.path` — the
+/// canonical-path answer the protected exec path needs before delegating a
+/// command pane. A missing or invalid compatibility revision fails closed.
+#[cfg(target_os = "macos")]
+pub(crate) fn installed_supports_real_path(config_dir: &Path) -> bool {
+    installed_compat_revision(config_dir)
+        .is_some_and(|revision| revision >= REAL_PATH_MIN_COMPAT_REVISION)
+}
+
+/// Resolve the canonical real path of one validated root through the installed
+/// stable broker — the only client authorized to stat TCC-protected folders
+/// without making the rotating runtime the consent requester.
+#[cfg(target_os = "macos")]
+pub(crate) fn real_path_via_stable_broker(snapshot: &Value, path: &Path) -> Result<Value, String> {
+    run_stable_broker(
+        "real.path",
+        snapshot,
+        &json!({
+            "path": path.to_string_lossy(),
+        }),
+    )
 }
 
 /// Resolve the exact `HEAD` commit and branch of a managed root through the
@@ -2254,6 +2331,61 @@ mod tests {
         let out = handle_request_bytes(&serde_json::to_vec(&symlink).unwrap()).unwrap();
         assert_eq!(out["ok"].as_bool(), Some(false));
         assert_eq!(out["reason"].as_str(), Some("symlink_escape"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// user broker real.path | Given a validated root | When the op runs |
+    /// Then the canonical real path is returned — and a root swapped for a
+    /// symlink resolves to the link's target, observably different.
+    #[test]
+    fn real_path_op_resolves_validated_roots_and_sees_through_swaps() {
+        let dir = temp_dir("real-path");
+        let root = dir.join("repo");
+        fs::create_dir_all(&root).unwrap();
+        init_git_repo(&root);
+        let snapshot = make_snapshot(&root);
+
+        let response = request("real.path", &snapshot, json!({"path": root}));
+        let out = handle_request_bytes(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+        assert_eq!(out["is_dir"].as_bool(), Some(true), "{out}");
+        assert_eq!(
+            out["real"].as_str().unwrap(),
+            std::fs::canonicalize(&root).unwrap().to_string_lossy(),
+            "{out}"
+        );
+
+        // The op never resolves paths outside the validated roots.
+        let outside = request("real.path", &snapshot, json!({"path": "/etc"}));
+        let out = handle_request_bytes(&serde_json::to_vec(&outside).unwrap()).unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(false), "{out}");
+
+        // A missing root answers a structured failure, not a hang.
+        let missing = dir.join("gone");
+        let response = request("real.path", &snapshot, json!({"path": missing}));
+        let out = handle_request_bytes(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(false), "{out}");
+
+        // Root swapped for a symlink: the answer is the link's target, which
+        // the runtime-side identity check refuses.
+        let target = dir.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        let response = request("real.path", &snapshot, json!({"path": root}));
+        let out = handle_request_bytes(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+        assert_eq!(
+            out["real"].as_str().unwrap(),
+            std::fs::canonicalize(&target).unwrap().to_string_lossy(),
+            "{out}"
+        );
+        assert_ne!(
+            out["real"].as_str().unwrap(),
+            root.to_string_lossy(),
+            "{out}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -298,7 +298,7 @@ fn string_array(value: Option<&Value>) -> Vec<&str> {
 }
 
 fn resolve_scope(arguments: &Value, snapshot: &Value) -> Option<WorkScope> {
-    let topology = projects::derive_routing(snapshot);
+    let topology = projects::derive_routing_cached(snapshot);
     // Tool_call capture scopes to the unified validated-root surface: managed
     // Git roots plus vcs-less operational roots proven by the live topology
     // (same surface the tailers tail). Project key = the git root when any,
