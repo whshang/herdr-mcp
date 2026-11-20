@@ -556,6 +556,22 @@ struct PromptRegistryInner {
     // Serialize durable task read/modify/write across report, lifecycle, ack and
     // parent notification so a stale snapshot cannot erase an accepted report.
     task_mutations: Mutex<()>,
+    parent_notifications: Mutex<HashSet<String>>,
+    /// Lightweight in-memory index of durable tasks that still need tracker
+    /// attention: every non-terminal task plus terminal tasks whose
+    /// notification_state is still "pending". `None` means "not hydrated" and
+    /// always falls back to a full `list_tasks` scan; `Some(empty)` lets the
+    /// tracker skip both the supersession-repair pass and the reconcile pass
+    /// without decoding any history rows. Every `save_task` /
+    /// `persist_task_with_supersede` write mutates it, and each full scan
+    /// rebuilds it, so a stale miss self-heals on the next write or scan.
+    /// The first hydration includes every active row and pending terminal
+    /// notification, not only the recent task window. `task_activity_writes`
+    /// (below) prevents that snapshot from clobbering a concurrent insert.
+    task_activity_index: Mutex<Option<HashSet<String>>>,
+    /// Monotonic counter bumped on every task-row persist; the index refresh
+    /// uses it as a happens-before guard against interleaved writes.
+    task_activity_writes: AtomicU64,
     role_dispatches: Mutex<()>,
     /// Idempotency keys whose resumable spawn checkpoint is being continued,
     /// so two concurrent replays cannot both prompt the same agent.
@@ -576,6 +592,19 @@ struct PromptRegistryInner {
 #[derive(Clone, Default)]
 pub struct PromptRegistry {
     inner: Arc<PromptRegistryInner>,
+}
+
+struct ParentNotificationGuard<'a> {
+    active: &'a Mutex<HashSet<String>>,
+    target: &'a str,
+}
+
+impl Drop for ParentNotificationGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(self.target);
+        }
+    }
 }
 
 /// One in-flight spawn resume. Dropping it releases the key for the next replay.
@@ -629,6 +658,9 @@ impl PromptRegistry {
         Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -651,6 +683,9 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -680,6 +715,9 @@ impl PromptRegistry {
         let registry = Self {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -1043,11 +1081,12 @@ impl PromptRegistry {
         };
         let now = self.now_ms();
         let mut rows = vec![encode_task_ledger_row(task, request_hash, now)?];
-        for mut prior in self.unacknowledged_priors(task)? {
+        let mut priors = self.unacknowledged_priors(task)?;
+        for prior in &mut priors {
             prior.steering_state = Some("superseded".to_owned());
             prior.superseded_by = Some(task.task_id.clone());
             prior.updated_at_ms = now;
-            rows.push(encode_task_ledger_row(&prior, None, now)?);
+            rows.push(encode_task_ledger_row(prior, None, now)?);
         }
         let mut store = store
             .lock()
@@ -1065,7 +1104,16 @@ impl PromptRegistry {
             .iter()
             .map(TaskLedgerRow::as_input)
             .collect::<Vec<OperationLedgerInput<'_>>>();
-        store.put_operation_ledgers_atomic(&inputs)
+        store.put_operation_ledgers_atomic(&inputs)?;
+        // `rows[0]` is the new record itself; the rest are the superseded
+        // priors in `unacknowledged_priors` order. `note_task_persisted`
+        // needs the decoded lifecycle/notification fields, which the row
+        // encoding does not carry, so fold the in-memory records back in.
+        self.note_task_persisted(task);
+        for prior in &priors {
+            self.note_task_persisted(prior);
+        }
+        Ok(())
     }
 
     /// Idempotent repair path: re-apply supersession for one existing task.
@@ -2145,7 +2193,14 @@ impl PromptRegistry {
                 loop {
                     match cursor.has_changed() {
                         Ok(true) => {
-                            let _ = cursor.borrow_and_update();
+                            // Coalesce consecutive cursor jumps: events that
+                            // arrived while the previous pass ran are already
+                            // inside the next snapshot, so drain the watch
+                            // backlog and spend a single scan on the whole
+                            // burst instead of one reconcile pass per event.
+                            while cursor.has_changed().unwrap_or(false) {
+                                let _ = cursor.borrow_and_update();
+                            }
                             let Some(inner) = weak.upgrade() else {
                                 return;
                             };
@@ -2175,13 +2230,12 @@ impl PromptRegistry {
     /// identical to the arrival order `persist_task_with_supersede` encodes —
     /// and re-marking the same rows is idempotent, so this pass is safe to run
     /// on every reconcile, at startup and afterwards.
-    fn repair_supersession_gaps(&self) {
-        let Ok(tasks) = self.list_tasks(512) else {
-            return;
-        };
+    /// Same pass over a caller-supplied snapshot so the tracker spends one
+    /// `list_tasks(512)` decode per cursor event instead of two.
+    fn repair_supersession_gaps_in(&self, tasks: &[PromptTaskRecord]) {
         let now = self.now_ms();
         let mut repaired: Vec<PromptTaskRecord> = Vec::new();
-        for prior in &tasks {
+        for prior in tasks {
             if prior.is_terminal() {
                 continue;
             }
@@ -2243,15 +2297,68 @@ impl PromptRegistry {
             .iter()
             .map(TaskLedgerRow::as_input)
             .collect::<Vec<OperationLedgerInput<'_>>>();
-        let _ = store.put_operation_ledgers_atomic(&inputs);
+        if store.put_operation_ledgers_atomic(&inputs).is_ok() {
+            for task in &repaired {
+                self.note_task_persisted(task);
+            }
+        }
     }
 
+    /// One full task-list scan feeds both tracker passes: the supersession
+    /// repair reads the same snapshot the reconcile loop then walks, so each
+    /// cursor event costs one `list_tasks(512)` decode instead of two. When
+    /// the activity index is hydrated and empty there is nothing that could
+    /// need attention, so both passes are skipped without touching the store.
+    /// The initial hydration also checks the unbounded active and pending
+    /// terminal phases, so a long-lived task cannot be evicted by newer
+    /// terminal history. A row written between the scan and a pass is still
+    /// folded into the index by its own `note_task_persisted`.
     fn reconcile_active_tasks(&self) {
-        self.repair_supersession_gaps();
-        let Ok(tasks) = self.list_tasks(512) else {
+        if self.task_activity_index_idle() {
+            return;
+        }
+        let hydrate_full_index = self.task_activity_index_unhydrated();
+        let writes_before = self.inner.task_activity_writes.load(Ordering::SeqCst);
+        let Ok(recent_tasks) = self.list_tasks(512) else {
             return;
         };
-        for task in tasks {
+        let mut tracker_tasks = recent_tasks.clone();
+        if hydrate_full_index {
+            let Ok(active_tasks) = self.list_active_tasks() else {
+                return;
+            };
+            let Ok(pending_terminal_tasks) = self.list_terminal_tasks() else {
+                return;
+            };
+            tracker_tasks.extend(active_tasks);
+            tracker_tasks.extend(
+                pending_terminal_tasks
+                    .into_iter()
+                    .filter(|task| task.notification_state == "pending"),
+            );
+        }
+        self.refresh_task_activity_index(&tracker_tasks, writes_before);
+        self.repair_supersession_gaps_in(&recent_tasks);
+        let mut seen = HashSet::with_capacity(tracker_tasks.len());
+        for task in tracker_tasks {
+            if !seen.insert(task.task_id.clone()) {
+                continue;
+            }
+            if task.is_terminal() {
+                if task.notification_state == "pending" {
+                    self.maybe_notify_parent(&task);
+                }
+            } else {
+                let _ = self.reconcile_task(&task.task_id);
+            }
+        }
+        for task_id in self.task_activity_index_task_ids() {
+            if !seen.insert(task_id.clone()) {
+                continue;
+            }
+            let Ok(Some(task)) = self.load_task(&task_id) else {
+                continue;
+            };
             if task.is_terminal() {
                 if task.notification_state == "pending" {
                     self.maybe_notify_parent(&task);
@@ -2263,7 +2370,10 @@ impl PromptRegistry {
     }
 
     fn reconcile_activity_timeouts(&self) {
-        let Ok(tasks) = self.list_tasks(512) else {
+        if self.task_activity_index_idle() {
+            return;
+        }
+        let Ok(tasks) = self.list_active_tasks() else {
             return;
         };
         for task in tasks {
@@ -2281,6 +2391,9 @@ impl PromptRegistry {
     /// entirely (the default 20-minute stall liveness projection is unchanged
     /// and emits nothing). Never terminates a task.
     fn sweep_task_budgets(&self) {
+        if self.task_activity_index_idle() {
+            return;
+        }
         // Active tasks only: the bounded recent-512 window can evict a still
         // running task behind newer terminal history and silence its caps
         // forever (S5 review P1-5).
@@ -2505,144 +2618,259 @@ impl PromptRegistry {
         }
     }
 
+    /// Notify the parent that one or more of its child tasks turned terminal.
+    ///
+    /// `task_mutations` never spans a socket call: the parent liveness probe
+    /// and the notification `agent.prompt` both run unlocked, and every durable
+    /// read-modify-write is fenced by a short lock that re-validates state.
+    /// The `in_flight` claim + claimed-at timestamp act as the optimistic
+    /// concurrency guard: a `task_ack`, a second notifier, or a superseding
+    /// update that lands while the prompt is on the wire changes the durable
+    /// row, so the write-back only finalizes rows it still owns.
     fn maybe_notify_parent(&self, trigger: &PromptTaskRecord) {
-        let Ok(_guard) = self.inner.task_mutations.lock() else {
-            return;
-        };
-        self.maybe_notify_parent_locked(trigger);
-    }
-
-    fn maybe_notify_parent_locked(&self, trigger: &PromptTaskRecord) {
-        let Some(parent_target) = trigger.parent_target.as_deref() else {
-            return;
-        };
         if !trigger.is_terminal() || trigger.notification_state != "pending" {
             return;
         }
+        let Some(parent_target) = trigger.parent_target.as_deref() else {
+            return;
+        };
         let Some(client) = self.inner.client.as_ref() else {
             return;
         };
-        let Some(parent_state) = agent_state_of(client, parent_target) else {
+        let active = &self.inner.parent_notifications;
+        let Ok(mut targets) = active.lock() else {
             return;
         };
-        if !matches!(parent_state.agent_status.as_deref(), Some("idle" | "done")) {
+        if !targets.insert(parent_target.to_owned()) {
             return;
         }
-
-        let Ok(all_tasks) = self.list_tasks(512) else {
-            return;
+        drop(targets);
+        let _notification_guard = ParentNotificationGuard {
+            active,
+            target: parent_target,
         };
-        let attention = task_attention_advice(all_tasks.iter().filter(|task| {
-            task.parent_target.as_deref() == Some(parent_target)
-                && (!task.is_terminal() || task.notification_state == "pending")
-        }));
-
-        let mut pending = all_tasks
-            .into_iter()
-            .filter(|task| {
+        // Probe while holding the parent-specific reservation, before claiming
+        // rows, so busy or unreachable parents do not count as send attempts.
+        if !agent_state_of(client, parent_target)
+            .is_some_and(|state| matches!(state.agent_status.as_deref(), Some("idle" | "done")))
+        {
+            return;
+        }
+        // Claim phase: keep durable state changes under the short mutation lock.
+        let (pending, text, claimed_at) = {
+            let Ok(_guard) = self.inner.task_mutations.lock() else {
+                return;
+            };
+            match self.load_task(&trigger.task_id) {
+                Ok(Some(fresh))
+                    if fresh.is_terminal()
+                        && fresh.notification_state == "pending"
+                        && fresh.parent_target.as_deref() == Some(parent_target) => {}
+                _ => return,
+            }
+            let Ok(all_tasks) = self.list_tasks(512) else {
+                return;
+            };
+            let attention = task_attention_advice(all_tasks.iter().filter(|task| {
                 task.parent_target.as_deref() == Some(parent_target)
-                    && task.is_terminal()
-                    && task.notification_state == "pending"
-            })
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            return;
-        }
-        pending.sort_by(|left, right| {
-            task_notification_priority(right)
-                .cmp(&task_notification_priority(left))
-                .then_with(|| {
-                    left.terminal_cursor
-                        .unwrap_or(u64::MAX)
-                        .cmp(&right.terminal_cursor.unwrap_or(u64::MAX))
-                })
-        });
-        pending.truncate(32);
+                    && (!task.is_terminal() || task.notification_state == "pending")
+            }));
 
-        let now = self.now_ms();
-        for task in &mut pending {
-            task.notification_state = "in_flight".to_owned();
-            task.notification_attempts = task.notification_attempts.saturating_add(1);
-            task.notification_at_ms = Some(now);
-            task.notification_error = None;
-            task.updated_at_ms = now;
-            if self.save_task(task, None).is_err() {
+            let Ok(terminal_tasks) = self.list_terminal_tasks() else {
+                return;
+            };
+            let mut pending = terminal_tasks
+                .into_iter()
+                .filter(|task| {
+                    task.parent_target.as_deref() == Some(parent_target)
+                        && task.is_terminal()
+                        && task.notification_state == "pending"
+                })
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
                 return;
             }
+            pending.sort_by(|left, right| {
+                task_notification_priority(right)
+                    .cmp(&task_notification_priority(left))
+                    .then_with(|| {
+                        left.terminal_cursor
+                            .unwrap_or(u64::MAX)
+                            .cmp(&right.terminal_cursor.unwrap_or(u64::MAX))
+                    })
+            });
+            pending.truncate(32);
+
+            let now = self.now_ms();
+            for task in &mut pending {
+                task.notification_state = "in_flight".to_owned();
+                task.notification_attempts = task.notification_attempts.saturating_add(1);
+                task.notification_at_ms = Some(now);
+                task.notification_error = None;
+                task.updated_at_ms = now;
+                if self.save_task(task, None).is_err() {
+                    return;
+                }
+            }
+
+            let mut lines = vec![format!(
+                "Herdr child-task update: {} terminal task(s).",
+                pending.len()
+            )];
+            for task in &pending {
+                let attention_state = task_attention_state(&attention, &task.task_id)
+                    .map(|state| format!(" [attention={state}]"))
+                    .unwrap_or_default();
+                // The final excerpt deliberately stays out of the wake text: child
+                // pane output must not be typed into the parent's prompt, and TUI
+                // agents end their screen with chrome rather than the outcome.
+                lines.push(format!(
+                    "- {}: {} (child {}, turn {}, terminal_seq {}){}",
+                    task.task_id,
+                    task.lifecycle.as_str(),
+                    task.target,
+                    task.turn_id.as_deref().unwrap_or("unverified"),
+                    task.terminal_cursor
+                        .map(|cursor| cursor.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    attention_state
+                ));
+            }
+            lines.push(
+                "Attention is advisory. Use durable task facts as authority: verify_completion enters deterministic validation; continue_unobserved leaves independent running children alone. Do not re-dispatch a terminal or delivery-uncertain task blindly."
+                    .to_owned(),
+            );
+            (pending, lines.join("\n"), now)
+        };
+
+        // The parent may have become busy while the batch was assembled.
+        if !agent_state_of(client, parent_target)
+            .is_some_and(|state| matches!(state.agent_status.as_deref(), Some("idle" | "done")))
+        {
+            self.finalize_notification_claim(&pending, claimed_at, "pending", None, now_ms());
+            return;
         }
 
-        let mut lines = vec![format!(
-            "Herdr child-task update: {} terminal task(s).",
-            pending.len()
-        )];
-        for task in &pending {
-            let attention_state = task_attention_state(&attention, &task.task_id)
-                .map(|state| format!(" [attention={state}]"))
-                .unwrap_or_default();
-            // The final excerpt deliberately stays out of the wake text: child
-            // pane output must not be typed into the parent's prompt, and TUI
-            // agents end their screen with chrome rather than the outcome.
-            lines.push(format!(
-                "- {}: {} (child {}, turn {}, terminal_seq {}){}",
-                task.task_id,
-                task.lifecycle.as_str(),
-                task.target,
-                task.turn_id.as_deref().unwrap_or("unverified"),
-                task.terminal_cursor
-                    .map(|cursor| cursor.to_string())
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                attention_state
-            ));
-        }
-        lines.push(
-            "Attention is advisory. Use durable task facts as authority: verify_completion enters deterministic validation; continue_unobserved leaves independent running children alone. Do not re-dispatch a terminal or delivery-uncertain task blindly."
-                .to_owned(),
-        );
-        let text = lines.join("\n");
-
+        // Slow path: the notification RPC runs with no lock held, so a slow
+        // parent cannot stall concurrent register_task / task_ack /
+        // task_report behind a socket round trip.
         let outcome = client.call_with_timeout(
             "agent.prompt",
             json!({"target": parent_target, "text": text}),
             Duration::from_secs(10),
         );
         let finished_at = now_ms();
+
+        // Write-back phase: a row is only finalized while it still carries
+        // the exact `in_flight` claim stamped above. `task_ack` flips the
+        // state to `acknowledged` and a concurrent notifier re-stamps
+        // `notification_at_ms`, so either mutation during the RPC makes this
+        // pass skip the row instead of clobbering the newer fact.
         match outcome {
-            Ok(_) => {
-                for task in &mut pending {
-                    task.notification_state = "delivered".to_owned();
-                    task.notification_at_ms = Some(finished_at);
-                    task.notification_error = None;
-                    task.updated_at_ms = finished_at;
-                    let _ = self.save_task(task, None);
-                }
-            }
+            Ok(_) => self.finalize_notification_claim(
+                &pending,
+                claimed_at,
+                "delivered",
+                None,
+                finished_at,
+            ),
             Err(error) => {
-                let definitely_not_delivered = definitely_not_delivered(&error);
-                for task in &mut pending {
-                    task.notification_state = if definitely_not_delivered {
-                        "pending".to_owned()
-                    } else {
-                        "uncertain".to_owned()
-                    };
-                    task.notification_at_ms = Some(finished_at);
-                    task.notification_error = Some(truncate_chars(&error.message, 512));
-                    task.updated_at_ms = finished_at;
-                    let _ = self.save_task(task, None);
-                }
+                let state = if definitely_not_delivered(&error) {
+                    "pending"
+                } else {
+                    "uncertain"
+                };
+                self.finalize_notification_claim(
+                    &pending,
+                    claimed_at,
+                    state,
+                    Some(truncate_chars(&error.message, 512)),
+                    finished_at,
+                );
             }
         }
     }
 
-    fn reconcile_task(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
-        let _guard = self
-            .inner
-            .task_mutations
-            .lock()
-            .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
-        self.reconcile_task_locked(task_id)
+    /// Finalize the notification outcome on every row this pass still owns.
+    /// Rows are re-loaded under the mutation lock; a claim whose state or
+    /// timestamp moved since `claimed_at` is left to whoever mutated it.
+    fn finalize_notification_claim(
+        &self,
+        claimed: &[PromptTaskRecord],
+        claimed_at: u64,
+        state: &str,
+        notification_error: Option<String>,
+        finished_at: u64,
+    ) {
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        for claimed_task in claimed {
+            let Ok(Some(mut task)) = self.load_task(&claimed_task.task_id) else {
+                continue;
+            };
+            if task.notification_state != "in_flight" || task.notification_at_ms != Some(claimed_at)
+            {
+                continue;
+            }
+            task.notification_state = state.to_owned();
+            task.notification_at_ms = Some(finished_at);
+            task.notification_error = notification_error.clone();
+            task.updated_at_ms = finished_at;
+            let _ = self.save_task(&task, None);
+        }
     }
 
-    fn reconcile_task_locked(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
+    /// Reconcile one task against the event cache without ever holding
+    /// `task_mutations` across a socket call or a large file read.
+    ///
+    /// Three phases, mirroring the durable task ledger's own concurrency
+    /// model:
+    ///   1. short lock — apply the in-memory state machine, record whether a
+    ///      terminal transition armed the one-shot final-excerpt read, and
+    ///      persist the transition itself;
+    ///   2. no lock — run `read_final_excerpt` (agent.get + agent.read + a
+    ///      bounded session-tail read, worst case ~21s before) while every
+    ///      other register/report/ack path proceeds unblocked;
+    ///   3. short lock — attach the excerpt only when the durable record
+    ///      still proves the same terminal transition, so a concurrent
+    ///      `task_report`/`task_ack`/supersession is never overwritten by a
+    ///      stale snapshot (optimistic concurrency guard).
+    ///
+    /// The parent notification runs last and likewise keeps its RPCs
+    /// lock-free (see `maybe_notify_parent`).
+    fn reconcile_task(&self, task_id: &str) -> Result<Option<PromptTaskRecord>, String> {
+        let mut deferred = DeferredExcerpt::default();
+        let saved = {
+            let _guard = self
+                .inner
+                .task_mutations
+                .lock()
+                .map_err(|_| "agent task mutation lock unavailable".to_owned())?;
+            self.reconcile_task_locked(task_id, &mut deferred)?
+        };
+        let Some(saved) = saved else {
+            return Ok(None);
+        };
+        if deferred.armed {
+            self.capture_deferred_excerpt(&saved, deferred.expected_state_change_seq);
+        }
+        // Unconditional: the notify path re-validates terminal + pending on a
+        // fresh row, and the excerpt write-back above may be the write that
+        // completes the record.
+        self.maybe_notify_parent(&saved);
+        self.load_task(task_id)
+    }
+
+    /// In-memory half of [`reconcile_task`]. `deferred` carries the
+    /// final-excerpt intent across the lock boundary; everything the old code
+    /// did inline except `read_final_excerpt` and parent notification still
+    /// happens here under `task_mutations`.
+    fn reconcile_task_locked(
+        &self,
+        task_id: &str,
+        deferred: &mut DeferredExcerpt,
+    ) -> Result<Option<PromptTaskRecord>, String> {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
@@ -2660,7 +2888,6 @@ impl PromptRegistry {
             task.notification_state = "pending".to_owned();
             update_steering(&mut task);
             self.save_task(&task, None)?;
-            self.maybe_notify_parent_locked(&task);
             return self.load_task(task_id);
         }
         let mut changed = false;
@@ -2673,7 +2900,6 @@ impl PromptRegistry {
         if task.is_terminal() {
             if changed {
                 self.save_task(&task, None)?;
-                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -2701,7 +2927,6 @@ impl PromptRegistry {
             changed |= mark_delivery_uncertain(&mut task, self.now_ms(), reason);
             if changed {
                 self.save_task(&task, None)?;
-                self.maybe_notify_parent_locked(&task);
                 if let Some(reloaded) = self.load_task(task_id)? {
                     task = reloaded;
                 }
@@ -2709,17 +2934,59 @@ impl PromptRegistry {
             return Ok(Some(task));
         }
         let digest = cache.digest_since(task.last_cursor);
-        changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events)?;
+        changed |= self.apply_task_window(&mut task, digest.cursor, &digest.events, deferred)?;
         if changed {
             self.save_task(&task, None)?;
-            if task.is_terminal() {
-                self.maybe_notify_parent_locked(&task);
-                if let Some(reloaded) = self.load_task(task_id)? {
-                    task = reloaded;
-                }
+            if task.is_terminal()
+                && let Some(reloaded) = self.load_task(task_id)?
+            {
+                task = reloaded;
             }
         }
         Ok(Some(task))
+    }
+
+    /// Lock-free phase 2/3 of the deferred capture: the read runs with no
+    /// locks held, then the excerpt is attached under `task_mutations` only
+    /// when the durable row still describes the same terminal transition it
+    /// was read for — same lifecycle, terminal status, cursor and timestamp,
+    /// and no `final_excerpt` yet. A concurrent `task_report`, `task_ack`, a
+    /// supersession heal, or a supervisor hold that reverted the settle all
+    /// fail the comparison, so the older snapshot can never overwrite them.
+    fn capture_deferred_excerpt(&self, saved: &PromptTaskRecord, expected_seq: Option<u64>) {
+        let Some(excerpt) = read_final_excerpt(self.inner.client.as_ref(), saved, expected_seq)
+        else {
+            return;
+        };
+        let Ok(_guard) = self.inner.task_mutations.lock() else {
+            return;
+        };
+        let Ok(Some(mut task)) = self.load_task(&saved.task_id) else {
+            return;
+        };
+        if !Self::same_terminal_transition(&task, saved) {
+            return;
+        }
+        task.final_excerpt = Some(excerpt);
+        task.updated_at_ms = self.now_ms();
+        let _ = self.save_task(&task, None);
+    }
+
+    /// Optimistic guard for the deferred excerpt write-back: every field that
+    /// identifies the terminal transition the excerpt was fenced on must be
+    /// unchanged. Concurrent `task_report`/`task_ack` writes (heartbeat,
+    /// ack, budget rows) leave these alone, so attaching the excerpt is still
+    /// safe and never rewrites their newer facts.
+    fn same_terminal_transition(current: &PromptTaskRecord, saved: &PromptTaskRecord) -> bool {
+        current.task_id == saved.task_id
+            && current.is_terminal()
+            && current.lifecycle == saved.lifecycle
+            && current.terminal_status == saved.terminal_status
+            && current.terminal_cursor == saved.terminal_cursor
+            && current.terminal_at_ms == saved.terminal_at_ms
+            && current.last_cursor == saved.last_cursor
+            && current.awaiting_children == saved.awaiting_children
+            && current.final_excerpt.is_none()
     }
 
     /// Applies one ordered cache window to a task record that is neither
@@ -2734,6 +3001,7 @@ impl PromptRegistry {
         task: &mut PromptTaskRecord,
         cursor: u64,
         events: &[Value],
+        deferred: &mut DeferredExcerpt,
     ) -> Result<bool, String> {
         if task.gate.is_some() {
             return Ok(false);
@@ -2741,7 +3009,13 @@ impl PromptRegistry {
         let mut changed = if cursor.saturating_sub(task.last_cursor) > 2048 {
             mark_delivery_uncertain(task, now_ms(), "event_history_gap")
         } else {
-            apply_events_with_final_excerpt(self.inner.client.as_ref(), Some(self), task, events)?
+            apply_events_with_final_excerpt(
+                self.inner.client.as_ref(),
+                Some(self),
+                task,
+                events,
+                Some(deferred),
+            )?
         };
         if cursor > task.last_cursor {
             task.last_cursor = cursor;
@@ -2916,7 +3190,91 @@ impl PromptRegistry {
             result_json: &encoded,
             now_ms: i64::try_from(now).unwrap_or(i64::MAX),
             expires_at: Some(i64::try_from(expires_at).unwrap_or(i64::MAX)),
-        })
+        })?;
+        self.note_task_persisted(task);
+        Ok(())
+    }
+
+    /// A task row still needs tracker attention while it is non-terminal or
+    /// its terminal notification has not been sent yet. Anything else
+    /// (acknowledged, delivered, failed notification, gated terminal) is idle
+    /// for the tracker — budget events ride on the non-terminal half, matching
+    /// the scan predicate `reconcile_active_tasks` already used.
+    fn task_needs_tracker_attention(task: &PromptTaskRecord) -> bool {
+        !task.is_terminal() || task.notification_state == "pending"
+    }
+
+    /// Fold one committed write into the activity index. `None` stays `None`:
+    /// an index that has never been hydrated cannot trust a single write to
+    /// represent the whole ledger, so it keeps falling back to full scans
+    /// until `reconcile_active_tasks` rebuilds it.
+    fn note_task_persisted(&self, task: &PromptTaskRecord) {
+        if let Ok(mut index) = self.inner.task_activity_index.lock() {
+            self.inner
+                .task_activity_writes
+                .fetch_add(1, Ordering::SeqCst);
+            if let Some(set) = index.as_mut() {
+                if Self::task_needs_tracker_attention(task) {
+                    set.insert(task.task_id.clone());
+                } else {
+                    set.remove(&task.task_id);
+                }
+            }
+        } else {
+            self.inner
+                .task_activity_writes
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Rebuild the index from the first authoritative scan. Later writes are
+    /// folded incrementally by `note_task_persisted`, so replacing a hydrated
+    /// index with a recent-window snapshot would evict older active tasks.
+    fn refresh_task_activity_index(&self, tasks: &[PromptTaskRecord], writes_before: u64) {
+        let mut set = HashSet::with_capacity(tasks.len());
+        for task in tasks {
+            if Self::task_needs_tracker_attention(task) {
+                set.insert(task.task_id.clone());
+            }
+        }
+        let Ok(mut index) = self.inner.task_activity_index.lock() else {
+            return;
+        };
+        if index.is_some() {
+            return;
+        }
+        if self.inner.task_activity_writes.load(Ordering::SeqCst) != writes_before {
+            return;
+        }
+        *index = Some(set);
+    }
+
+    fn task_activity_index_unhydrated(&self) -> bool {
+        self.inner
+            .task_activity_index
+            .lock()
+            .ok()
+            .is_some_and(|index| index.is_none())
+    }
+
+    fn task_activity_index_task_ids(&self) -> Vec<String> {
+        self.inner
+            .task_activity_index
+            .lock()
+            .ok()
+            .and_then(|index| index.clone())
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Cheap pre-scan gate: only a hydrated, empty index proves no tracker
+    /// work exists. Unhydrated or non-empty indexes must still scan.
+    fn task_activity_index_idle(&self) -> bool {
+        self.inner
+            .task_activity_index
+            .lock()
+            .ok()
+            .is_some_and(|index| index.as_ref().is_some_and(HashSet::is_empty))
     }
 }
 
@@ -3666,6 +4024,18 @@ const FINAL_EXCERPT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// If the pane's state cannot be revalidated promptly, omit the excerpt.
 const FINAL_EXCERPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Carries the one-shot final-excerpt intent across the `task_mutations` lock
+/// boundary. `reconcile_task` arms it in the locked pass, runs
+/// `read_final_excerpt` unlocked, then attaches the result under a guarded
+/// write-back. `expected_state_change_seq` is the terminal event's producer
+/// sequence; `None` already fails the capture fence closed inside
+/// `read_final_excerpt`.
+#[derive(Debug, Default)]
+struct DeferredExcerpt {
+    armed: bool,
+    expected_state_change_seq: Option<u64>,
+}
+
 /// Applies cache events to a durable task record, keeps a supervisor that
 /// completed while its children still run non-terminal, and — exactly once at
 /// an eligible terminal transition — captures the bounded final excerpt of the
@@ -3678,11 +4048,17 @@ const FINAL_EXCERPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 /// callers with no ledger to consult. A failed child lookup returns an error
 /// before anything is persisted, so the caller retries the same window instead
 /// of settling a supervisor early.
+/// `deferred` is `Some` only on the `reconcile_task` path: there the excerpt
+/// read must not run under `task_mutations`, so this function records the
+/// intent instead of performing the socket/file I/O. Every other caller
+/// passes `None` and keeps the inline capture (used by tests that already own
+/// the record).
 fn apply_events_with_final_excerpt(
     client: Option<&HerdrClient>,
     registry: Option<&PromptRegistry>,
     task: &mut PromptTaskRecord,
     events: &[Value],
+    deferred: Option<&mut DeferredExcerpt>,
 ) -> Result<bool, String> {
     let mut changed = false;
     let mut terminal_state_change_seq = None;
@@ -3726,7 +4102,18 @@ fn apply_events_with_final_excerpt(
         && final_excerpt_eligible(task)
         && !batch_proves_pane_advanced(task, events, terminal_state_change_seq)
     {
-        task.final_excerpt = read_final_excerpt(client, task, terminal_state_change_seq);
+        match deferred {
+            // The reconcile path defers the socket/file read until the caller
+            // has released `task_mutations`; the write-back re-validates the
+            // terminal transition before attaching the excerpt.
+            Some(slot) => {
+                slot.armed = true;
+                slot.expected_state_change_seq = terminal_state_change_seq;
+            }
+            None => {
+                task.final_excerpt = read_final_excerpt(client, task, terminal_state_change_seq);
+            }
+        }
     }
     Ok(changed)
 }
@@ -11056,6 +11443,9 @@ mod tests {
         PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -11702,6 +12092,9 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -12068,7 +12461,12 @@ mod tests {
         let settle = json!({"cursor": 1, "pane_id": "w1:p1", "agent_status": "done"});
         assert!(
             !registry
-                .apply_task_window(&mut held, 1, std::slice::from_ref(&settle))
+                .apply_task_window(
+                    &mut held,
+                    1,
+                    std::slice::from_ref(&settle),
+                    &mut DeferredExcerpt::default()
+                )
                 .unwrap()
         );
         assert_eq!(held.lifecycle, PromptTaskLifecycle::Running);
@@ -12089,7 +12487,7 @@ mod tests {
         let mut released = registry.load_task(&task.task_id).unwrap().unwrap();
         assert!(
             registry
-                .apply_task_window(&mut released, 1, &[settle])
+                .apply_task_window(&mut released, 1, &[settle], &mut DeferredExcerpt::default())
                 .unwrap()
         );
         registry.save_task(&released, None).unwrap();
@@ -13421,6 +13819,9 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -13575,6 +13976,27 @@ mod tests {
         }
     }
 
+    fn activity_test_registry(store: Arc<Mutex<StateStore>>) -> PromptRegistry {
+        PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
+                #[cfg(test)]
+                clock: None,
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(store),
+                cache: None,
+                client: None,
+            }),
+        }
+    }
+
     /// user owner | Given a running child whose pane reports done | When the
     /// terminal transition is reconciled | Then exactly one bounded native
     /// read is captured with ANSI stripped and trailing blanks trimmed.
@@ -13605,6 +14027,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
         assert!(changed);
@@ -13645,6 +14068,7 @@ mod tests {
                 "cursor": 102,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
         assert!(!changed_again);
@@ -13701,6 +14125,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -13774,6 +14199,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -13827,6 +14253,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -13869,6 +14296,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -13910,6 +14338,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -13955,6 +14384,7 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 3}
                 }),
             ],
+            None,
         )
         .unwrap();
 
@@ -14005,6 +14435,7 @@ mod tests {
                 "agent_status": "done",
                 "type": "pane.agent_status_changed"
             })],
+            None,
         )
         .unwrap();
 
@@ -14069,6 +14500,7 @@ mod tests {
                     "type": "pane.agent_status_changed"
                 }),
             ],
+            None,
         )
         .unwrap();
 
@@ -14112,6 +14544,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -14166,6 +14599,7 @@ mod tests {
                     "type": "pane.agent_status_changed"
                 }),
             ],
+            None,
         )
         .unwrap();
 
@@ -14225,6 +14659,7 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "done"}
                 }),
             ],
+            None,
         )
         .unwrap();
 
@@ -14283,6 +14718,7 @@ mod tests {
                 "agent_status": "done",
                 "type": "pane.agent_status_changed"
             })],
+            None,
         )
         .unwrap();
 
@@ -14344,6 +14780,7 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "done"}
                 }),
             ],
+            None,
         )
         .unwrap();
 
@@ -14398,6 +14835,7 @@ mod tests {
                     "state_change_seq": 2
                 }
             })],
+            None,
         )
         .unwrap();
 
@@ -14443,6 +14881,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
 
@@ -14492,6 +14931,7 @@ mod tests {
                     "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
                 }),
             ],
+            None,
         )
         .unwrap();
 
@@ -14539,6 +14979,7 @@ mod tests {
             None,
             &mut task,
             &[json!({"cursor": 101, "pane_id": "w1:p1", "type": "pane.closed"})],
+            None,
         )
         .unwrap();
         assert!(changed);
@@ -14574,6 +15015,9 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -14635,6 +15079,7 @@ mod tests {
                 "cursor": 101,
                 "pane": {"pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}
             })],
+            None,
         )
         .unwrap();
         assert!(changed);
@@ -14718,6 +15163,7 @@ mod tests {
         let server = thread::spawn(move || {
             let responses = vec![
                 json!({"result": {"agent": {"pane_id": "w9:p9", "agent_status": "idle", "state_change_seq": 9}}}),
+                json!({"result": {"agent": {"pane_id": "w9:p9", "agent_status": "idle", "state_change_seq": 9}}}),
                 json!({"result": {"ok": true}}),
             ];
             for mut response in responses {
@@ -14760,6 +15206,9 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -15530,6 +15979,7 @@ mod tests {
                 &mut settled,
                 101,
                 &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+                &mut DeferredExcerpt::default(),
             )
             .unwrap();
         assert!(held);
@@ -15564,6 +16014,7 @@ mod tests {
                     &mut child,
                     201,
                     &[json!({"cursor": 201, "pane_id": "w1:p2", "agent_status": "done"})],
+                    &mut DeferredExcerpt::default(),
                 )
                 .unwrap()
         );
@@ -15606,6 +16057,7 @@ mod tests {
                     &mut resettled,
                     301,
                     &[json!({"cursor": 301, "pane_id": "w1:p1", "agent_status": "done"})],
+                    &mut DeferredExcerpt::default(),
                 )
                 .unwrap()
         );
@@ -15863,6 +16315,7 @@ mod tests {
                     &mut blocked,
                     101,
                     &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "blocked"})],
+                    &mut DeferredExcerpt::default(),
                 )
                 .unwrap()
         );
@@ -15931,6 +16384,9 @@ mod tests {
         let registry = PromptRegistry {
             inner: Arc::new(PromptRegistryInner {
                 task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
                 role_dispatches: Mutex::new(()),
                 spawn_resumes: Mutex::new(HashSet::new()),
                 spawn_early_exit_watch_disabled: AtomicBool::new(false),
@@ -16012,6 +16468,7 @@ mod tests {
                     &mut held,
                     101,
                     &[json!({"cursor": 101, "pane_id": "w1:p1", "agent_status": "done"})],
+                    &mut DeferredExcerpt::default(),
                 )
                 .unwrap()
         );
@@ -16909,6 +17366,621 @@ mod tests {
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    /// #1062 regression: while the parent-notification `agent.prompt` is still
+    /// on the wire, `task_mutations` is free — a concurrent `task_ack` and
+    /// `register_task` complete without waiting, and the ack the RPC raced
+    /// with is never overwritten by the notification write-back.
+    #[test]
+    fn old_pending_notification_survives_recent_terminal_window() {
+        let socket = temp_socket();
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                store: Some(Arc::clone(&store)),
+                client: Some(HerdrClient::new(&socket)),
+                ..Default::default()
+            }),
+        };
+        let mut pending = excerpt_test_task("dispatch:prompt:old-pending");
+        pending.lifecycle = PromptTaskLifecycle::Completed;
+        pending.parent_target = Some("w1:p0".to_owned());
+        pending.notification_state = "pending".to_owned();
+        pending.updated_at_ms = 1;
+        registry.save_task(&pending, None).unwrap();
+        for index in 0..513 {
+            let mut task = excerpt_test_task(&format!("dispatch:prompt:delivered-{index}"));
+            task.lifecycle = PromptTaskLifecycle::Completed;
+            task.notification_state = "delivered".to_owned();
+            task.updated_at_ms = 10_000 + index;
+            registry.save_task(&task, None).unwrap();
+        }
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "agent.get" => json!({"agent": {"pane_id":"w1:p0","agent_status":"idle"}}),
+                    "agent.prompt" => json!({"ok":true}),
+                    method => panic!("unexpected method {method}"),
+                };
+                assert!(write_fake_reply(
+                    &mut stream,
+                    &json!({"id": request["id"], "result": result}).to_string()
+                ));
+            }
+        });
+        registry.maybe_notify_parent(&pending);
+        assert_eq!(
+            registry
+                .load_task(&pending.task_id)
+                .unwrap()
+                .unwrap()
+                .notification_state,
+            "delivered"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn notification_rechecks_parent_before_send() {
+        let socket = temp_socket();
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                store: Some(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()))),
+                client: Some(HerdrClient::new(&socket)),
+                ..Default::default()
+            }),
+        };
+        let mut task = excerpt_test_task("dispatch:prompt:parent-became-busy");
+        task.lifecycle = PromptTaskLifecycle::Completed;
+        task.parent_target = Some("w1:p0".to_owned());
+        task.notification_state = "pending".to_owned();
+        registry.save_task(&task, None).unwrap();
+        let server = thread::spawn(move || {
+            for status in ["idle", "working"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "agent.get");
+                assert!(write_fake_reply(&mut stream, &json!({"id":request["id"],"result":{"agent":{"pane_id":"w1:p0","agent_status":status}}}).to_string()));
+            }
+        });
+        registry.maybe_notify_parent(&task);
+        server.join().unwrap();
+        assert_eq!(
+            registry
+                .load_task(&task.task_id)
+                .unwrap()
+                .unwrap()
+                .notification_state,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn notifications_to_same_parent_are_single_flight() {
+        let socket = temp_socket();
+        let _socket_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                store: Some(Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()))),
+                client: Some(HerdrClient::new(&socket)),
+                ..Default::default()
+            }),
+        };
+        let mut first = excerpt_test_task("dispatch:prompt:single-flight-a");
+        first.lifecycle = PromptTaskLifecycle::Completed;
+        first.parent_target = Some("w1:p0".to_owned());
+        first.notification_state = "pending".to_owned();
+        registry.save_task(&first, None).unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_gate = Arc::clone(&gate);
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let gate = Arc::clone(&server_gate);
+                        let seen = seen_tx.clone();
+                        handlers.push(thread::spawn(move || {
+                            let mut line = String::new();
+                            BufReader::new(stream.try_clone().unwrap())
+                                .read_line(&mut line)
+                                .unwrap();
+                            let request: Value = serde_json::from_str(&line).unwrap();
+                            let result = match request["method"].as_str().unwrap() {
+                                "agent.get" => {
+                                    json!({"agent":{"pane_id":"w1:p0","agent_status":"idle"}})
+                                }
+                                "agent.prompt" => {
+                                    seen.send(()).unwrap();
+                                    let (lock, cond) = &*gate;
+                                    let _guard = cond
+                                        .wait_while(lock.lock().unwrap(), |released| !*released)
+                                        .unwrap();
+                                    json!({"ok":true})
+                                }
+                                method => panic!("unexpected method {method}"),
+                            };
+                            let _ = write_fake_reply(
+                                &mut stream,
+                                &json!({"id": request["id"], "result":result}).to_string(),
+                            );
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let notify_registry = registry.clone();
+        let notifier = thread::spawn(move || notify_registry.maybe_notify_parent(&first));
+        seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut second = excerpt_test_task("dispatch:prompt:single-flight-b");
+        second.lifecycle = PromptTaskLifecycle::Completed;
+        second.parent_target = Some("w1:p0".to_owned());
+        second.notification_state = "pending".to_owned();
+        registry.save_task(&second, None).unwrap();
+        let notify_registry = registry.clone();
+        let second_notifier = thread::spawn(move || notify_registry.maybe_notify_parent(&second));
+        let concurrent = seen_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        let (lock, cond) = &*gate;
+        *lock.lock().unwrap() = true;
+        cond.notify_all();
+        notifier.join().unwrap();
+        second_notifier.join().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert!(!concurrent, "same parent received two concurrent prompts");
+    }
+
+    #[test]
+    fn slow_parent_prompt_neither_blocks_nor_overwrites_concurrent_ack() {
+        let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(false).unwrap();
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut registry_inner = PromptRegistryInner {
+            task_mutations: Mutex::new(()),
+            parent_notifications: Mutex::new(HashSet::new()),
+            task_activity_index: Mutex::new(None),
+            task_activity_writes: AtomicU64::new(0),
+            role_dispatches: Mutex::new(()),
+            spawn_resumes: Mutex::new(HashSet::new()),
+            spawn_early_exit_watch_disabled: AtomicBool::new(false),
+            #[cfg(test)]
+            clock: None,
+            records: Mutex::new(HashMap::new()),
+            handoff_injected_panes: Mutex::new(HashSet::new()),
+            store: Some(Arc::clone(&store)),
+            cache: None,
+            client: Some(HerdrClient::new(&socket)),
+        };
+        let registry = PromptRegistry {
+            inner: Arc::new(std::mem::take(&mut registry_inner)),
+        };
+
+        let mut task = excerpt_test_task("dispatch:prompt:notify-gated");
+        task.lifecycle = PromptTaskLifecycle::Completed;
+        task.terminal_status = Some("done".to_owned());
+        task.terminal_at_ms = Some(1);
+        task.terminal_cursor = Some(7);
+        task.parent_target = Some("w1:p0".to_owned());
+        task.notification_state = "pending".to_owned();
+        registry.save_task(&task, None).unwrap();
+
+        // Server: probe `agent.get` replies instantly; `agent.prompt` blocks on
+        // a channel so the test controls exactly when the RPC resolves.
+        let (prompt_seen_tx, prompt_seen_rx) = std::sync::mpsc::channel::<()>();
+        let (prompt_release_tx, prompt_release_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    return;
+                };
+                let response = match request["method"].as_str() {
+                    Some("agent.get") => {
+                        json!({"id": request["id"], "result": {"agent": {
+                            "pane_id": "w1:p0", "agent_status": "idle", "state_change_seq": 9}}})
+                    }
+                    Some("agent.prompt") => {
+                        let _ = prompt_seen_tx.send(());
+                        let _ = prompt_release_rx.recv();
+                        json!({"id": request["id"], "result": {"ok": true}})
+                    }
+                    _ => return,
+                };
+                if !write_fake_reply(&mut stream, &response.to_string()) {
+                    return;
+                }
+            }
+        });
+
+        let notify_registry = registry.clone();
+        let notify_task = task.clone();
+        let notifier = thread::spawn(move || notify_registry.maybe_notify_parent(&notify_task));
+
+        // Wait until the notification RPC is in flight on the socket, i.e. the
+        // notifier is parked inside the unlocked slow path.
+        prompt_seen_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("notification prompt reached the fake server");
+
+        // Both mutations must complete while the prompt is still blocked —
+        // a few hundred ms of slack, nowhere near the 10s prompt budget.
+        let ack_deadline = std::time::Instant::now();
+        let ack = registry.task_ack("dispatch:prompt:notify-gated");
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(
+            ack_deadline.elapsed() < Duration::from_secs(5),
+            "task_ack must not wait on the in-flight notification RPC"
+        );
+        let registered = registry
+            .register_task(RegisterTaskInput {
+                task_id: "dispatch:prompt:concurrent-register",
+                target: "w1:p9",
+                requested_target: None,
+                fingerprint: "fp-concurrent",
+                idempotency_key: None,
+                before: None,
+                after: None,
+                submitted: Some(true),
+                start_cursor: 0,
+                parent_target: None,
+                parent_session_ref: None,
+                stall_after_ms: None,
+                max_runtime_ms: None,
+                on_budget: None,
+                request_id: None,
+                foreground_blocker: None,
+                audit: None,
+            })
+            .unwrap();
+        assert!(registered.is_some());
+
+        let _ = prompt_release_tx.send(());
+        notifier.join().unwrap();
+        server.join().unwrap();
+
+        // The optimistic guard leaves the acked row alone even though the
+        // prompt succeeded: notification_state stays `acknowledged`, not
+        // `delivered`.
+        let stored = registry
+            .load_task("dispatch:prompt:notify-gated")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.notification_state, "acknowledged");
+        assert!(stored.acknowledged_at_ms.is_some());
+    }
+
+    /// #1062 regression: while the deferred `read_final_excerpt` is blocked
+    /// inside `agent.read`, `task_mutations` is free — a concurrent `task_ack`
+    /// completes immediately and is preserved by the guarded write-back.
+    #[test]
+    fn slow_excerpt_read_neither_blocks_nor_overwrites_concurrent_ack() {
+        let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"workspace_id": "w1"}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1"}],
+            "agents": [{"pane_id": "w1:p1", "workspace_id": "w1"}],
+        })));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
+                #[cfg(test)]
+                clock: None,
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(Arc::clone(&store)),
+                cache: Some(Arc::clone(&cache)),
+                client: Some(HerdrClient::new(&socket)),
+            }),
+        };
+
+        // Running task pinned to pane w1:p1, boot-matched to the test cache;
+        // the terminal event below moves it to seq 2 so the excerpt fence opens.
+        let task_id = "dispatch:prompt:excerpt-gated";
+        let mut task = excerpt_test_task(task_id);
+        task.boot_epoch = Some("test-boot".to_owned());
+        task.start_cursor = 0;
+        task.last_cursor = 0;
+        registry.save_task(&task, None).unwrap();
+
+        // Gated server: every request is answered instantly except
+        // `agent.read`, which parks on a channel the test controls.
+        let (read_seen_tx, read_seen_rx) = std::sync::mpsc::channel::<()>();
+        let (read_release_tx, read_release_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    return;
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    return;
+                };
+                let response = match request["method"].as_str() {
+                    Some("agent.get") => {
+                        json!({"id": request["id"], "result": {"agent": {
+                            "pane_id": "w1:p1", "agent_status": "done", "state_change_seq": 2}}})
+                    }
+                    Some("agent.read") => {
+                        let _ = read_seen_tx.send(());
+                        let _ = read_release_rx.recv();
+                        json!({"id": request["id"], "result": {"read": {
+                            "content": "final report: T1062-DONE\n"}}})
+                    }
+                    Some("pane.layout") => {
+                        let mut response = wide_layout_response();
+                        response["id"] = request["id"].clone();
+                        response
+                    }
+                    _ => return,
+                };
+                if !write_fake_reply(&mut stream, &response.to_string()) {
+                    return;
+                }
+            }
+        });
+
+        // Feed the terminal transition through the real cache pipeline so
+        // reconcile sees the same digest the live worker would produce.
+        cache.apply_event_for_test(json!({
+            "type": "pane.agent_status_changed",
+            "workspace_id": "w1",
+            "data": {
+                "pane_id": "w1:p1",
+                "pane": {"pane_id": "w1:p1", "workspace_id": "w1",
+                         "agent_status": "done", "state_change_seq": 2},
+            },
+        }));
+
+        let reconcile_registry = registry.clone();
+        let reconciler = thread::spawn(move || reconcile_registry.reconcile_task(task_id).unwrap());
+
+        // The reconcile must reach the unlocked `agent.read` before we race
+        // the ack against it.
+        read_seen_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deferred excerpt read reached the fake server");
+
+        let ack_deadline = std::time::Instant::now();
+        let ack = registry.task_ack(task_id);
+        assert_eq!(ack["ok"], true, "{ack}");
+        assert!(
+            ack_deadline.elapsed() < Duration::from_secs(5),
+            "task_ack must not wait on the deferred excerpt read"
+        );
+
+        let _ = read_release_tx.send(());
+        let saved = reconciler.join().unwrap().expect("task still stored");
+        server.join().unwrap();
+
+        let stored = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(stored.notification_state, "acknowledged");
+        assert!(stored.is_terminal());
+        let excerpt = stored
+            .final_excerpt
+            .as_deref()
+            .expect("guarded write-back still attaches the excerpt after an ack");
+        assert!(excerpt.contains("T1062-DONE"), "excerpt: {excerpt:?}");
+        assert!(saved.is_terminal());
+        assert_eq!(saved.notification_state, "acknowledged");
+        assert!(saved.acknowledged_at_ms.is_some());
+        assert_eq!(saved.final_excerpt, stored.final_excerpt);
+    }
+
+    /// #1062: a hydrated, empty activity index lets the tracker skip both the
+    /// supersession repair and the reconcile pass without decoding history;
+    /// the next `save_task` re-arms the index and the pass runs again.
+    #[test]
+    fn idle_activity_index_skips_full_scan_until_next_persist() {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let cache = Arc::new(EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"workspace_id": "w1"}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1"}],
+        })));
+        let registry = PromptRegistry {
+            inner: Arc::new(PromptRegistryInner {
+                task_mutations: Mutex::new(()),
+                parent_notifications: Mutex::new(HashSet::new()),
+                task_activity_index: Mutex::new(None),
+                task_activity_writes: AtomicU64::new(0),
+                role_dispatches: Mutex::new(()),
+                spawn_resumes: Mutex::new(HashSet::new()),
+                spawn_early_exit_watch_disabled: AtomicBool::new(false),
+                #[cfg(test)]
+                clock: None,
+                records: Mutex::new(HashMap::new()),
+                handoff_injected_panes: Mutex::new(HashSet::new()),
+                store: Some(Arc::clone(&store)),
+                cache: Some(Arc::clone(&cache)),
+                client: None,
+            }),
+        };
+
+        // First pass hydrates the index and finds nothing.
+        registry.reconcile_active_tasks();
+        assert!(registry.task_activity_index_idle());
+
+        // A row written past the index (e.g. by another writer that does not
+        // maintain it) must NOT be picked up while the index says idle —
+        // proving the scan was really skipped rather than silently run.
+        let mut foreign = excerpt_test_task("dispatch:prompt:foreign-write");
+        foreign.boot_epoch = None;
+        let encoded = serde_json::to_string(&foreign).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .put_operation_ledger(OperationLedgerInput {
+                op_id: &foreign.task_id,
+                kind: PROMPT_TASK_OPERATION_KIND,
+                idempotency_key: None,
+                request_hash: None,
+                phase: "active",
+                state: foreign.lifecycle.as_str(),
+                result_json: &encoded,
+                now_ms: i64::try_from(foreign.updated_at_ms).unwrap_or(i64::MAX),
+                expires_at: None,
+            })
+            .unwrap();
+        registry.reconcile_active_tasks();
+        let still = registry.load_task(&foreign.task_id).unwrap().unwrap();
+        assert_eq!(
+            still.lifecycle,
+            PromptTaskLifecycle::Running,
+            "idle index must skip the reconcile pass entirely"
+        );
+
+        // A persist through the registry folds into the index and re-arms the
+        // scan; the same foreign row is then reconciled on the next pass.
+        registry.save_task(&foreign, None).unwrap();
+        assert!(!registry.task_activity_index_idle());
+        registry.reconcile_active_tasks();
+        let reconciled = registry.load_task(&foreign.task_id).unwrap().unwrap();
+        assert_eq!(
+            reconciled.lifecycle,
+            PromptTaskLifecycle::DeliveryUncertain,
+            "re-armed index must scan and fail the boot-fence closed"
+        );
+    }
+
+    #[test]
+    fn activity_index_refresh_rejects_a_write_after_snapshot() {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let registry = activity_test_registry(store);
+        let writes_before = registry.inner.task_activity_writes.load(Ordering::SeqCst);
+
+        let task = excerpt_test_task("dispatch:prompt:index-write-race");
+        registry.save_task(&task, None).unwrap();
+        registry.refresh_task_activity_index(&[], writes_before);
+
+        assert!(
+            !registry.task_activity_index_idle(),
+            "a snapshot taken before a persist must not publish an empty index"
+        );
+        registry.reconcile_active_tasks();
+        assert!(!registry.task_activity_index_idle());
+    }
+
+    #[test]
+    fn initial_activity_index_includes_old_active_tasks() {
+        let store = Arc::new(Mutex::new(StateStore::open(":memory:").unwrap()));
+        let mut old_active = excerpt_test_task("dispatch:prompt:old-active");
+        old_active.stall_after_ms = Some(1);
+        old_active.created_at_ms = 1;
+        old_active.updated_at_ms = 1;
+
+        let mut tasks = vec![old_active];
+        for index in 0..513 {
+            let mut terminal = excerpt_test_task(&format!("dispatch:prompt:terminal-{index}"));
+            terminal.lifecycle = PromptTaskLifecycle::Completed;
+            terminal.terminal_status = Some("done".to_owned());
+            terminal.terminal_at_ms = Some(10_000 + index);
+            terminal.notification_state = "delivered".to_owned();
+            terminal.created_at_ms = 10_000 + index;
+            terminal.updated_at_ms = 10_000 + index;
+            tasks.push(terminal);
+        }
+        let encoded = tasks
+            .iter()
+            .map(|task| serde_json::to_string(task).unwrap())
+            .collect::<Vec<_>>();
+        let inputs = tasks
+            .iter()
+            .zip(encoded.iter())
+            .map(|(task, result_json)| OperationLedgerInput {
+                op_id: &task.task_id,
+                kind: PROMPT_TASK_OPERATION_KIND,
+                idempotency_key: None,
+                request_hash: None,
+                phase: if task.is_terminal() {
+                    "terminal"
+                } else {
+                    "active"
+                },
+                state: task.lifecycle.as_str(),
+                result_json,
+                now_ms: i64::try_from(task.updated_at_ms).unwrap_or(i64::MAX),
+                expires_at: None,
+            })
+            .collect::<Vec<_>>();
+        store
+            .lock()
+            .unwrap()
+            .put_operation_ledgers_atomic(&inputs)
+            .unwrap();
+
+        let registry = PromptRegistry::with_store_only(Arc::clone(&store));
+        registry.reconcile_active_tasks();
+        assert!(
+            !registry.task_activity_index_idle(),
+            "an active task outside the recent terminal window must keep tracking armed"
+        );
+        registry.sweep_task_budgets();
+
+        let stored = registry
+            .load_task("dispatch:prompt:old-active")
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .budget_events
+                .iter()
+                .any(|event| event.get("event").and_then(Value::as_str) == Some("agent_stalled")),
+            "the old active task must still receive its stall event"
         );
     }
 }
