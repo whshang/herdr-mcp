@@ -392,6 +392,12 @@ struct PromptTaskRecord {
     session_evidence_seen_ino: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_evidence_seen_len: Option<u64>,
+    /// Creation stamp (ns since epoch) captured with the baseline stat. A
+    /// recreated file that reuses the inode gets a new creation time, so a
+    /// zero-length baseline can still reject rotation. None when the
+    /// filesystem cannot report it: later growth then fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_evidence_btime_ns: Option<u64>,
     /// Why this task may still leave `delivery_uncertain`. Independent of
     /// `notification_error`, which parent notification reuses and clears.
     /// `recovery_closed` means a boot change, history gap, rotation, or
@@ -992,6 +998,7 @@ impl PromptRegistry {
             session_evidence_seen_dev: session_evidence.dev,
             session_evidence_seen_ino: session_evidence.ino,
             session_evidence_seen_len: session_evidence.bytes,
+            session_evidence_btime_ns: session_evidence.btime_ns,
             delivery_uncertain_reason: None,
         };
         if record.lifecycle == PromptTaskLifecycle::DeliveryUncertain {
@@ -2228,6 +2235,7 @@ impl PromptRegistry {
                         let registry = PromptRegistry { inner };
                         registry.reconcile_activity_timeouts();
                         registry.sweep_task_budgets();
+                        registry.reconcile_recoverable_timeouts();
                         last_timeout_scan = std::time::Instant::now();
                     }
                 }
@@ -2318,7 +2326,10 @@ impl PromptRegistry {
             return;
         };
         for task in tasks {
-            if task.is_terminal() {
+            // A recoverable activity timeout is terminal in the ledger but
+            // must still be reconciled here: the tracker/event path is the
+            // only caller that runs without an inbox request.
+            if task.is_terminal() && !delivery_timeout_can_recover(&task) {
                 if task.notification_state == "pending" {
                     self.maybe_notify_parent(&task);
                 }
@@ -2959,7 +2970,12 @@ impl PromptRegistry {
         };
         match session_file_stat(Path::new(&path)) {
             SessionFileStat::Missing => SessionEvidence::missing_file(path),
-            SessionFileStat::File { len, dev, ino } => SessionEvidence::known(path, len, dev, ino),
+            SessionFileStat::File {
+                len,
+                dev,
+                ino,
+                btime_ns,
+            } => SessionEvidence::known(path, len, dev, ino, btime_ns),
             SessionFileStat::Unreadable => SessionEvidence::none(),
         }
     }
@@ -2997,12 +3013,21 @@ impl PromptRegistry {
         {
             return false;
         }
-        let (len, dev, ino) = match session_file_stat(Path::new(path)) {
-            SessionFileStat::File { len, dev, ino } => (len, dev, ino),
-            // A file that existed (or cannot be read) is no longer evidence.
-            // A missing file at baseline 0 may still be created after submit.
+        let (len, dev, ino, btime_ns) = match session_file_stat(Path::new(path)) {
+            SessionFileStat::File {
+                len,
+                dev,
+                ino,
+                btime_ns,
+            } => (len, dev, ino, btime_ns),
+            // "missing at submit" is recorded as baseline 0 with no baseline
+            // device identity; that file may still be created after the
+            // dispatch. A file that existed at submit (identity present) and
+            // vanished later, or one that cannot be stat'ed, is sealed.
             SessionFileStat::Missing
-                if baseline == 0 && task.session_evidence_seen_len.is_none() =>
+                if baseline == 0
+                    && task.session_evidence_dev.is_none()
+                    && task.session_evidence_ino.is_none() =>
             {
                 return false;
             }
@@ -3043,6 +3068,19 @@ impl PromptRegistry {
             // prove later bytes are the same file.
             task.session_evidence_closed = true;
             return false;
+        }
+        if baseline == 0 && identity.is_some() {
+            // The baseline file existed but was empty, so no prefix digest
+            // can prove identity. A delete+recreate that reuses the inode is
+            // otherwise indistinguishable from an append; only a matching
+            // creation stamp keeps the file admissible.
+            match (task.session_evidence_btime_ns, btime_ns) {
+                (Some(expected), Some(current)) if expected == current => {}
+                _ => {
+                    task.session_evidence_closed = true;
+                    return false;
+                }
+            }
         }
         // Same device and inode is not enough: unlink plus recreate can reuse
         // the inode and still be a different file. The captured prefix must
@@ -3438,6 +3476,7 @@ const KNOWN_TASK_KEYS: &[&str] = &[
     "session_evidence_seen_dev",
     "session_evidence_seen_ino",
     "session_evidence_seen_len",
+    "session_evidence_btime_ns",
     "delivery_uncertain_reason",
 ];
 
@@ -4066,6 +4105,7 @@ struct SessionEvidence {
     bytes: Option<u64>,
     dev: Option<u64>,
     ino: Option<u64>,
+    btime_ns: Option<u64>,
     prefix: Option<String>,
 }
 
@@ -4076,6 +4116,7 @@ impl SessionEvidence {
             bytes: None,
             dev: None,
             ino: None,
+            btime_ns: None,
             prefix: None,
         }
     }
@@ -4086,11 +4127,12 @@ impl SessionEvidence {
             bytes: Some(0),
             dev: None,
             ino: None,
+            btime_ns: None,
             prefix: None,
         }
     }
 
-    fn known(path: impl Into<String>, len: u64, dev: u64, ino: u64) -> Self {
+    fn known(path: impl Into<String>, len: u64, dev: u64, ino: u64, btime_ns: Option<u64>) -> Self {
         let path = path.into();
         let prefix = file_prefix_digest(Path::new(&path), len as usize);
         Self {
@@ -4098,6 +4140,7 @@ impl SessionEvidence {
             bytes: Some(len),
             dev: Some(dev),
             ino: Some(ino),
+            btime_ns,
             prefix,
         }
     }
@@ -4106,7 +4149,12 @@ impl SessionEvidence {
 enum SessionFileStat {
     Missing,
     Unreadable,
-    File { len: u64, dev: u64, ino: u64 },
+    File {
+        len: u64,
+        dev: u64,
+        ino: u64,
+        btime_ns: Option<u64>,
+    },
 }
 
 fn session_file_stat(path: &Path) -> SessionFileStat {
@@ -4117,12 +4165,23 @@ fn session_file_stat(path: &Path) -> SessionFileStat {
                 len: meta.len(),
                 dev,
                 ino,
+                btime_ns: file_created_ns(&meta),
             }
         }
         Ok(_) => SessionFileStat::Unreadable,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => SessionFileStat::Missing,
         Err(_) => SessionFileStat::Unreadable,
     }
+}
+
+/// File creation stamp in nanos since epoch. `Metadata::created` uses
+/// `statx` btime where the filesystem reports it; a filesystem that cannot
+/// prove creation returns None and the caller fails closed.
+fn file_created_ns(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.created()
+        .ok()
+        .and_then(|created| created.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as u64)
 }
 
 const SESSION_PREFIX_BYTES: usize = 64;
@@ -12999,7 +13058,14 @@ mod tests {
                 pre_submit_session: Some({
                     let meta = fs::metadata(&path).unwrap();
                     let (dev, ino) = file_identity(&meta);
-                    SessionEvidence::known(path_string.clone(), initial.len() as u64, dev, ino)
+                    let btime_ns = file_created_ns(&meta);
+                    SessionEvidence::known(
+                        path_string.clone(),
+                        initial.len() as u64,
+                        dev,
+                        ino,
+                        btime_ns,
+                    )
                 }),
             })
             .unwrap()
@@ -13195,6 +13261,128 @@ mod tests {
         fs::remove_file(&grown_path).ok();
     }
 
+    /// user dispatcher | Given a session file that was missing at submit |
+    /// When the first reconcile still finds nothing and a later pass finds
+    /// the transcript created | Then recovery still follows the grown file.
+    #[test]
+    fn user_session_file_missing_at_submit_can_be_created_later() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-missing-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        let (db_path, registry, _) =
+            registry_with_snapshot("missing-later", session_snapshot(&path));
+        let task_id = "dispatch:prompt:missing-later";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        // First reconcile while the file is still absent must NOT seal the
+        // evidence: the task enters the recoverable delivery_uncertain and
+        // stays open for the file appearing later.
+        let first = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(first.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(!first.session_evidence_closed);
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"later\"}}\n")
+            .unwrap();
+        let recovered = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+        assert!(!recovered.is_terminal());
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user dispatcher | Given a session file that existed empty at submit |
+    /// When it is deleted and recreated before reconcile | Then the evidence
+    /// stays sealed; a recreated file at the same path is not the dispatch.
+    #[test]
+    fn user_empty_baseline_recreated_file_stays_sealed() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-empty-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(&path, b"").unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("empty-rotate", session_snapshot(&path));
+        let task_id = "dispatch:prompt:empty-rotate";
+        register_idle_task(&registry, task_id, "w1:p1");
+        let baseline = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(baseline.session_evidence_bytes, Some(0));
+        assert!(baseline.session_evidence_dev.is_some());
+        fs::remove_file(&path).unwrap();
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"assistant\",\"content\":\"other\"}}\n",
+        )
+        .unwrap();
+        // Even when Linux hands the recreated file the same inode, the
+        // creation stamp differs. Forcing the recorded identity to the new
+        // file's makes the creation check the only fence, so the outcome is
+        // deterministic regardless of inode reuse.
+        let mut task = registry.load_task(task_id).unwrap().unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let (dev, ino) = file_identity(&meta);
+        task.session_evidence_dev = Some(dev);
+        task.session_evidence_ino = Some(ino);
+        registry.save_task(&task, None).unwrap();
+        age_for_activity_timeout(&registry, task_id);
+        let sealed = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(sealed.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        assert!(sealed.session_evidence_closed);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
+    /// user tracker | Given a delivery_uncertain task whose transcript then
+    /// grows | When the tracker pass runs without an inbox request | Then it
+    /// recovers the task instead of waiting for the next status poll.
+    #[test]
+    fn user_tracker_pass_recovers_a_recoverable_timeout() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-session-tracker-{}-{}.jsonl",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::write(
+            &path,
+            b"{\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let (db_path, registry, _) =
+            registry_with_snapshot("tracker-recover", session_snapshot(&path));
+        let task_id = "dispatch:prompt:tracker-recover";
+        register_idle_task(&registry, task_id, "w1:p1");
+        age_for_activity_timeout(&registry, task_id);
+        let uncertain = registry.reconcile_task(task_id).unwrap().unwrap();
+        assert_eq!(uncertain.lifecycle, PromptTaskLifecycle::DeliveryUncertain);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":{\"role\":\"assistant\",\"content\":\"late\"}}\n")
+            .unwrap();
+        registry.reconcile_active_tasks();
+        let recovered = registry.load_task(task_id).unwrap().unwrap();
+        assert_eq!(recovered.lifecycle, PromptTaskLifecycle::Running);
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+        fs::remove_file(&path).ok();
+    }
+
     /// user dispatcher | Given a later submit has reserved its window before
     /// the earlier timeout is reconciled | When the file grows to that later
     /// baseline | Then the earlier task does not claim those bytes.
@@ -13383,6 +13571,7 @@ mod tests {
             earlier.session_evidence_bytes.unwrap(),
             earlier.session_evidence_dev.unwrap(),
             earlier.session_evidence_ino.unwrap(),
+            earlier.session_evidence_btime_ns,
         );
         registry
             .publish_session_window(later_id, Some("w1:p1"), &evidence)
@@ -13870,6 +14059,7 @@ mod tests {
             earlier.session_evidence_bytes.unwrap(),
             earlier.session_evidence_dev.unwrap(),
             earlier.session_evidence_ino.unwrap(),
+            earlier.session_evidence_btime_ns,
         );
         registry
             .publish_session_window("dispatch:prompt:expired-later", Some("w1:p1"), &evidence)
@@ -14169,6 +14359,7 @@ mod tests {
             session_evidence_seen_dev: None,
             session_evidence_seen_ino: None,
             session_evidence_seen_len: None,
+            session_evidence_btime_ns: None,
             delivery_uncertain_reason: None,
         }
     }
@@ -15875,6 +16066,7 @@ mod tests {
             session_evidence_seen_dev: None,
             session_evidence_seen_ino: None,
             session_evidence_seen_len: None,
+            session_evidence_btime_ns: None,
             delivery_uncertain_reason: None,
         }
     }
