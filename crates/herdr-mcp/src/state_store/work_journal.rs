@@ -6,8 +6,6 @@
 
 // The tool-call capture consumer lives in `crate::work_capture`; tailers and
 // the compactor land in follow-up lanes, so unused items stay allow-listed.
-#![allow(dead_code)]
-
 use super::StateStore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -169,6 +167,7 @@ impl StateStore {
     }
 
     /// The newest `limit` events for one project/worktree, oldest first.
+    #[cfg_attr(not(test), allow(dead_code))] // exercised by state-store / tailer tests
     pub(crate) fn latest_work_events(
         &self,
         project_ref: &str,

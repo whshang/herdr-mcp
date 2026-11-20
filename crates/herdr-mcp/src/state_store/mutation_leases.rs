@@ -4,8 +4,6 @@
 //! Uses a forward-additive auxiliary table (`mutation_leases`) so `SCHEMA_VERSION`
 //! remains unchanged and rollback to pinned v1.1.x binaries stays 100% compatible.
 
-#![allow(dead_code)]
-
 use super::StateStore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -488,6 +486,7 @@ fn load_stored_lease(
 }
 
 impl StateStore {
+    #[cfg_attr(not(test), allow(dead_code))] // all callers are test modules; production uses acquire_mutation_lease_for_device
     pub fn acquire_mutation_lease(
         &mut self,
         input: MutationLeaseAcquireInput<'_>,
