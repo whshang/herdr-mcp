@@ -127,6 +127,18 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         return RequestLedgerState::Applied;
     }
+    // Anything that already left evidence of delivery or external resources
+    // is the "maybe applied" class regardless of how the failure was framed:
+    // `delivery_uncertain` is a boolean field (not a `code`), `submitted`
+    // claims the request reached the agent, and spawn resources outlive the
+    // key. Releasing any of these would let a blind same-key retry
+    // re-execute, so they keep a terminal `unknown` record.
+    if result.get("delivery_uncertain").and_then(Value::as_bool) == Some(true)
+        || result.get("submitted").and_then(Value::as_bool) == Some(true)
+        || result_created_spawn_resources(result)
+    {
+        return RequestLedgerState::Unknown;
+    }
     match result.get("delivery_state").and_then(Value::as_str) {
         // `not_delivered` releases the key unless the result already left
         // external spawn resources behind. A resumable checkpoint still
@@ -622,6 +634,23 @@ mod tests {
         assert_eq!(
             classify_result_state(&json!({"ok": false, "delivery_state": "not_delivered"})),
             RequestLedgerState::NotDelivered
+        );
+        // `delivery_uncertain` is a boolean result field — not a `code` — so
+        // it must be caught directly: an uncertain submission may already
+        // have been delivered and releasing the key would allow a blind
+        // retry. Same for a claimed submission and for external spawn
+        // resources reported without a delivery_state.
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "delivery_uncertain": true})),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "submitted": true})),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "spawn": {"created": true}})),
+            RequestLedgerState::Unknown
         );
     }
 

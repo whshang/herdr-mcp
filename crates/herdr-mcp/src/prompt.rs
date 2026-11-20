@@ -4414,11 +4414,16 @@ fn release_persisted(
 fn prompt_result_created_nothing(result: &Value) -> bool {
     result.get("ok").and_then(Value::as_bool) == Some(false)
         && result.get("resumable").and_then(Value::as_bool) != Some(true)
-        && !crate::request_ledger::result_created_spawn_resources(result)
-        && result.get("submitted").and_then(Value::as_bool) != Some(true)
+        // Releasing is safe exactly where the durable client-request ledger
+        // would release too (clean `not_delivered` or a provable refusal).
+        // Sharing `classify_result_state` keeps the two ledgers' release
+        // boundaries identical by construction: `delivery_uncertain`,
+        // `submitted`, spawn resources, `delivery_unknown` and timeout-coded
+        // results all classify `Unknown` and stay persisted.
         && matches!(
-            result.get("delivery_state").and_then(Value::as_str),
-            None | Some("not_delivered")
+            crate::request_ledger::classify_result_state(result),
+            crate::request_ledger::RequestLedgerState::NotDelivered
+                | crate::request_ledger::RequestLedgerState::Rejected
         )
 }
 
@@ -11751,6 +11756,59 @@ mod tests {
         assert_eq!(result["dispatch_correlation"]["terminal"], false);
         assert_eq!(result["submitted"], "unknown");
         assert_eq!(result["delivery_uncertain"], true);
+    }
+
+    /// user prompt | Given an agent.prompt whose delivery became uncertain
+    /// mid-flight | When both ledgers settle the result | Then neither
+    /// releases the key: the inner prompt registry persists the outcome and
+    /// the durable ledger classifies it `unknown`, so a same-key retry can
+    /// never blindly resubmit the request.
+    #[test]
+    fn delivery_uncertain_result_is_kept_by_both_ledgers() {
+        let socket = temp_socket();
+        let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let client = HerdrClient::new(&socket);
+        let before = AgentState {
+            pane_id: Some("w1:p1".to_owned()),
+            agent_status: Some("idle".to_owned()),
+            state_change_seq: Some(40),
+            kind: None,
+        };
+        let result = prompt_failure(
+            &client,
+            "pi",
+            Some(&before),
+            true,
+            HerdrError {
+                code: "unexpected_eof".to_owned(),
+                message: "connection closed mid-request".to_owned(),
+            },
+            "dispatch:prompt:test-uncertain",
+        );
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["delivery_uncertain"], true);
+        assert!(
+            !prompt_result_created_nothing(&result),
+            "uncertain delivery must persist in the prompt registry"
+        );
+        assert_eq!(
+            crate::request_ledger::classify_result_state(&result),
+            crate::request_ledger::RequestLedgerState::Unknown,
+            "uncertain delivery must keep the durable record"
+        );
+
+        // Delivered-but-failed (`submitted: true`, no delivery_state) keeps
+        // both ledgers too — the request provably reached the agent.
+        let submitted = json!({
+            "ok": false,
+            "submitted": true,
+            "failure_phase": "post_submission_task_wait",
+        });
+        assert!(!prompt_result_created_nothing(&submitted));
+        assert_eq!(
+            crate::request_ledger::classify_result_state(&submitted),
+            crate::request_ledger::RequestLedgerState::Unknown
+        );
     }
 
     #[test]
