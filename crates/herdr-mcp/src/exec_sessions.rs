@@ -5170,10 +5170,16 @@ mod tests {
             .record_exec_running("es_twice", 99_000, None, started)
             .unwrap();
         // A second dead session whose spool is committed only later — kept
-        // out of the boot-load so its read exercises the persisted-row path
-        // rather than a resident buffer.
+        // out of the boot-load so its reads exercise the
+        // `committed_spool_session` recovered-map path rather than a
+        // resident buffer.
         store
             .record_exec_running("es_corrupt", 99_001, None, started)
+            .unwrap();
+        // `es_late` likewise keeps no spool at either boot: its second-boot
+        // reads exercise the persisted-row (recovered-map-miss) path.
+        store
+            .record_exec_running("es_late", 99_005, None, started)
             .unwrap();
         let session = unpersisted_closed_session("es_twice", "twice-restart\n");
         // `es_expired` never gets a committed spool, so it stays
@@ -5195,11 +5201,87 @@ mod tests {
         let first_view = first.read("es_twice", "stdout", 0, 64);
         assert_eq!(first_view["ok"], true, "{first_view}");
         assert_eq!(first_view["text"], "twice-restart\n");
+
+        // `es_corrupt` settled this boot (in the recovered map) but had no
+        // spool at boot-load: a corrupt artifact is surfaced, then a
+        // repaired spool is picked up — and its timestamps come from the
+        // persisted row, never read time (pi 7038448644 P2-A binds the
+        // recovered-map arm of `committed_spool_session`).
+        fs::write(exec_spool_path(&path, "es_corrupt"), b"corrupt-not-json").unwrap();
+        let corrupt = first.read("es_corrupt", "stdout", 0, 64);
+        assert_eq!(corrupt["ok"], false, "{corrupt}");
+        assert_eq!(corrupt["reason"], "session_spool_corrupt", "{corrupt}");
+        let settled = first
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_closed_before_restart_exec_session("es_corrupt", now_ms())
+            .unwrap()
+            .and_then(|row| row.ended_at_ms)
+            .expect("es_corrupt must have a persisted settle time");
+        let repaired = unpersisted_closed_session("es_corrupt", "repaired\n");
+        write_session_spool(&path, &repaired).unwrap();
+        let late = first.read("es_corrupt", "stdout", 0, 64);
+        assert_eq!(late["ok"], true, "{late}");
+        assert_eq!(late["text"], "repaired\n");
+        assert_eq!(late["started_at"], iso_from_ms(started), "{late}");
+        assert_eq!(late["finished_at"], iso_from_ms(settled), "{late}");
+        let late_again = first.read("es_corrupt", "stdout", 0, 64);
+        assert_eq!(
+            late_again["finished_at"], late["finished_at"],
+            "{late_again}"
+        );
         drop(first);
 
         // Second restart: the in-process recovery map is empty; only the
         // persisted closed_before_restart row proves the death.
         let second = ExecRegistry::new(path.clone()).unwrap();
+
+        // The list is authoritative BEFORE any read warms the resident map
+        // (pi 7038448644 P2-B — a read would mask a missing boot-load):
+        // `es_twice` must appear as a real completed view, not a recovery
+        // tombstone, and artifact-less rows still appear as tombstones with
+        // their evidence state.
+        let views_before_read = second.list_views();
+        let twice_entry = views_before_read
+            .iter()
+            .find(|entry| entry["session_id"] == "es_twice")
+            .expect("the second-restart registry must list the persisted dead session");
+        assert_eq!(
+            twice_entry["started_at"],
+            iso_from_ms(started),
+            "{twice_entry}"
+        );
+        assert!(
+            twice_entry.get("recovery_state").is_none(),
+            "es_twice must be a real completed view, not a tombstone: {twice_entry}"
+        );
+        let missing_view = views_before_read
+            .iter()
+            .find(|entry| entry["session_id"] == "es_missing")
+            .cloned()
+            .expect("es_missing must stay listable after the second restart");
+        assert_eq!(missing_view["recovery_state"], "closed_before_restart");
+        assert_eq!(missing_view["evidence"], "missing", "{missing_view}");
+        let late_view = views_before_read
+            .iter()
+            .find(|entry| entry["session_id"] == "es_late")
+            .cloned()
+            .expect("es_late must stay listable after the second restart");
+        assert_eq!(late_view["recovery_state"], "closed_before_restart");
+        assert_eq!(late_view["evidence"], "missing", "{late_view}");
+        // `es_corrupt` committed a spool on the previous boot, so it is
+        // boot-loaded as a real completed view, not a tombstone.
+        let corrupt_entry = views_before_read
+            .iter()
+            .find(|entry| entry["session_id"] == "es_corrupt")
+            .expect("es_corrupt must stay listable after the second restart");
+        assert!(
+            corrupt_entry.get("recovery_state").is_none(),
+            "es_corrupt must be a real completed view, not a tombstone: {corrupt_entry}"
+        );
+
         let view = second.read("es_twice", "stdout", 0, 64);
         assert_eq!(view["ok"], true, "{view}");
         assert_eq!(view["phase"], "completed");
@@ -5250,26 +5332,45 @@ mod tests {
         );
 
         // A corrupt spool is surfaced, never hidden behind a generic
-        // recovery refusal. `es_corrupt` was never boot-loaded (no spool at
-        // restart), so this read goes through the persisted-row path.
-        fs::write(exec_spool_path(&path, "es_corrupt"), b"corrupt-not-json").unwrap();
-        let corrupt = second.read("es_corrupt", "stdout", 0, 64);
+        // recovery refusal. `es_late` was never boot-loaded (no spool at
+        // either restart), so this read goes through the persisted-row
+        // (recovered-map-miss) path.
+        fs::write(exec_spool_path(&path, "es_late"), b"corrupt-not-json").unwrap();
+        let corrupt = second.read("es_late", "stdout", 0, 64);
         assert_eq!(corrupt["ok"], false, "{corrupt}");
         assert_eq!(corrupt["reason"], "session_spool_corrupt", "{corrupt}");
         // The corrupt row is listable too, reporting its artifact state.
         let corrupt_view = second
             .list_views()
             .iter()
-            .find(|entry| entry["session_id"] == "es_corrupt")
+            .find(|entry| entry["session_id"] == "es_late")
             .cloned()
-            .expect("es_corrupt must stay listable after the second restart");
+            .expect("es_late must stay listable after the second restart");
         assert_eq!(corrupt_view["evidence"], "corrupt", "{corrupt_view}");
         // ...and a legal spool committed later is still picked up.
-        let recovered_session = unpersisted_closed_session("es_corrupt", "late-corrupt\n");
+        let recovered_session = unpersisted_closed_session("es_late", "late-corrupt\n");
         write_session_spool(&path, &recovered_session).unwrap();
-        let late = second.read("es_corrupt", "stdout", 0, 64);
+        let late = second.read("es_late", "stdout", 0, 64);
         assert_eq!(late["ok"], true, "{late}");
         assert_eq!(late["text"], "late-corrupt\n");
+        // This path rebuilt the session through `committed_spool_session`
+        // (non-resident at read time), so its `finished_at` must be the
+        // persisted settle time — not read time (pi 7038448644 P2-A).
+        let persisted_ended = second
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .get_closed_before_restart_exec_session("es_late", now_ms())
+            .unwrap()
+            .and_then(|row| row.ended_at_ms)
+            .expect("es_late must have a persisted settle time");
+        assert_eq!(late["finished_at"], iso_from_ms(persisted_ended), "{late}");
+        let late_again = second.read("es_late", "stdout", 0, 64);
+        assert_eq!(
+            late_again["finished_at"], late["finished_at"],
+            "{late_again}"
+        );
 
         // Expiry boundary, resident path: `es_twice` is resident, so its
         // memory buffers remain servable until SESSION_TTL_MS — the
