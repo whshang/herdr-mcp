@@ -16234,6 +16234,13 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
 
         Some(Ok(value)) => {
             invalidate_git_status_after_broker_write(op, &value);
+            // `repo_identity` is an internal cache-invalidation hint the
+            // broker supplies for the parent — it is not part of the public
+            // tool response and must not leak to callers (pi 7035463441).
+            let mut value = value;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("repo_identity");
+            }
             value
         }
 

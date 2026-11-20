@@ -536,6 +536,13 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
                     .is_some_and(|current| Arc::ptr_eq(current, &waiter))
                 {
                     state.in_flight.remove(&key);
+                    // Poison the evicted waiter too: its late result must be
+                    // refused at the publish fence even if it raced a new
+                    // probe's registration (Codex 7035056472 / Claude
+                    // 7035902838 P1).
+                    waiter
+                        .invalidated
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     drop(state);
                     *waiter
                         .done
@@ -593,15 +600,24 @@ fn cached_git_status(snapshot: &Value, root: &Path) -> Option<GitStatus> {
         let mut state = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Generation fence: an identity-less probe cannot be matched to any
-        // write's repo identity, so it may only publish when NO invalidation
-        // at all ran during the probe — the write could have landed through
-        // an alias the runtime cannot see (Codex 7030506844 P1). Probes with
-        // a provable identity rely on the direct `invalidated` flag instead:
+        // This waiter may have been evicted by a wait-timeout — or poisoned
+        // directly — while the probe ran; it may publish only while it is
+        // still the registered in-flight probe for this key AND unflagged
+        // (Codex 7035056472 / Claude 7035902838 P1). Generation fence: an
+        // identity-less probe cannot be matched to any write's repo
+        // identity, so it may only publish when NO invalidation at all ran
+        // during the probe — the write could have landed through an alias
+        // the runtime cannot see (Codex 7030506844 P1). Probes with a
+        // provable identity rely on the direct `invalidated` flag instead:
         // unrelated writes must not churn them.
-        let stale = waiter
-            .invalidated
-            .load(std::sync::atomic::Ordering::Relaxed)
+        let registered = state
+            .in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &waiter));
+        let stale = !registered
+            || waiter
+                .invalidated
+                .load(std::sync::atomic::Ordering::Relaxed)
             || (waiter.repo_identity.is_none() && state.invalidation_epoch != waiter.started_epoch);
         if !stale {
             let now = cache_now();
@@ -747,8 +763,22 @@ pub fn invalidate_git_status_cache_all() {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
-
 fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
+    #[cfg(test)]
+    let delay = GIT_STATUS_PROBE_DELAY_MS
+        .get()
+        .and_then(|delays| delays.lock().ok().and_then(|map| map.get(root).copied()));
+    let result = if should_use_stable_broker(snapshot, root) {
+        broker_git_status(snapshot, root)
+    } else {
+        git_status_direct(root).map(|(dirty, changed_files)| GitStatus {
+            root: root.to_path_buf(),
+            dirty,
+            changed_files,
+            source: "local_git",
+            repo_identity: repo_identity_for(root),
+        })
+    };
     #[cfg(test)]
     {
         *GIT_STATUS_PROBES
@@ -757,26 +787,16 @@ fn git_status_uncached(snapshot: &Value, root: &Path) -> Option<GitStatus> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(root.to_path_buf())
             .or_insert(0) += 1;
-        // Controlled probe latency: a test parks the prober thread so it can
-        // run an invalidation WHILE the probe is in flight — the publish-path
-        // generation fence exists for exactly that interleave (#1023).
-        if let Some(delay) = GIT_STATUS_PROBE_DELAY_MS
-            .get()
-            .and_then(|delays| delays.lock().ok().and_then(|map| map.get(root).copied()))
-        {
+        // Controlled latency AFTER the probe computed: a test parks the
+        // prober on its way to publish so it can invalidate mid-flight and
+        // still distinguish the probe's (already captured) result from a
+        // fresh re-probe. The publish fences exist for exactly this
+        // interleave (#1023).
+        if let Some(delay) = delay {
             std::thread::sleep(delay);
         }
     }
-    if should_use_stable_broker(snapshot, root) {
-        return broker_git_status(snapshot, root);
-    }
-    git_status_direct(root).map(|(dirty, changed_files)| GitStatus {
-        root: root.to_path_buf(),
-        dirty,
-        changed_files,
-        source: "local_git",
-        repo_identity: repo_identity_for(root),
-    })
+    result
 }
 
 fn git_status_direct(root: &Path) -> Option<(bool, usize)> {
@@ -978,11 +998,18 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
+        // pid + atomic + nanos: parallel tests in this and other binaries must
+        // never collide on the same fixture directory (Claude 7035902838).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-mcp-projects-{unique}"))
+        std::env::temp_dir().join(format!(
+            "herdr-mcp-projects-{}-{sequence}-{unique}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1102,6 +1129,9 @@ mod tests {
 
     #[test]
     fn git_status_ttl_expiry_refreshes_the_probe() {
+        // Shared-cache invalidations from parallel tests must not poison this
+        // probe count (pi 7035463441).
+        let _env_guard = crate::test_env::lock();
         let root = temp_dir();
         fs::create_dir_all(&root).unwrap();
         assert!(
@@ -1210,6 +1240,10 @@ mod tests {
 
     #[test]
     fn expired_entries_are_evicted_on_the_next_probe() {
+        // The clear-all fallback poisons unrelated in-flight probes; hold the
+        // shared-cache lock so this probe count cannot be disturbed (pi
+        // 7035463441).
+        let _env_guard = crate::test_env::lock();
         let root_a = temp_dir();
         let root_b = temp_dir();
         for root in [&root_a, &root_b] {
@@ -1279,6 +1313,81 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// user operator | Given a probe wedged past the wait bound, a second
+    /// caller that takes over, and a write during the takeover | When the
+    /// evicted probe finally returns | Then its stale result is refused and
+    /// the invalidation wins — no entry is backfilled (Codex 7035056472 /
+    /// Claude 7035902838 P1).
+    #[test]
+    fn evicted_probe_result_is_refused_after_a_write() {
+        let _env_guard = crate::test_env::lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // T1 probes slowly; the main caller waits past the 50ms test bound,
+        // evicts T1's marker, and becomes the replacement prober.
+        reset_git_status_probe_count(&root);
+        set_git_status_probe_delay(&root, Some(Duration::from_millis(200)));
+        let snapshot = git_snapshot(&root);
+        let first = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            move || derive(&snapshot)
+        });
+        // Barrier: the first probe must actually be parked inside
+        // git_status_uncached before the takeover attempt starts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while git_status_probe_count(&root) == 0 {
+            assert!(std::time::Instant::now() < deadline, "probe never ran");
+            std::thread::yield_now();
+        }
+        // This derive waits on T1, times out at the test bound, evicts the
+        // marker, and starts its own delayed probe.
+        let second = std::thread::spawn({
+            let snapshot = snapshot.clone();
+            move || derive(&snapshot)
+        });
+        // Barrier: the takeover probe registered (count 2) before the write
+        // lands, so the invalidation runs strictly between takeover and its
+        // publish.
+        while git_status_probe_count(&root) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "takeover probe never ran"
+            );
+            std::thread::yield_now();
+        }
+        // The write lands while BOTH probes are parked post-computation.
+        std::fs::write(root.join("written-after-probe.txt"), "dirty\n").unwrap();
+        invalidate_git_status_cache(&root);
+        first.join().unwrap();
+        second.join().unwrap();
+        set_git_status_probe_delay(&root, None);
+
+        // Distinguishing evidence: every parked probe captured the CLEAN
+        // status before the write, so any dirty result now observable can
+        // only come from a fresh re-probe — had an evicted or invalidated
+        // probe published, the cache would read clean forever.
+        let latest = derive(&snapshot);
+        assert!(
+            latest.projects[&root].dirty,
+            "the post-write state is observable — no stale clean publish survived: {latest:?}"
+        );
+        assert!(
+            git_status_probe_count(&root) >= 3,
+            "the refused publishes must have forced a fresh probe: {}",
+            git_status_probe_count(&root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn identity_less_probe_never_publishes_across_a_write() {
         let _env_guard = crate::test_env::lock();
@@ -1288,18 +1397,41 @@ mod tests {
         // write could have landed through an alias nobody can see. Here the
         // "write" reports an unrelated root: neither path nor identity
         // matches the probe's key, so only the epoch fence can stop it.
+        // The snapshot declares a worktree so the project is real, and the
+        // probe count proves the interleave actually ran (Claude 7035902838:
+        // the previous form could pass vacuously).
         let gone = temp_dir().join("identity-less-probe");
         let unrelated = temp_dir().join("unrelated-write");
         fs::create_dir_all(&unrelated).unwrap();
-        let snapshot = git_snapshot(&gone);
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": gone.to_string_lossy()}
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": gone.to_string_lossy()
+            }],
+            "agents": []
+        });
+        reset_git_status_probe_count(&gone);
         set_git_status_probe_delay(&gone, Some(Duration::from_millis(400)));
         let probe_snapshot = snapshot.clone();
         let gone_probe = gone.clone();
         let handle = std::thread::spawn(move || derive(&probe_snapshot));
-        // The delay is registered before the probe starts; give the prober a
-        // moment to register its in-flight waiter, then invalidate from an
-        // unrelated root mid-flight.
-        std::thread::sleep(Duration::from_millis(50));
+        // Explicit barrier: spin until the prober has registered AND parked
+        // inside the delayed probe — only then invalidate, so the order
+        // register → invalidate → resume → refuse is deterministic, not
+        // timing luck.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while git_status_probe_count(&gone) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the prober never reached git_status_uncached"
+            );
+            std::thread::yield_now();
+        }
         invalidate_git_status_cache_matching(&unrelated, None);
         handle.join().unwrap();
         set_git_status_probe_delay(&gone, None);
