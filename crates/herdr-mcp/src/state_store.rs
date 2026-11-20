@@ -9258,6 +9258,81 @@ impl StateStore {
         }
     }
 
+    /// A `closed_before_restart` row whose retention window is still open.
+    /// The settle already proved the process dead, so unlike
+    /// `get_unsettled_exec_session` this state may serve a committed spool
+    /// without any live-process fence; `reaped_on_restart` and
+    /// `detached_unverified` rows are deliberately not matched here
+    /// (Codex 7037326311 P1).
+    pub fn get_closed_before_restart_exec_session(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1
+                   AND state = 'closed_before_restart'
+                   AND (expires_at IS NULL OR expires_at > ?2)",
+            )
+            .map_err(|error| format!("cannot prepare recovered exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![session_id, now_i64], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query recovered exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode recovered exec session: {error}"))?;
+                let started_at_ms = u64::try_from(started_at).unwrap_or(0);
+                let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
+                let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms,
+                    ended_at_ms,
+                    exit_code,
+                    signal,
+                    expires_at_ms,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The persisted `started_at` for any session state — used to keep real
+    /// timestamps on records reconstructed for spool reads (pi 7037465609).
+    pub fn exec_session_started_at(&self, session_id: &str) -> Result<Option<u64>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT started_at FROM exec_sessions WHERE session_id = ?1")
+            .map_err(|error| format!("cannot prepare exec session started_at query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("cannot query exec session started_at: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let started_at =
+                    row.map_err(|error| format!("cannot decode started_at: {error}"))?;
+                Ok(Some(u64::try_from(started_at).unwrap_or(0)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// A close whose SQLite settle failed. The row is no longer `running`, so
     /// restart recovery will not treat the command as a live process, and a
     /// later read can rebuild incomplete evidence instead of `session_not_found`.

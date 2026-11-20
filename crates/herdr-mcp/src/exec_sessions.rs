@@ -1301,33 +1301,59 @@ impl ExecRegistry {
     }
 
     fn committed_spool_session(&self, id: &str) -> Option<Arc<Session>> {
+        // Dead-state proof may come from the in-process recovery map (this
+        // boot settled it) OR the persisted row (a PREVIOUS boot settled it
+        // as closed_before_restart — Codex 7037326311 P1: the second-restart
+        // read reached session_not_found before). `closed_before_restart` is
+        // a settled-dead state; `settle_failed:*` is the same proof with an
+        // unwritable DB. States whose process may still be alive
+        // (`reaped_on_restart` pending SIGKILL, `detached_unverified`) never
+        // reach this gate.
         let state = self
             .inner
             .recovered
             .lock()
             .ok()
-            .and_then(|recovered| recovered.get(id).cloned())?;
-        // `closed_before_restart` is a settled-dead state: the process was
-        // confirmed gone before this runtime started and the settle write
-        // succeeded. A `settle_failed:*` row is the same proof with an
-        // unwritable DB. Both may serve a committed spool — `exit_code` and
-        // `signal` stay absent because the spool is the only honest evidence
-        // (Codex 7030542301 P1). States whose process may still be alive
-        // (`reaped_on_restart` pending SIGKILL, `detached_unverified`) never
-        // reach this gate.
-        if state != "closed_before_restart" && !state.starts_with("settle_failed") {
-            return None;
-        }
-        let record = ClosedExecSessionRecord {
-            session_id: id.to_owned(),
-            started_at_ms: now_ms(),
-            ended_at_ms: Some(now_ms()),
-            exit_code: None,
-            signal: None,
-            expires_at_ms: Some(now_ms().saturating_add(SESSION_TTL_MS)),
+            .and_then(|recovered| recovered.get(id).cloned());
+        let mut record = match state {
+            Some(state)
+                if state == "closed_before_restart" || state.starts_with("settle_failed") =>
+            {
+                ClosedExecSessionRecord {
+                    session_id: id.to_owned(),
+                    started_at_ms: now_ms(),
+                    ended_at_ms: Some(now_ms()),
+                    exit_code: None,
+                    signal: None,
+                    expires_at_ms: Some(now_ms().saturating_add(SESSION_TTL_MS)),
+                }
+            }
+            Some(_) => return None,
+            None => self.inner.state_store.lock().ok().and_then(|store| {
+                store
+                    .get_closed_before_restart_exec_session(id, now_ms())
+                    .ok()
+                    .flatten()
+            })?,
         };
+        // Prefer persisted started/ended times over the values synthesized
+        // above so a read keeps the real timestamps instead of read time
+        // (pi 7037465609).
+        if let Ok(store) = self.inner.state_store.lock() {
+            if let Ok(Some(persisted)) = store.get_closed_exec_session(id) {
+                record.started_at_ms = persisted.started_at_ms;
+                record.ended_at_ms = persisted.ended_at_ms.or(record.ended_at_ms);
+            }
+            if let Ok(Some(started_at)) = store.exec_session_started_at(id) {
+                record.started_at_ms = started_at;
+            }
+        }
         let session = load_session_from_spool_or_record(&self.inner.state_dir, &record);
-        (!session.evidence_missing && !session.spool_corrupt).then_some(session)
+        // A corrupt spool is evidence in its own right and must surface as
+        // `session_spool_corrupt` — hiding it behind
+        // `session_recovered_after_restart` would lose the distinction
+        // (Codex 7037326311 P2). Only a wholly absent artifact falls through.
+        (!session.evidence_missing || session.spool_corrupt).then_some(session)
     }
 
     fn recovered_or_missing(&self, id: &str) -> Value {
@@ -4956,6 +4982,74 @@ mod tests {
         );
 
         drop(restarted);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// user operator | Given a dead native session settled as
+    /// `closed_before_restart` with a committed spool | When the runtime
+    /// restarts a SECOND time and reads it | Then the persisted dead-state
+    /// row still serves the spool, a corrupt spool surfaces
+    /// `session_spool_corrupt`, and an expired row reports
+    /// `session_not_found` (Codex 7037326311 P1+P2).
+    #[test]
+    fn user_operator_reads_spool_after_a_second_restart() {
+        let path = env::temp_dir().join(format!(
+            "herdr-mcp-exec-second-restart-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = StateStore::open_in_dir(&path, "state.db").unwrap();
+        let started = now_ms() - 60_000;
+        store
+            .record_exec_running("es_twice", 99_000, None, started)
+            .unwrap();
+        let session = unpersisted_closed_session("es_twice", "twice-restart\n");
+        write_session_spool(&path, &session).unwrap();
+        drop(store);
+
+        // First restart: the dead pid settles as closed_before_restart.
+        let first = ExecRegistry::new(path.clone()).unwrap();
+        let first_view = first.read("es_twice", "stdout", 0, 64);
+        assert_eq!(first_view["ok"], true, "{first_view}");
+        assert_eq!(first_view["text"], "twice-restart\n");
+        drop(first);
+
+        // Second restart: the in-process recovery map is empty; only the
+        // persisted closed_before_restart row proves the death.
+        let second = ExecRegistry::new(path.clone()).unwrap();
+        let view = second.read("es_twice", "stdout", 0, 64);
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["phase"], "completed");
+        assert_eq!(view["text"], "twice-restart\n");
+        assert!(view["exit_code"].is_null(), "{view}");
+        // Timestamps come from the persisted row, not read time
+        // (pi 7037465609).
+        assert_eq!(view["started_at"], iso_from_ms(started), "{view}");
+
+        // A corrupt spool is surfaced, never hidden behind a generic
+        // recovery refusal.
+        fs::write(exec_spool_path(&path, "es_twice"), b"corrupt-not-json").unwrap();
+        let corrupt = second.read("es_twice", "stdout", 0, 64);
+        assert_eq!(corrupt["ok"], false, "{corrupt}");
+        assert_eq!(corrupt["reason"], "session_spool_corrupt", "{corrupt}");
+
+        // Expiry boundary: past the persisted retention window the row is
+        // gone from the read path entirely.
+        second
+            .inner
+            .state_store
+            .lock()
+            .unwrap()
+            .expire_exec_session_for_test("es_twice", 1)
+            .unwrap();
+        second.prune();
+        // Restore a legal spool so only the expiry gate can refuse.
+        write_session_spool(&path, &session).unwrap();
+        let expired = second.read("es_twice", "stdout", 0, 64);
+        assert_eq!(expired["ok"], false, "{expired}");
+        assert_eq!(expired["reason"], "session_not_found", "{expired}");
+
+        drop(second);
         let _ = fs::remove_dir_all(&path);
     }
 }
