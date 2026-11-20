@@ -79,10 +79,14 @@ esac
 
 # Build the request body with jq so tool names/args are escaped per JSON
 # rules; reject an ARGS_JSON that does not parse. Built per sample so the
-# nonce/id vary — see the dedupe note in the header.
+# nonce/id vary — see the dedupe note in the header. RUN_ID is unique per
+# invocation: back-to-back runs inside Edge's 3s read-dedupe window must
+# not replay the previous run's samples (the JSON-RPC id is not part of
+# the dedupe key).
+RUN_ID="run-$(date +%s)-$$"
 build_body() { # $1=seq
   jq -cn --arg name "$TOOL" --argjson args "$ARGS_JSON" \
-    --argjson id "$1" --arg nonce "sample-$1" \
+    --argjson id "$1" --arg nonce "sample-$RUN_ID-$1" \
     '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:$name,arguments:($args + {sample_nonce:$nonce})}}'
 }
 jq -cn --argjson args "$ARGS_JSON" 'true' 2>/dev/null \
@@ -140,9 +144,14 @@ sample() { # $1=url $2=bearer $3=bodyfile $4=seq
     2*) ;;
     *) echo "FAIL"; return ;;
   esac
-  # Full envelope check: JSON-RPC 2.0, echoed request id, result, no error.
+  # Full envelope check: JSON-RPC 2.0, echoed request id, result present,
+  # no transport-level error AND no tool-level failure — a fast
+  # `result.isError: true` (auth refusal, tool failure) is not real
+  # latency and must count as FAIL.
   jq -e --argjson id "$seq" \
-    'type == "object" and .jsonrpc == "2.0" and .id == $id and .error == null and .result != null' \
+    'type == "object" and .jsonrpc == "2.0" and .id == $id
+     and .error == null and .result != null
+     and (if (.result|type) == "object" then (.result.isError // false) else false end) == false' \
     "$bodyfile" >/dev/null 2>&1 || { echo "FAIL"; return; }
   printf '%s\n' "$(awk -v t="$time_total" 'BEGIN{printf "%d", t*1000}')"
 }
