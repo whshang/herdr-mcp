@@ -438,6 +438,23 @@ fn firmlink_primary_spelling(candidate: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(rest))
 }
 
+/// Whether a canonical real path still spells the declared topology root.
+///
+/// The protected exec path delegates `cd` into the declared root; this is the
+/// identity check proving that the `cd` target is that same directory and not
+/// a symlink that was swapped in afterwards. Both spellings are compared after
+/// lexical normalization and under the Data-volume firmlink alias — a real
+/// path reported as `/System/Volumes/Data/<rest>` is the same object as the
+/// declared `/<rest>` — while any other divergence (a symlinked root, a
+/// renamed leaf, a different case) fails closed.
+pub(crate) fn same_declared_spelling(real: &Path, declared: &Path) -> bool {
+    let real = normalize_lexical(real);
+    let declared = normalize_lexical(declared);
+    real == declared
+        || firmlink_primary_spelling(&real).as_deref() == Some(declared.as_path())
+        || firmlink_primary_spelling(&declared).as_deref() == Some(real.as_path())
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
