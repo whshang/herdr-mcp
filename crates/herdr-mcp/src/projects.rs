@@ -690,8 +690,12 @@ pub fn invalidate_git_status_cache_for_path(path: &Path) {
 /// with `repo_identity`. Identities overlap bidirectionally because a probe
 /// keyed on a subdirectory records that subdirectory's canonical path while
 /// a write reports the repository root — both spellings of the same repo
-/// must still match (#1023, Claude 7011094552). Entries recorded without an
-/// identity keep the prefix-only behavior.
+/// must still match (#1023, Claude 7011094552). Entries and probes recorded
+/// without an identity can never prove they belong to a DIFFERENT repo, so
+/// once the write carries an identity they are dropped conservatively —
+/// otherwise a `value=None` cache (e.g. a protected root whose broker probe
+/// failed transiently) keeps serving pre-write state until TTL
+/// (Codex 7037947948 P2).
 pub fn invalidate_git_status_cache_matching(root: &Path, repo_identity: Option<&Path>) {
     let Some(cache) = GIT_STATUS_CACHE.get() else {
         return;
@@ -701,8 +705,12 @@ pub fn invalidate_git_status_cache_matching(root: &Path, repo_identity: Option<&
         if root.starts_with(key) || key.starts_with(root) {
             return true;
         }
-        let (Some(identity), Some(entry_identity)) = (&identity, entry_identity) else {
+        let Some(identity) = &identity else {
             return false;
+        };
+        let Some(entry_identity) = entry_identity else {
+            // Unknown identity cannot rule out the written repo: drop it.
+            return true;
         };
         entry_identity.starts_with(identity) || identity.starts_with(entry_identity)
     };
@@ -1478,6 +1486,83 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(unrelated).unwrap();
+    }
+
+    /// user operator | Given alias A's cached status was recorded without a
+    /// repo identity | When a write succeeds through alias B of the same
+    /// repository carrying its canonical identity | Then A's entry drops
+    /// conservatively and the next inspect re-probes (Codex 7037947948 P2).
+    #[cfg(unix)]
+    #[test]
+    fn unknown_identity_entry_drops_on_an_identified_write_through_another_alias() {
+        use std::os::unix::fs::symlink;
+
+        let _env_guard = crate::test_env::lock();
+        let real = temp_dir().join("real");
+        fs::create_dir_all(&real).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fixture = real.parent().unwrap().to_path_buf();
+        let alias_a = fixture.join("alias-a");
+        let alias_b = fixture.join("alias-b");
+        symlink(&real, &alias_a).unwrap();
+        symlink(&real, &alias_b).unwrap();
+
+        // Seed a value=None, identity-less entry keyed on alias A — the
+        // shape a protected-root probe leaves when its broker call failed.
+        GIT_STATUS_CACHE
+            .get_or_init(|| Mutex::new(GitStatusCacheState::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .insert(
+                alias_a.clone(),
+                GitStatusCacheEntry {
+                    expires_at: cache_now() + GIT_STATUS_CACHE_TTL,
+                    value: None,
+                    repo_identity: None,
+                },
+            );
+
+        // The write lands through alias B and reports the repo's canonical
+        // identity: A's entry cannot prove it is a different repo, so it must
+        // drop rather than keep serving pre-write state until TTL.
+        let identity = std::fs::canonicalize(&real).unwrap();
+        invalidate_git_status_cache_matching(&alias_b, Some(&identity));
+        assert_eq!(
+            git_status_cache_entry_count_for(&alias_a),
+            0,
+            "an identity-less entry cannot rule out the written repo and must drop"
+        );
+
+        // The next inspect re-probes instead of serving the dropped entry.
+        let snapshot = json!({
+            "workspaces": [{
+                "workspace_id": "w1",
+                "worktree": {"checkout_path": alias_a.to_string_lossy()}
+            }],
+            "panes": [{
+                "pane_id": "w1:p1",
+                "workspace_id": "w1",
+                "cwd": alias_a.to_string_lossy()
+            }],
+            "agents": []
+        });
+        reset_git_status_probe_count(&alias_a);
+        let latest = derive(&snapshot);
+        assert!(latest.projects.contains_key(&alias_a), "{latest:?}");
+        assert_eq!(
+            git_status_probe_count(&alias_a),
+            1,
+            "alias A must re-probe immediately after the identified write"
+        );
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]

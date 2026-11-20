@@ -18342,6 +18342,10 @@ mod tests {
         }
         drop(_env_guard);
         assert_eq!(outcome["ok"], true, "{outcome}");
+        assert!(
+            outcome.get("repo_identity").is_none(),
+            "the internal identity hint must be stripped before returning: {outcome}"
+        );
         assert_eq!(
             crate::projects::git_status_cache_entry_count_for(&fixture),
             0,
