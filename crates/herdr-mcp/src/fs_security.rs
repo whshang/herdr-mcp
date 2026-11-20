@@ -245,7 +245,29 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     };
     let guard = HomeGuard::new(home);
     let root = &project.root;
-    if !root.is_absolute() || guard.rejects(root) || denied_secret_path(root) {
+    if !root.is_absolute() {
+        return false;
+    }
+    // Everything in this classification must be probe-free until the
+    // delegation decision is made: `HomeGuard::rejects` stats the candidate
+    // for a device+inode match, so calling it on a protected
+    // Documents/Desktop/Downloads path would make the rotating runtime a TCC
+    // requester (or block) before it could delegate. Lexical normalization
+    // and the secret-path guard touch no filesystem and run for every
+    // candidate; the delegation check then splits the policy — delegated
+    // roots get only the lexical HOME-boundary check here and the authorized
+    // broker verifies identity/symlinks, while every other path keeps the
+    // full metadata-backed HomeGuard probe.
+    let normalized = normalize_lexical(root);
+    if denied_secret_path(&normalized) {
+        return false;
+    }
+    let delegated = must_delegate_probe(&normalized, home);
+    if delegated {
+        if guard.rejects_lexically(&normalized) {
+            return false;
+        }
+    } else if guard.rejects(&normalized) {
         return false;
     }
     // "canonical existing directory": the live cwd must resolve to a real
@@ -257,16 +279,17 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     // stable broker (`herdr_fs_*`) or the delegated utility pane
     // (`herdr_exec`) — the same route the pre-existing protected-root command
     // preflight already uses. Every other unresolvable path is refused.
-    // `runtime_must_not_probe` already carries the full protected-path
-    // contract (Documents/Desktop/Downloads, the /System/Volumes/Data firmlink
-    // spelling, APFS case variants) *and* the broker-child exemption: inside
-    // the stable TCC broker it returns false, so the authorized child still
-    // runs the complete canonicalize + HomeGuard + secret-path validation
-    // instead of inheriting the rotating runtime's delegation shortcut.
-    let root_real = if crate::macos_permissions::runtime_must_not_probe(root) {
+    // `must_delegate_probe` carries the full protected-path contract
+    // (Documents/Desktop/Downloads, the /System/Volumes/Data firmlink
+    // spelling, APFS case variants) *and* the broker-child exemption on the
+    // caller's `home` context: inside the stable TCC broker it returns false,
+    // so the authorized child still runs the complete canonicalize +
+    // HomeGuard + secret-path validation instead of inheriting the rotating
+    // runtime's delegation shortcut.
+    let root_real = if delegated {
         None
     } else {
-        match std::fs::canonicalize(root) {
+        match std::fs::canonicalize(&normalized) {
             Ok(real) => {
                 if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
                     return false;
@@ -282,15 +305,34 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     // cannot borrow this root's authority. A delegated-root cwd is likewise
     // never probed in-process; only an exact match carries authority.
     project.cwds.iter().all(|cwd| {
-        if crate::macos_permissions::runtime_must_not_probe(cwd) {
-            cwd == root
+        if must_delegate_probe(cwd, home) {
+            normalize_lexical(cwd) == normalized
         } else {
             match (&root_real, std::fs::canonicalize(cwd)) {
                 (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
-                _ => cwd == root,
+                _ => normalize_lexical(cwd) == normalized,
             }
         }
     })
+}
+
+/// Whether `path` under `home` must not be probed by the rotating runtime:
+/// the lexical protected-path contract (Documents/Desktop/Downloads, firmlink
+/// spelling, APFS case variants) plus the broker-child exemption — identical
+/// to `runtime_must_not_probe`, but driven by the caller's `home` context
+/// instead of the process `HOME` env so tests and custom-home callers get
+/// the same classification the probe guards rely on.
+fn must_delegate_probe(path: &Path, home: &Path) -> bool {
+    #[cfg(any(target_os = "macos", test))]
+    {
+        crate::macos_permissions::is_protected_user_path_lexical_for_home(path, home)
+            && !crate::tcc_broker::is_broker_child_process()
+    }
+    #[cfg(not(any(target_os = "macos", test)))]
+    {
+        let _ = (path, home);
+        false
+    }
 }
 
 /// Stable filesystem identity of an existing path: `(device, inode)` on Unix.
@@ -362,21 +404,25 @@ impl HomeGuard {
         }
     }
 
-    fn rejects(&self, candidate: &Path) -> bool {
+    /// The probe-free portion of `rejects`: lexical ancestry against both
+    /// spellings of HOME. Callers that must not touch the filesystem for a
+    /// candidate (delegated TCC-protected roots) use this layer alone; the
+    /// authorized broker runs the full check.
+    fn rejects_lexically(&self, candidate: &Path) -> bool {
         let mut candidates = vec![candidate.to_path_buf()];
         if let Some(primary) = firmlink_primary_spelling(candidate) {
             candidates.push(primary);
         }
-        for candidate in &candidates {
-            if self
-                .spellings
+        candidates.iter().any(|candidate| {
+            self.spellings
                 .iter()
                 .any(|home| home == candidate || home.starts_with(candidate))
-            {
-                return true;
-            }
-        }
-        path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
+        })
+    }
+
+    fn rejects(&self, candidate: &Path) -> bool {
+        self.rejects_lexically(candidate)
+            || path_identity(candidate).is_some_and(|identity| self.identities.contains(&identity))
     }
 }
 
@@ -1006,6 +1052,43 @@ mod tests {
             }],
             "agents": []
         })
+    }
+
+    /// Given a caller-injected home whose Documents root cannot be traversed
+    /// When operational_root_eligible classifies the live-proven project
+    /// Then the delegated arm admits it without ever stat'ing the candidate —
+    /// a probing implementation fails on the untraversable parent, so an `ok`
+    /// classification is direct evidence that no filesystem access happened.
+    /// This exercises the real call chain on every platform (the injected
+    /// `home`, not the process HOME, drives the delegation decision).
+    #[cfg(unix)]
+    #[test]
+    fn delegated_protected_root_is_classified_without_probing() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = plain_parent("delegatedlex", &[]);
+        let home = parent.join("home");
+        let documents = home.join("Documents");
+        let project = documents.join("proj");
+        fs::create_dir_all(&project).unwrap();
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o000)).unwrap();
+        // Under an unprivileged runner metadata traversal fails, so an `ok`
+        // classification is direct evidence the delegated arm never probed.
+        // Under a privileged runner (root) that precondition does not hold —
+        // the eligibility assertions below still exercise the same arm.
+        let traversal_blocked = std::fs::metadata(&project).is_err();
+        assert!(
+            operational_root_eligible(&vcs_less_project(&project), Some(&home)),
+            "delegated arm must admit without probing (traversal_blocked={traversal_blocked})"
+        );
+        // The lexical boundary still applies on the delegated arm: the same
+        // home itself (an ancestor of every protected spelling) is refused
+        // without a probe.
+        assert!(!operational_root_eligible(
+            &vcs_less_project(&home),
+            Some(&home)
+        ));
+        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&parent).ok();
     }
 
     /// A vcs-less scratch parent plus the named child directories under it.
