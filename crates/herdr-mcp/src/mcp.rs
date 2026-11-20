@@ -16267,6 +16267,15 @@ fn invalidate_git_status_after_broker_write(op: &str, value: &Value) {
     {
         return;
     }
+    // Codex 7030506844 P1: a rev-5 broker response has no `repo_identity`,
+    // and its `root` is one arbitrary alias of the touched repo. Prefix
+    // matching alone can miss cache entries recorded under a different
+    // alias, so the fallback must not trust ANY retained state.
+    let has_identity = value.get("repo_identity").and_then(Value::as_str).is_some();
+    if !has_identity {
+        crate::projects::invalidate_git_status_cache_all();
+        return;
+    }
     let root = value
         .get("root")
         .or_else(|| value.get("repo_identity"))
@@ -17874,6 +17883,11 @@ mod tests {
     fn user_next_inspect_after_a_broker_write_reprobes_git_status() {
         use std::process::Command;
 
+        // The canned no-identity result below now routes to the clear-all
+        // fallback (Codex 7030506844 P1), which poisons every in-flight
+        // probe — serialize against the other shared-cache tests.
+        let _env_guard = crate::test_env::lock();
+
         let root = std::env::temp_dir().join(format!(
             "herdr-mcp-broker-cache-{}-{}",
             std::process::id(),
@@ -17935,6 +17949,73 @@ mod tests {
         assert_eq!(crate::projects::git_status_probe_count(&root), 2);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// user operator | Given status entries under two unrelated roots | When
+    /// a broker write succeeds but reports no `repo_identity` (a rev-5
+    /// broker response, Codex 7030506844 P1) | Then every retained entry is
+    /// dropped — prefix matching alone cannot reach aliases of the touched
+    /// repo, so nothing is trusted.
+    #[test]
+    fn user_rev5_broker_write_result_clears_every_cached_status() {
+        // Serializes against the other broker-cache tests: the clear-all this
+        // test verifies would poison THEIR in-flight probes too.
+        let _env_guard = crate::test_env::lock();
+        let fixture = std::env::temp_dir().join(format!(
+            "herdr-mcp-broker-rev5-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root_a = fixture.join("a");
+        let root_b = fixture.join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        for root in [&root_a, &root_b] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let snapshot = json!({
+            "panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root_a.to_string_lossy()},
+                {"pane_id": "w1:p2", "workspace_id": "w1", "cwd": root_b.to_string_lossy()}
+            ],
+            "agents": []
+        });
+        crate::projects::invalidate_git_status_cache_all();
+        crate::projects::derive(&snapshot);
+        assert!(
+            crate::projects::git_status_cache_entry_count_for(&root_a) >= 1
+                && crate::projects::git_status_cache_entry_count_for(&root_b) >= 1,
+            "fixture must seed both entries"
+        );
+
+        // The canned rev-5 shape: only `root`, no `repo_identity`.
+        invalidate_git_status_after_broker_write(
+            "fs_write",
+            &json!({"ok": true, "root": root_a.to_string_lossy()}),
+        );
+
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&root_a),
+            0,
+            "the touched root's entry must drop"
+        );
+        assert_eq!(
+            crate::projects::git_status_cache_entry_count_for(&root_b),
+            0,
+            "entries under other roots must drop too: without a repo identity \
+             they may alias the write's repository"
+        );
+        std::fs::remove_dir_all(root_a.parent().unwrap()).unwrap_or_default();
     }
 
     /// Build a fake broker installation under a temp config dir: a `#!/bin/sh`
