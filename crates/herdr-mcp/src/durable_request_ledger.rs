@@ -104,6 +104,28 @@ pub fn client_request_key_digest(kind: &str, client_request_id: &str) -> String 
 /// Stable `op_id` embedding the kind so two kinds reusing one raw key get
 /// independent primary keys. `key_digest[..32]` is 32 hex chars = 16 bytes
 /// (~122 bits) of the SHA-256 prefix.
+/// #1094 P0-a: the first-class write tools that accept `client_request_id` in
+/// `params.arguments`, mapped to their durable-ledger kinds. Every other tool
+/// keeps its pre-existing dedupe surface.
+pub(crate) fn client_request_tool_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "herdr_fs_write" => Some(HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+        "herdr_fs_edit" => Some(HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+        "herdr_fs_patch" => Some(HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+        "herdr_prompt" => Some(HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        _ => None,
+    }
+}
+
+/// The kind embedded in a client-request `op_id` (`op:{kind}:{digest}`).
+fn kind_from_op_id(op_id: &str) -> &str {
+    op_id
+        .strip_prefix("op:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .map(|(kind, _)| kind)
+        .unwrap_or("")
+}
+
 pub fn client_request_op_id(kind: &str, key_digest: &str) -> String {
     let prefix_len = key_digest.len().min(32);
     format!("op:{kind}:{}", &key_digest[..prefix_len])
@@ -712,13 +734,20 @@ pub fn durable_settle_result(
 /// record only answers for the scope digest embedded in its `request_hash`;
 /// foreign-scope hits return `None` exactly like a miss so existence never
 /// leaks across scopes.
-pub fn durable_client_request_status(store: &StateStore, key: &str, scope: &str) -> Option<Value> {
+pub fn durable_client_request_status(
+    store: &StateStore,
+    key: &str,
+    scope: &str,
+    tool: Option<&str>,
+) -> Option<Value> {
     let scope_digest = durable_scope_digest(scope);
     // Select by caller scope first: the same key under a different kind or
     // the same raw id submitted by another caller must not leak a foreign
     // record's state, and two kinds may legitimately hold rows for one key.
-    let record = CLIENT_REQUEST_KINDS
+    let kind_filter = tool.and_then(client_request_tool_kind);
+    let matches = CLIENT_REQUEST_KINDS
         .iter()
+        .filter(|kind| kind_filter.is_none() || Some(**kind) == kind_filter)
         .filter_map(|kind| {
             store
                 .client_request_record(kind, &client_request_key_digest(kind, key))
@@ -734,7 +763,34 @@ pub fn durable_client_request_status(store: &StateStore, key: &str, scope: &str)
         .filter(|record| {
             durable_scope_digest_from_hash(&record.request_hash) == Some(scope_digest.as_str())
         })
-        .max_by_key(|record| record.updated_at)?;
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+    // One caller key may legitimately name several tools (an fs_write and a
+    // prompt retry can share a client_request_id). Guessing by recency would
+    // silently answer for the wrong request, so report the ambiguity and let
+    // the caller pass `tool` to disambiguate.
+    if matches.len() > 1 {
+        return Some(json!({
+            "ok": true,
+            "found": true,
+            "durable": true,
+            "ambiguous": true,
+            "matches": matches.iter().map(|record| {
+                json!({
+                    "kind": kind_from_op_id(&record.op_id),
+                    "op_id": record.op_id,
+                    "request_id": record_request_id(record),
+                    "state": record.state,
+                    "created_ms": record.created_at,
+                    "updated_ms": record.updated_at,
+                })
+            }).collect::<Vec<_>>(),
+            "message": "client_request_id maps to several tools; pass the tool name to disambiguate",
+        }));
+    }
+    let record = matches.into_iter().next()?;
     let result = record.result();
     Some(json!({
         "ok": true,
@@ -904,13 +960,13 @@ mod tests {
         assert_eq!(body["code"], "idempotency_conflict", "{body}");
 
         // Cross-scope status never proves key existence.
-        assert!(durable_client_request_status(&store, KEY, SCOPE_B).is_none());
-        let status = durable_client_request_status(&store, KEY, SCOPE_A).unwrap();
+        assert!(durable_client_request_status(&store, KEY, SCOPE_B, None).is_none());
+        let status = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
         assert_eq!(status["found"], true, "{status}");
         assert_eq!(status["request_id"], "req_a_1", "{status}");
-        let by_id = durable_client_request_status(&store, "req_a_1", SCOPE_A).unwrap();
+        let by_id = durable_client_request_status(&store, "req_a_1", SCOPE_A, None).unwrap();
         assert_eq!(by_id["found"], true, "{by_id}");
-        assert!(durable_client_request_status(&store, "req_a_1", SCOPE_B).is_none());
+        assert!(durable_client_request_status(&store, "req_a_1", SCOPE_B, None).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1316,7 +1372,7 @@ mod tests {
             "receipt whitelist must not retain body fields: {replay}"
         );
         // request.status surfaces the same receipt for inspection.
-        let status = durable_client_request_status(&store, KEY, SCOPE_A).unwrap();
+        let status = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
         assert_eq!(status["receipt"]["task_id"], "task_1", "{status}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1419,10 +1475,39 @@ mod tests {
             expect_execute(begin(&mut store, &ids, scope, &params, false, 1_000));
             durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
         }
-        let status_a = durable_client_request_status(&store, KEY, SCOPE_A).unwrap();
+        let status_a = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
         assert_eq!(status_a["request_id"], "req_call_1", "{status_a}");
-        let status_b = durable_client_request_status(&store, KEY, SCOPE_B).unwrap();
+        let status_b = durable_client_request_status(&store, KEY, SCOPE_B, None).unwrap();
         assert_eq!(status_b["request_id"], "req_write_1", "{status_b}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given the same key settled under two write-tool kinds in
+    /// one scope | When request.status runs without a tool hint | Then it
+    /// reports the ambiguity instead of answering for whichever row is newer,
+    /// and a `tool` hint selects the intended record.
+    #[test]
+    fn user_status_given_key_shared_by_two_tools_then_ambiguous_until_tool_hint() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        for (kind, request_id) in [
+            (HERDR_FS_WRITE_CLIENT_REQUEST_KIND, "req_w_1"),
+            (HERDR_FS_PATCH_CLIENT_REQUEST_KIND, "req_p_1"),
+        ] {
+            let ids = client_request_ids(kind, SCOPE_A, METHOD, &params, KEY, request_id, false);
+            expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        let status = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
+        assert_eq!(status["ambiguous"], true, "{status}");
+        assert_eq!(status["matches"].as_array().unwrap().len(), 2, "{status}");
+        let write =
+            durable_client_request_status(&store, KEY, SCOPE_A, Some("herdr_fs_write")).unwrap();
+        assert_eq!(write["request_id"], "req_w_1", "{write}");
+        let patch =
+            durable_client_request_status(&store, KEY, SCOPE_A, Some("herdr_fs_patch")).unwrap();
+        assert_eq!(patch["request_id"], "req_p_1", "{patch}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

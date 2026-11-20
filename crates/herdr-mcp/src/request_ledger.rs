@@ -112,17 +112,13 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
         return RequestLedgerState::Applied;
     }
     match result.get("delivery_state").and_then(Value::as_str) {
-        // A spawn dispatch that already created external resources (worktree,
-        // pane, agent) before stopping carries a resumable checkpoint: the
-        // "not_delivered" envelope then means "the prompt text was not
-        // delivered", not "nothing happened" — keep the durable receipt so a
-        // caller can inspect instead of a blind retry erasing evidence.
-        Some("not_delivered")
-            if result.get("resumable").and_then(Value::as_bool) == Some(true)
-                && result.get("spawn").is_some() =>
-        {
-            return RequestLedgerState::Unknown;
-        }
+        // `not_delivered` releases the key even when the result carries a
+        // resumable spawn checkpoint: retrying then re-enters herdr_prompt,
+        // where the (bridged or caller) `idempotency_key` reaches the
+        // DispatchReservation::Known path and resumes the pane/agent that the
+        // first attempt created — dedupe and same-receipt replay are handled
+        // by the prompt registry, so a durable tombstone here would only
+        // block the designed continuation.
         Some("not_delivered") => return RequestLedgerState::NotDelivered,
         Some("delivery_unknown") => return RequestLedgerState::Unknown,
         _ => {}
@@ -587,7 +583,9 @@ mod tests {
             RequestLedgerState::Rejected
         );
         // A spawn checkpoint carries not_delivered *and* evidence of created
-        // external resources: keep the receipt (unknown), never release.
+        // external resources: still releases — the prompt layer resumes the
+        // spawned pane/agent by idempotency key on the same-key retry, so a
+        // durable tombstone would only block the designed resume path.
         assert_eq!(
             classify_result_state(&json!({
                 "ok": false,
@@ -595,7 +593,7 @@ mod tests {
                 "resumable": true,
                 "spawn": {"pane_id": "w1:p1"}
             })),
-            RequestLedgerState::Unknown
+            RequestLedgerState::NotDelivered
         );
         // A not_delivered refusal with no resource evidence still releases.
         assert_eq!(

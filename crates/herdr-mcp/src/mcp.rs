@@ -1329,7 +1329,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // declare client_request_id inside params and are unaffected.)
     if let Some(params) = herdr_call_params.as_ref()
         && params.get("client_request_id").is_some()
-        && client_request_tool_kind(
+        && crate::durable_request_ledger::client_request_tool_kind(
             arguments
                 .get("method")
                 .and_then(Value::as_str)
@@ -1452,7 +1452,7 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     // arrives undeclared inside `params.arguments` (option (b), no epoch/hash
     // change). `herdr_prompt` additionally keeps its native `idempotency_key`;
     // D-1 means one call never holds both idempotency slots.
-    if let Some(kind) = client_request_tool_kind(name) {
+    if let Some(kind) = crate::durable_request_ledger::client_request_tool_kind(name) {
         if name == "herdr_prompt"
             && arguments.get("client_request_id").is_some()
             && arguments.get("idempotency_key").is_some()
@@ -1486,19 +1486,6 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
         }
     }
     dispatch_admitted_tool(name, arguments, herdr_call_params, context, route)
-}
-
-/// #1094 P0-a: durable-ledger kinds for the first-class write tools that
-/// accept `client_request_id` in `params.arguments`. Every other tool keeps
-/// its pre-existing dedupe surface.
-fn client_request_tool_kind(name: &str) -> Option<&'static str> {
-    match name {
-        "herdr_fs_write" => Some(crate::durable_request_ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
-        "herdr_fs_edit" => Some(crate::durable_request_ledger::HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
-        "herdr_fs_patch" => Some(crate::durable_request_ledger::HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
-        "herdr_prompt" => Some(crate::durable_request_ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND),
-        _ => None,
-    }
 }
 
 /// `client_request_id` on a first-class write tool goes through the same
@@ -1934,7 +1921,10 @@ fn request_status_call(context: &RuntimeContext<'_>, params: &Value) -> Value {
             if let Some(scope) =
                 crate::durable_request_ledger::durable_caller_scope(context, &store)
                 && let Some(status) = crate::durable_request_ledger::durable_client_request_status(
-                    &store, key, &scope,
+                    &store,
+                    key,
+                    &scope,
+                    params.get("tool").and_then(Value::as_str),
                 )
             {
                 return status;
@@ -16446,7 +16436,7 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
                 "code": "broker_failed",
                 "message": message,
             });
-            if matches!(op, "fs_write" | "fs_edit" | "fs_patch" | "git") {
+            if matches!(op, "fs_write" | "fs_edit" | "fs_patch") {
                 value["delivery_state"] = json!("delivery_unknown");
             }
             value
@@ -34732,13 +34722,16 @@ mod durable_client_request_tests {
     }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
+        // Keep the leaf short: macOS temp roots are already long and a Unix
+        // socket path must fit SUN_LEN (~104 chars).
         std::env::temp_dir().join(format!(
-            "herdr-durable-e2e-{tag}-{}-{}",
+            "d-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
+                % 1_000_000_000u128
         ))
     }
 
@@ -35436,10 +35429,18 @@ mod durable_client_request_tests {
             ("herdr_fs_patch", ledger::HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
             ("herdr_prompt", ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND),
         ] {
-            assert_eq!(client_request_tool_kind(tool), Some(kind), "{tool}");
+            assert_eq!(
+                crate::durable_request_ledger::client_request_tool_kind(tool),
+                Some(kind),
+                "{tool}"
+            );
         }
         for non_write in ["herdr_fs_read", "herdr_call", "herdr_git", "herdr_inspect"] {
-            assert_eq!(client_request_tool_kind(non_write), None, "{non_write}");
+            assert_eq!(
+                crate::durable_request_ledger::client_request_tool_kind(non_write),
+                None,
+                "{non_write}"
+            );
         }
     }
 
