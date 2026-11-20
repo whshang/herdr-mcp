@@ -18,7 +18,7 @@ origin. See [`../../docs/i18n/en/cloudflare-edge-deployment.md`](../../docs/i18n
 
 | Plan phase | Edge state |
 | --- | --- |
-| Phase 1 relay protocol / contract | Complete: canonical Relay v1 plus the then-current frozen epoch-2 18-tool public contract; epoch 1 remains a legacy compatibility baseline. |
+| Phase 1 relay protocol / contract | Complete: canonical Relay v1 plus the then-current frozen epoch-2 18-tool public contract. The Edge runtime window accepts epochs 6, 5, 4 and 2, so a hello advertising the retired epoch-1 identity is refused with `contract_mismatch`; the remaining epoch-1 compatibility lives in Rust Link rollback handling, not in this Edge. |
 | Phase 2 Rust Link | Implemented in `crates/herdr-mcp/src/link/**`; the workstation runtime connects outbound over authenticated WSS. |
 | Phase 3 Cloudflare Edge | Implemented: Worker/DO/Hibernation WSS, MCP transport, correlation, offline semantics, payload bounds and redacted logging. |
 | Phase 4 OAuth Edge | Implemented and migrated for the production issuer, including DCR, PKCE, refresh rotation and signing-key continuity. |
@@ -45,7 +45,7 @@ edge/cloudflare/
 │   ├── canonical-imports.ts   ← canonical v1 type/validation port (isolated build)
 │   ├── env.ts                ← typed bindings
 │   ├── version.ts            ← Edge identity / env-resolved public contract epoch + hash
-│   ├── contracts/            ← frozen epoch1–epoch7 catalogs + public contract pointer
+│   ├── contracts/            ← frozen epoch2–epoch8 catalogs + runtime window + public contract pointer
 │   ├── limits.ts             ← capacities, timeouts, frame budgets, op classification
 │   ├── errors.ts             ← error taxonomy + retry/ambiguity classification
 │   ├── pending.ts            ← bounded pending-request registry + request ids

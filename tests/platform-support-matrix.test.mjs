@@ -27,7 +27,6 @@ test("published support matrix tracks the live protocol compatibility identities
   const en = read("docs/i18n/en/platform-support-matrix.md");
   const zh = read("docs/i18n/zh-CN/platform-support-matrix.md");
   const handler = read("edge/cloudflare/src/mcp-handler.ts");
-  const epoch1 = read("edge/cloudflare/src/contracts/epoch1.ts");
   const epoch2 = read("edge/cloudflare/src/contracts/epoch2.ts");
   const epoch3 = read("edge/cloudflare/src/contracts/epoch3.ts");  const runtime = read("edge/cloudflare/src/contracts/runtime.ts");
   const relay = read("edge/cloudflare/src/canonical-imports.ts");
@@ -57,10 +56,6 @@ test("published support matrix tracks the live protocol compatibility identities
       assert.match(doc, new RegExp(`\\*\\*${count}\\*\\*`));
     }
   }
-  // The frozen epoch-1 catalog still exists but is no longer an accepted runtime baseline.
-  assert.equal(numberField(epoch1, "contract_epoch"), 1);
-  assert.equal(numberField(epoch1, "tool_count"), 17);
-
   // The accepted runtime window is epoch 6 plus the frozen epoch-5, epoch-4,
   // and epoch-2 identities.
   assert.match(
