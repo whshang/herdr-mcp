@@ -98,7 +98,20 @@ pub fn run(snapshot: &Value, args: &Value) -> Value {
     };
     let mut output = Map::new();
     output.insert("ok".to_owned(), json!(result.exit_code == 0));
+    // Callers that asked for a directory alias still see that alias in `root`.
+    // `repo_identity` is the validated canonical repository, so two aliases of
+    // one protected checkout share one cache identity. The broker child is the
+    // process allowed to resolve it; the parent must not canonicalize the
+    // protected path itself.
     output.insert("root".to_owned(), json!(managed.root.to_string_lossy()));
+    // Canonicalize the validated Git root, not the caller path. A pane cwd
+    // inside the repository would otherwise publish that subdirectory as the
+    // repository identity and the parent would route it as a new project root.
+    let repo_identity = std::fs::canonicalize(&managed.root).unwrap_or(managed.root.clone());
+    output.insert(
+        "repo_identity".to_owned(),
+        json!(repo_identity.to_string_lossy()),
+    );
     output.insert("action".to_owned(), json!(action));
     output.insert("exit_code".to_owned(), json!(result.exit_code));
     output.insert("truncated".to_owned(), json!(result.truncated));
@@ -1757,5 +1770,53 @@ aaa1111 (api) preserve this prefix
         assert!(paths.contains(&"outside.txt"));
         assert!(!paths.contains(&".env"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_operator_receives_one_canonical_repo_identity_for_two_aliases() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "herdr-mcp-git-alias-identity-{}-{unique}",
+            std::process::id()
+        ));
+        let real = parent.join("real");
+        fs::create_dir_all(&real).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let alias_a = parent.join("alias-a");
+        let alias_b = parent.join("alias-b");
+        symlink(&real, &alias_a).unwrap();
+        symlink(&real, &alias_b).unwrap();
+        for alias in [&alias_a, &alias_b] {
+            let snapshot = json!({
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": alias}],
+                "agents": []
+            });
+            let result = run(
+                &snapshot,
+                &json!({"root": alias, "action": "status", "max_bytes": 4096}),
+            );
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(
+                PathBuf::from(result["repo_identity"].as_str().unwrap()),
+                fs::canonicalize(&real).unwrap(),
+                "{result}"
+            );
+            assert_ne!(result["repo_identity"], result["root"]);
+        }
+        fs::remove_dir_all(parent).unwrap();
     }
 }

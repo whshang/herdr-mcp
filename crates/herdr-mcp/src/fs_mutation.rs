@@ -87,6 +87,14 @@ pub fn edit(snapshot: &Value, args: &Value) -> Value {
             message,
         );
     }
+    // `edit` writes through `atomic_write` directly, not `write_bytes`. A
+    // successful replace still dirties the managed repository, so the next
+    // inspect must not reuse the pre-edit git-status cache.
+    // Use the caller-facing path. `target.real` is canonicalized and can miss
+    // a cache key that still uses the snapshot root (for example `/var` versus
+    // `/private/var` on macOS).
+    projects::invalidate_git_status_cache_for_path(&target.resolved);
+    projects::invalidate_git_status_cache_for_path(&target.real);
     success_with_working(
         json!({
             "ok": true,
@@ -189,6 +197,8 @@ pub(crate) fn write_bytes(
         );
     }
     projects::invalidate_git_status_cache(&target.root);
+    projects::invalidate_git_status_cache_for_path(&target.resolved);
+    projects::invalidate_git_status_cache_for_path(&target.real);
     success_with_working(
         json!({
             "ok": true,
@@ -416,5 +426,210 @@ mod tests {
         assert!(project.dirty);
         assert_eq!(project.changed_files, 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_invalidates_cache_and_next_inspect_observes_git_status() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let file = root.join("tracked.txt");
+
+        projects::invalidate_git_status_cache(&root);
+        projects::reset_git_status_probe_count(&root);
+        let clean = projects::derive(&snap);
+        assert!(!clean.projects[&root].dirty);
+        assert_eq!(
+            projects::git_status_probe_count(&root),
+            1,
+            "the clean inspect must probe once"
+        );
+        let cached = projects::derive(&snap);
+        assert!(!cached.projects[&root].dirty);
+        assert_eq!(
+            projects::git_status_probe_count(&root),
+            1,
+            "the pre-edit inspect must hit the live cache, not expire across the 250ms TTL"
+        );
+
+        let edited = edit(
+            &snap,
+            &json!({"path": file, "old_string": "before", "new_string": "after"}),
+        );
+        assert_eq!(edited["ok"], true, "{edited}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after\n");
+
+        // No manual invalidate: the successful edit must drop the cached
+        // status for the repository that contains the edited file.
+        let refreshed = projects::derive(&snap);
+        let project = &refreshed.projects[&root];
+        assert!(project.dirty, "{project:?}");
+        assert!(project.changed_files >= 1, "{project:?}");
+        assert_eq!(
+            projects::git_status_probe_count(&root),
+            2,
+            "invalidation must force a new probe instead of reusing the clean entry"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_edit_keeps_the_git_status_cache_and_probe_count() {
+        let root = repo();
+        let snap = snapshot(&root);
+        let file = root.join("tracked.txt");
+
+        projects::invalidate_git_status_cache(&root);
+        projects::reset_git_status_probe_count(&root);
+        let clean = projects::derive(&snap);
+        assert!(!clean.projects[&root].dirty);
+        let probes_after_prime = projects::git_status_probe_count(&root);
+        assert!(probes_after_prime >= 1);
+        assert!(!projects::derive(&snap).projects[&root].dirty);
+        assert_eq!(
+            projects::git_status_probe_count(&root),
+            probes_after_prime,
+            "the second inspect must hit the live cache"
+        );
+
+        let missing = edit(
+            &snap,
+            &json!({"path": file, "old_string": "not-in-file", "new_string": "after"}),
+        );
+        assert_eq!(missing["reason"], "old_string_not_found");
+        assert_eq!(
+            projects::git_status_probe_count(&root),
+            probes_after_prime,
+            "a rejected edit must not drop the cached clean status"
+        );
+        assert!(!projects::derive(&snap).projects[&root].dirty);
+        assert_eq!(projects::git_status_probe_count(&root), probes_after_prime);
+
+        fs::write(&file, "dirty\n").unwrap();
+        projects::invalidate_git_status_cache(&root);
+        projects::reset_git_status_probe_count(&root);
+        let dirty = projects::derive(&snap);
+        assert!(dirty.projects[&root].dirty);
+        let probes_after_dirty = projects::git_status_probe_count(&root);
+        assert!(probes_after_dirty >= 1);
+
+        let blocked = edit(
+            &snap,
+            &json!({"path": file, "old_string": "dirty", "new_string": "again"}),
+        );
+        assert_eq!(blocked["reason"], "file_dirty_confirmation_required");
+        assert_eq!(
+            projects::git_status_probe_count(&root),
+            probes_after_dirty,
+            "a dirty-confirmation refusal must not probe or invalidate again"
+        );
+        assert!(projects::derive(&snap).projects[&root].dirty);
+        assert_eq!(projects::git_status_probe_count(&root), probes_after_dirty);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_through_one_symlink_invalidates_the_other_alias_cache() {
+        use std::os::unix::fs::symlink;
+
+        let parent = std::env::temp_dir().join(format!(
+            "herdr-mcp-fs-alias-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = parent.join("real");
+        fs::create_dir_all(&real).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(real.join("tracked.txt"), "before\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked.txt"])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Herdr Test",
+                    "-c",
+                    "user.email=herdr@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "baseline"
+                ])
+                .current_dir(&real)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let alias_a = parent.join("alias-a");
+        let alias_b = parent.join("alias-b");
+        symlink(&real, &alias_a).unwrap();
+        symlink(&real, &alias_b).unwrap();
+
+        let snap_b = snapshot(&alias_b);
+        projects::invalidate_git_status_cache(&alias_b);
+        projects::invalidate_git_status_cache(&real);
+        projects::reset_git_status_probe_count(&alias_b);
+        projects::reset_git_status_probe_count(&real);
+        let clean = projects::derive(&snap_b);
+        let clean_root = clean
+            .projects
+            .iter()
+            .find(|(_, project)| project.vcs == Some("git"))
+            .map(|(root, _)| root.clone())
+            .expect("alias B resolves to a git project");
+        assert!(!clean.projects[&clean_root].dirty, "{clean:?}");
+        let probes_before = projects::git_status_probe_count(&clean_root)
+            + projects::git_status_probe_count(&alias_b)
+            + projects::git_status_probe_count(&real);
+        assert!(probes_before >= 1, "{clean:?}");
+        assert!(!projects::derive(&snap_b).projects[&clean_root].dirty);
+        let probes_cached = projects::git_status_probe_count(&clean_root)
+            + projects::git_status_probe_count(&alias_b)
+            + projects::git_status_probe_count(&real);
+        assert_eq!(
+            probes_cached, probes_before,
+            "alias B must be served from cache before the edit"
+        );
+
+        let snap_a = snapshot(&alias_a);
+        let edited = edit(
+            &snap_a,
+            &json!({
+                "path": alias_a.join("tracked.txt"),
+                "old_string": "before",
+                "new_string": "after"
+            }),
+        );
+        assert_eq!(edited["ok"], true, "{edited}");
+
+        let refreshed = projects::derive(&snap_b);
+        assert!(
+            refreshed.projects[&clean_root].dirty,
+            "alias B must not keep the clean cache after an edit through alias A: {refreshed:?}"
+        );
+        let probes_after = projects::git_status_probe_count(&clean_root)
+            + projects::git_status_probe_count(&alias_b)
+            + projects::git_status_probe_count(&real);
+        assert!(
+            probes_after > probes_cached,
+            "alias B must probe again inside the TTL"
+        );
+        fs::remove_dir_all(parent).unwrap();
     }
 }
