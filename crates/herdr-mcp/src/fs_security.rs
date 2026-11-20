@@ -151,20 +151,20 @@ fn git_marker_probe(snapshot: &Value, git_root: &Path) -> GitMarkerProbe {
     }
 }
 
-/// Ask the authorized stable broker to list the protected root and decide
-/// marker presence from the returned entries. The rotating runtime never
-/// probes the protected folder itself, so a broker that is not installed,
-/// fails, or answers with a truncated listing that never reached `.git` is
-/// [`GitMarkerProbe::Inconclusive`] — the write stays fail-closed without the
-/// runtime becoming the TCC requester.
+/// Ask the authorized stable broker to read the marker path itself and
+/// decide presence from the `fs_read` result contract. `fs_list` cannot be
+/// used here: its walker deliberately skips `.git` entries, so a listing can
+/// never observe the marker. A plain clone's `.git` directory answers
+/// `not_a_file`, a linked worktree's `.git` file answers `ok`, a missing
+/// marker answers `stat_failed` carrying errno `ENOENT` (`os_error`), and
+/// every other failure — permission, read error, broker unavailable, or an
+/// older broker that does not emit `os_error` — is
+/// [`GitMarkerProbe::Inconclusive`] so the write stays fail-closed without
+/// the runtime becoming the TCC requester.
 #[cfg(target_os = "macos")]
 fn protected_git_marker_probe(snapshot: &Value, git_root: &Path) -> GitMarkerProbe {
-    match crate::tcc_broker::fs_list_via_stable_broker(
-        snapshot,
-        git_root,
-        crate::fs_tools::LIST_MAX_ENTRIES,
-    ) {
-        Ok(result) => git_marker_from_root_listing(&result),
+    match crate::tcc_broker::fs_read_via_stable_broker(snapshot, &git_root.join(".git"), 64) {
+        Ok(result) => git_marker_from_marker_read(&result),
         Err(_) => GitMarkerProbe::Inconclusive,
     }
 }
@@ -177,28 +177,24 @@ fn protected_git_marker_probe(_snapshot: &Value, _git_root: &Path) -> GitMarkerP
     GitMarkerProbe::Inconclusive
 }
 
-/// Decide marker presence from a broker `fs_list` result. Covers both `.git`
-/// spellings (plain-clone directory and linked-worktree file) because both
-/// appear as entries of the root listing. Only a complete `ok` listing that
-/// lacks `.git` is [`GitMarkerProbe::Gone`]; a failure payload or a truncated
-/// listing that may not have reached the marker is Inconclusive.
+/// Decide marker presence from a broker `fs_read` of `<root>/.git`. Covers
+/// both `.git` spellings: a successful read is the linked-worktree file and
+/// `not_a_file` is the plain-clone directory. Only `stat_failed` with errno
+/// `ENOENT` proves the marker is gone — a missing `os_error` field (broker
+/// older than the `io_error_to_fs_value` addition) or any other failure is
+/// Inconclusive.
 #[cfg(any(target_os = "macos", test))]
-fn git_marker_from_root_listing(result: &Value) -> GitMarkerProbe {
-    if result.get("ok").and_then(Value::as_bool) != Some(true) {
-        return GitMarkerProbe::Inconclusive;
+fn git_marker_from_marker_read(result: &Value) -> GitMarkerProbe {
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        return GitMarkerProbe::Present;
     }
-    let Some(entries) = result.get("entries").and_then(Value::as_array) else {
-        return GitMarkerProbe::Inconclusive;
-    };
-    let seen = entries
-        .iter()
-        .any(|entry| entry.get("name").and_then(Value::as_str) == Some(".git"));
-    if seen {
-        GitMarkerProbe::Present
-    } else if result.get("truncated").and_then(Value::as_bool) == Some(true) {
-        GitMarkerProbe::Inconclusive
-    } else {
-        GitMarkerProbe::Gone
+    match result.get("reason").and_then(Value::as_str) {
+        Some("not_a_file") => GitMarkerProbe::Present,
+        Some("stat_failed") => match result.get("os_error").and_then(Value::as_i64) {
+            Some(code) if code == libc::ENOENT as i64 => GitMarkerProbe::Gone,
+            _ => GitMarkerProbe::Inconclusive,
+        },
+        _ => GitMarkerProbe::Inconclusive,
     }
 }
 
@@ -247,33 +243,40 @@ fn operational_root_eligible(project: &projects::ProjectInfo, home: Option<&Path
     // "canonical existing directory": the live cwd must resolve to a real
     // directory, and that real directory must itself survive the HOME-ancestry
     // and secret-path guards, so a symlinked cwd cannot escape them.
-    let root_real = match std::fs::canonicalize(root) {
-        Ok(real) => {
-            if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
-                return false;
+    // The rotating runtime is deliberately not the macOS TCC client:
+    // Documents/Desktop/Downloads roots are classified before any in-process
+    // canonicalize, and their existence/symlink resolution is verified by the
+    // stable broker (`herdr_fs_*`) or the delegated utility pane
+    // (`herdr_exec`) — the same route the pre-existing protected-root command
+    // preflight already uses. Every other unresolvable path is refused.
+    let root_real = if tcc_delegated_root(home, root) {
+        None
+    } else {
+        match std::fs::canonicalize(root) {
+            Ok(real) => {
+                if !real.is_dir() || guard.rejects(&real) || denied_secret_path(&real) {
+                    return false;
+                }
+                Some(real)
             }
-            Some(real)
+            Err(_) => return false,
         }
-        // The rotating runtime is deliberately not the macOS TCC client, so
-        // Documents/Desktop/Downloads existence, symlink resolution, and real
-        // paths are verified by the stable broker (`herdr_fs_*`) or the
-        // delegated utility pane (`herdr_exec`) instead — the same route the
-        // pre-existing protected-root command preflight already uses. Every
-        // other unresolvable path is refused.
-        Err(_) if tcc_delegated_root(home, root) => None,
-        Err(_) => return false,
     };
     // Exactly proven by live cwd: every cwd attached to this project resolves
     // to this root's real directory (or, when the real path is delegated to
     // TCC, must be this exact cwd). A sibling outside the group therefore
-    // cannot borrow this root's authority.
-    project
-        .cwds
-        .iter()
-        .all(|cwd| match (&root_real, std::fs::canonicalize(cwd)) {
-            (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
-            _ => cwd == root,
-        })
+    // cannot borrow this root's authority. A delegated-root cwd is likewise
+    // never probed in-process; only an exact match carries authority.
+    project.cwds.iter().all(|cwd| {
+        if tcc_delegated_root(home, cwd) {
+            cwd == root
+        } else {
+            match (&root_real, std::fs::canonicalize(cwd)) {
+                (Some(root_real), Ok(cwd_real)) => &cwd_real == root_real,
+                _ => cwd == root,
+            }
+        }
+    })
 }
 
 /// macOS Documents/Desktop/Downloads roots are executed/read through the TCC
@@ -1531,48 +1534,44 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Given a broker fs_list answer for a protected Git root
+    /// Given a broker fs_read answer for a protected root's `.git` marker
     /// When the write boundary decides marker presence
-    /// Then only a complete `ok` listing without `.git` is "gone": a broker
-    /// failure payload, a truncated listing, or missing entries are
-    /// inconclusive and never misreport a real repo as stripped of its VCS
-    /// marker.
+    /// Then both spellings are "present" (worktree file `ok`, clone
+    /// directory `not_a_file`), only `stat_failed` carrying errno ENOENT is
+    /// "gone", and every other failure — including an older broker that
+    /// does not emit `os_error` — is inconclusive so a real repo is never
+    /// misreported as stripped of its VCS marker.
     #[test]
-    fn git_marker_from_root_listing_keeps_failures_inconclusive() {
+    fn git_marker_from_marker_read_covers_both_spellings_and_failures() {
+        // Linked-worktree marker: `.git` is a file, readable.
         assert_eq!(
-            git_marker_from_root_listing(&json!({
-                "ok": true,
-                "entries": [{"name": ".git"}, {"name": "src"}],
-            })),
+            git_marker_from_marker_read(&json!({"ok": true, "content": "gitdir: /x/.git/wt"})),
             GitMarkerProbe::Present
         );
+        // Plain-clone marker: `.git` is a directory.
         assert_eq!(
-            git_marker_from_root_listing(&json!({
-                "ok": true,
-                "entries": [{"name": "src"}],
-                "truncated": false,
+            git_marker_from_marker_read(&json!({"ok": false, "reason": "not_a_file"})),
+            GitMarkerProbe::Present
+        );
+        // Marker removed: stat reports ENOENT.
+        assert_eq!(
+            git_marker_from_marker_read(&json!({
+                "ok": false, "reason": "stat_failed", "os_error": 2,
             })),
             GitMarkerProbe::Gone
         );
-        // The marker may sort past the visible window; absence under
-        // truncation cannot be told from removal.
-        assert_eq!(
-            git_marker_from_root_listing(&json!({
-                "ok": true,
-                "entries": [{"name": "src"}],
-                "truncated": true,
-            })),
-            GitMarkerProbe::Inconclusive
-        );
-        // Broker-side refusal/timeout/permission payloads are not evidence
-        // of a missing marker.
+        // stat_failed without the structured errno (older broker) or with a
+        // different errno is not proof of removal.
         for failure in [
-            json!({"ok": false, "reason": "permission_denied"}),
-            json!({"ok": true, "entries": "not-an-array"}),
+            json!({"ok": false, "reason": "stat_failed"}),
+            json!({"ok": false, "reason": "stat_failed", "os_error": 5}),
+            json!({"ok": false, "reason": "stat_failed", "os_error": 20}),
+            json!({"ok": false, "reason": "read_failed", "os_error": 2}),
+            json!({"ok": false, "reason": "macos_tcc_access_blocked"}),
             json!({}),
         ] {
             assert_eq!(
-                git_marker_from_root_listing(&failure),
+                git_marker_from_marker_read(&failure),
                 GitMarkerProbe::Inconclusive,
                 "{failure}"
             );
