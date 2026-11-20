@@ -81,6 +81,14 @@ pub fn is_operational_root(topology: &ProjectTopology, root: &Path) -> bool {
 /// for a plain clone, a file for a linked worktree) has been removed or
 /// renamed inside the cache TTL, the root is effectively vcs-less and the
 /// mutation is refused instead of trusting the stale classification.
+///
+/// The re-verification distinguishes "marker gone" from "probe failed":
+/// macOS privacy-protected roots (Documents/Desktop/Downloads) are probed
+/// through the shared bounded consent slot — never a bare stat that could
+/// park the control path behind a TCC prompt — and a permission error or
+/// probe timeout is reported as `git_root_vcs_unverifiable`, not folded
+/// into `git_root_vcs_disappeared` (a real repo would otherwise be
+/// misreported as stripped of its VCS marker).
 pub fn reject_operational_root_mutation(topology: &ProjectTopology, root: &Path) -> Option<Value> {
     if is_operational_root(topology, root) {
         return Some(json!({
@@ -90,19 +98,64 @@ pub fn reject_operational_root_mutation(topology: &ProjectTopology, root: &Path)
             "hint": "this vcs-less operational root has no Git dirty state to confirm against; write inside a Git-backed project root, or restrict this change to reading it",
         }));
     }
-    let git_backed = topology
+    let probe = topology
         .projects
         .get(root)
         .and_then(root_kind_of)
-        .is_some_and(|(git_root, kind)| kind == RootKind::Git && !git_root.join(".git").exists());
-    git_backed.then(|| {
-        json!({
+        .and_then(|(git_root, kind)| (kind == RootKind::Git).then(|| git_marker_probe(&git_root)));
+    match probe {
+        Some(GitMarkerProbe::Gone) => Some(json!({
             "ok": false,
             "reason": "git_root_vcs_disappeared",
             "root": root.to_string_lossy(),
             "hint": "this root was Git-managed when the routing topology was derived but .git is no longer present; write confirmation cannot be trusted — retry after refreshing herdr_inspect",
-        })
-    })
+        })),
+        Some(GitMarkerProbe::Inconclusive) => Some(json!({
+            "ok": false,
+            "reason": "git_root_vcs_unverifiable",
+            "root": root.to_string_lossy(),
+            "hint": "the .git marker could not be verified (permission denied, consent prompt pending, or probe timeout); write confirmation cannot be trusted — retry after refreshing herdr_inspect",
+        })),
+        Some(GitMarkerProbe::Present) | None => None,
+    }
+}
+
+enum GitMarkerProbe {
+    Present,
+    /// Marker definitively absent — the cached Git classification is stale.
+    Gone,
+    /// Probe could not decide (permission denied, consent prompt, I/O
+    /// error). Must never be reported as "gone".
+    Inconclusive,
+}
+
+fn git_marker_probe(git_root: &Path) -> GitMarkerProbe {
+    let marker = git_root.join(".git");
+    if crate::macos_permissions::runtime_must_not_probe(&marker) {
+        // The broker child is the authorized client for protected folders;
+        // this runtime only takes a bounded, slot-shared real-path answer.
+        #[cfg(any(target_os = "macos", test))]
+        {
+            match crate::macos_permissions::bounded_real_path(&marker) {
+                crate::macos_permissions::BoundedRealPath::Resolved(_) => GitMarkerProbe::Present,
+                crate::macos_permissions::BoundedRealPath::NotFound => GitMarkerProbe::Gone,
+                crate::macos_permissions::BoundedRealPath::Failed
+                | crate::macos_permissions::BoundedRealPath::TimedOut => {
+                    GitMarkerProbe::Inconclusive
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", test)))]
+        {
+            GitMarkerProbe::Inconclusive
+        }
+    } else {
+        match marker.try_exists() {
+            Ok(true) => GitMarkerProbe::Present,
+            Ok(false) => GitMarkerProbe::Gone,
+            Err(_) => GitMarkerProbe::Inconclusive,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1353,6 +1406,27 @@ mod tests {
         // A linked-worktree style .git file also counts as a VCS marker.
         fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap();
         assert!(reject_operational_root_mutation(&topology, &root).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_marker_probe_failure_is_reported_as_unverifiable_not_disappeared() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = repo();
+        let snap = snapshot(&root);
+        let topology = projects::derive_routing(&snap);
+        assert!(reject_operational_root_mutation(&topology, &root).is_none());
+
+        // stat(<root>/.git) fails with EACCES when the root loses search
+        // permission — a probe failure, not a missing marker.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = reject_operational_root_mutation(&topology, &root)
+            .expect("an unverifiable .git probe must still fail closed");
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["reason"], "git_root_vcs_unverifiable");
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
