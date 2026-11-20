@@ -1435,6 +1435,7 @@ mod tests {
         invalidate_git_status_cache_matching(&unrelated, None);
         handle.join().unwrap();
         set_git_status_probe_delay(&gone, None);
+        assert_eq!(git_status_probe_count(&gone), 1, "exactly one probe ran");
         assert_eq!(
             git_status_cache_entry_count_for(&gone_probe),
             0,
