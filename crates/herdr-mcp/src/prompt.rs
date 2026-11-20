@@ -1917,9 +1917,15 @@ impl PromptRegistry {
         // pane the live snapshot no longer reports are dropped from the lanes:
         // a destroyed workspace's history must not keep producing
         // `repair_budget_exhausted` / `unsuccessful_streak` for the current
-        // orchestration. Liveness is only judged when the snapshot lists the
-        // collection at all; an absent list means "unknown", never "closed".
-        let live = self.inner.cache.as_ref().map(|cache| cache.snapshot());
+        // orchestration. Liveness is only judged from a fresh snapshot, and
+        // only when that snapshot lists the collection at all. A stale or
+        // disconnected cache, or an absent list, means "unknown", never
+        // "closed", so a new pane missing from an old snapshot is not dropped.
+        let live = self
+            .inner
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.fresh_snapshot());
         let live_workspaces = live
             .as_ref()
             .and_then(|snapshot| snapshot.get("workspaces"))
@@ -4507,6 +4513,18 @@ pub fn task_call_with_parent_session(
             if let Some(task_ids) = params.get("task_ids") {
                 if params.get("task_id").is_some() {
                     return invalid("choose task_id or task_ids, not both");
+                }
+                // Scope selectors choose the bulk-ack set. Combining them with
+                // an explicit id list used to ack only the ids and drop the
+                // scope. Fail closed instead of guessing which set the caller
+                // meant.
+                if params.get("workspace_id").is_some()
+                    || params.get("target").is_some()
+                    || params.get("before_ms").is_some()
+                {
+                    return invalid(
+                        "task_ids cannot be combined with workspace_id, target, or before_ms",
+                    );
                 }
                 let task_ids = match parse_task_ids(task_ids) {
                     Ok(task_ids) => task_ids,
@@ -12497,6 +12515,73 @@ mod tests {
         remove_escalation_db(&db_path);
     }
 
+    /// user parent | Given a fresh snapshot that omits the pane and workspace
+    /// collections | When the inbox is read | Then those receipts stay in the
+    /// escalation lanes, because an absent collection is unknown rather than
+    /// closed.
+    #[test]
+    fn escalation_keeps_lanes_when_snapshot_collections_are_absent() {
+        let (db_path, mut registry) = escalation_registry("absent-collections");
+        Arc::get_mut(&mut registry.inner).unwrap().cache =
+            Some(Arc::new(EventCache::from_snapshot_for_test(json!({}))));
+        for index in 0..4 {
+            registry
+                .save_task(
+                    &escalation_task(
+                        &format!("dispatch:prompt:unknown-{index}"),
+                        "child",
+                        PromptTaskLifecycle::Completed,
+                        1_000_u64 + index as u64,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let inbox = registry.task_inbox(None, None, None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 1, "{inbox}");
+        assert_eq!(signals[0]["kind"], "repair_budget_exhausted");
+        assert_eq!(signals[0]["target"], "child");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
+    /// user parent | Given a snapshot that would call the lane closed, then a
+    /// disconnected event stream | When the inbox is read | Then the stale
+    /// snapshot is not used and the lane still reports repair_budget_exhausted.
+    #[test]
+    fn escalation_keeps_lanes_when_snapshot_is_stale_or_disconnected() {
+        let (db_path, mut registry) = escalation_registry("stale-snapshot");
+        let mut cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [{"workspace_id": "w2"}],
+            "panes": [{"pane_id": "w2:p1", "workspace_id": "w2"}],
+        }));
+        cache.shutdown();
+        Arc::get_mut(&mut registry.inner).unwrap().cache = Some(Arc::new(cache));
+        for index in 0..4 {
+            registry
+                .save_task(
+                    &escalation_task(
+                        &format!("dispatch:prompt:stale-{index}"),
+                        "child",
+                        PromptTaskLifecycle::Completed,
+                        1_000_u64 + index as u64,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let inbox = registry.task_inbox(None, None, None, false, false, 10);
+        let signals = inbox["escalation"]["signals"].as_array().unwrap();
+        assert_eq!(signals.len(), 1, "{inbox}");
+        assert_eq!(signals[0]["kind"], "repair_budget_exhausted");
+        assert_eq!(signals[0]["target"], "child");
+
+        drop(registry);
+        remove_escalation_db(&db_path);
+    }
+
     /// user orchestrator | Given an unacknowledged terminal task holding a pane
     /// plus an active task on another | When agent.task.status is queried with
     /// `target` alone | Then it answers which task holds the pane, or the most
@@ -13346,6 +13431,63 @@ mod tests {
         assert_eq!(single["task"]["task_id"], "dispatch:prompt:dup");
         assert_eq!(single["task"]["acknowledged"], true);
         assert!(single.get("acked").is_none());
+
+        drop(registry);
+        remove_task_db(&db_path);
+    }
+
+    /// user parent | Given an explicit task_ids batch plus a scope selector |
+    /// When a batch ack is submitted | Then the call is invalid_params and no
+    /// receipt is acknowledged.
+    #[test]
+    fn batch_ack_rejects_task_ids_combined_with_scope() {
+        let (db_path, registry) = task_registry("ack-ids-and-scope");
+        let mut task = escalation_task(
+            "dispatch:prompt:scoped-id",
+            "child",
+            PromptTaskLifecycle::Completed,
+            100,
+        );
+        task.parent_session_ref = Some("session:parent".to_owned());
+        task.workspace_id = Some("w1".to_owned());
+        registry.save_task(&task, None).unwrap();
+
+        for params in [
+            json!({"task_ids": ["dispatch:prompt:scoped-id"], "workspace_id": "w1"}),
+            json!({"task_ids": ["dispatch:prompt:scoped-id"], "target": "child"}),
+            json!({"task_ids": ["dispatch:prompt:scoped-id"], "before_ms": 9_999_999_999_999u64}),
+            json!({
+                "task_ids": ["dispatch:prompt:scoped-id"],
+                "workspace_id": "w1",
+                "target": "child",
+                "before_ms": 1
+            }),
+        ] {
+            let result = task_call_with_parent_session(
+                &registry,
+                AGENT_TASK_ACK_METHOD,
+                &params,
+                Some("session:parent"),
+            );
+            assert_eq!(result["ok"], false, "{params} -> {result}");
+            assert_eq!(result["code"], "invalid_params", "{params} -> {result}");
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("task_ids cannot be combined"),
+                "{params} -> {result}"
+            );
+        }
+        assert_eq!(
+            registry
+                .load_task("dispatch:prompt:scoped-id")
+                .unwrap()
+                .unwrap()
+                .acknowledged_at_ms,
+            None,
+            "a rejected mix of task_ids and scope must not acknowledge anything"
+        );
 
         drop(registry);
         remove_task_db(&db_path);

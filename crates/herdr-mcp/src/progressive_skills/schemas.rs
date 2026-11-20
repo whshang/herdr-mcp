@@ -339,7 +339,7 @@ pub fn local_method_schemas(query: &str) -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": 32,
                         "uniqueItems": true,
-                        "description": "Optional batch alternative to task_id; out-of-scope or unknown ids are reported as not_found."
+                        "description": "Optional batch alternative to task_id; out-of-scope or unknown ids are reported as not_found. Cannot be combined with workspace_id, target, or before_ms; that mix is rejected as invalid_params."
                     },
                     "workspace_id": {
                         "type": "string",
