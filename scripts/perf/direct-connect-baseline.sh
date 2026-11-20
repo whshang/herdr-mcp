@@ -145,13 +145,18 @@ sample() { # $1=url $2=bearer $3=bodyfile $4=seq
     *) echo "FAIL"; return ;;
   esac
   # Full envelope check: JSON-RPC 2.0, echoed request id, result present,
-  # no transport-level error AND no tool-level failure — a fast
-  # `result.isError: true` (auth refusal, tool failure) is not real
-  # latency and must count as FAIL.
+  # no transport-level error AND no tool-level failure. Failures arrive
+  # two ways under the real contract: `result.isError: true`, AND the
+  # `is_error=false` wrapper that serializes `{"ok":false,...}` into
+  # `result.content[].text` — an arg/permission refusal measured as
+  # latency would be bogus, so both count as FAIL. Legitimate results
+  # without an `ok` field pass.
   jq -e --argjson id "$seq" \
     'type == "object" and .jsonrpc == "2.0" and .id == $id
      and .error == null and .result != null
-     and (if (.result|type) == "object" then (.result.isError // false) else false end) == false' \
+     and (if (.result|type) == "object" then (.result.isError // false) else false end) == false
+     and ([.result.content[]? | .text? | select(type == "string")
+           | (fromjson? | select(type == "object" and .ok == false))] | length == 0)' \
     "$bodyfile" >/dev/null 2>&1 || { echo "FAIL"; return; }
   printf '%s\n' "$(awk -v t="$time_total" 'BEGIN{printf "%d", t*1000}')"
 }
