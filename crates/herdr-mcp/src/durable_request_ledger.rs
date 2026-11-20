@@ -109,15 +109,24 @@ pub fn client_request_key_digest(kind: &str, client_request_id: &str) -> String 
 /// keeps its pre-existing dedupe surface.
 pub(crate) fn client_request_tool_kind(name: &str) -> Option<&'static str> {
     match name {
+        "herdr_call" => Some(HERDR_CALL_CLIENT_REQUEST_KIND),
+        "herdr_exec" => Some(HERDR_EXEC_CLIENT_REQUEST_KIND),
         "herdr_fs_write" => Some(HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
         "herdr_fs_edit" => Some(HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
         "herdr_fs_patch" => Some(HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
         "herdr_prompt" => Some(HERDR_PROMPT_CLIENT_REQUEST_KIND),
-        _ => None,
+        // A caller may echo back the kind string a `matches` entry reported.
+        _ => CLIENT_REQUEST_KINDS
+            .iter()
+            .find(|kind| **kind == name)
+            .copied(),
     }
 }
 
 /// The kind embedded in a client-request `op_id` (`op:{kind}:{digest}`).
+/// This relies on kind names never containing `:` — every entry of
+/// `CLIENT_REQUEST_KINDS` is a dotted `*.client_request.v1` identifier, so
+/// `rsplit_once` splits at the digest boundary, not inside the kind.
 fn kind_from_op_id(op_id: &str) -> &str {
     op_id
         .strip_prefix("op:")
@@ -612,6 +621,11 @@ pub enum DurableSettle {
     Released,
     /// `settled/unknown` tombstone with `inspect_before_retry`.
     RecordedUnknown,
+    /// The terminal write itself failed (e.g. the SQLite commit errored):
+    /// the outcome may be committed while the row still reads as pending,
+    /// so a same-key resubmission pins as in-flight until restart decays it.
+    /// Callers must inspect live state before any retry.
+    PersistFailed,
 }
 
 /// Bounded `result_json` for a settled record: status fields, digest and byte
@@ -686,14 +700,19 @@ pub fn durable_settle_result(
                 now_ms,
             );
             let expires_at = read_only.then(|| now_ms + REQUEST_LEDGER_TTL_MS);
-            let _ = store.complete_client_request(
-                &ids.kind,
-                &ids.key_digest,
-                &ids.request_hash,
-                &payload,
-                now_ms,
-                expires_at,
-            );
+            if store
+                .complete_client_request(
+                    &ids.kind,
+                    &ids.key_digest,
+                    &ids.request_hash,
+                    &payload,
+                    now_ms,
+                    expires_at,
+                )
+                .is_err()
+            {
+                return DurableSettle::PersistFailed;
+            }
             DurableSettle::Completed
         }
         crate::request_ledger::RequestLedgerState::Unknown => {
@@ -706,23 +725,35 @@ pub fn durable_settle_result(
                 result,
                 now_ms,
             );
-            let _ = store.complete_client_request_unknown(
-                &ids.kind,
-                &ids.key_digest,
-                &ids.request_hash,
-                &payload,
-                now_ms,
-            );
+            if store
+                .complete_client_request_unknown(
+                    &ids.kind,
+                    &ids.key_digest,
+                    &ids.request_hash,
+                    &payload,
+                    now_ms,
+                )
+                .is_err()
+            {
+                return DurableSettle::PersistFailed;
+            }
             DurableSettle::RecordedUnknown
         }
         crate::request_ledger::RequestLedgerState::Rejected
         | crate::request_ledger::RequestLedgerState::NotDelivered => {
-            let _ = store.release_client_request_reservation(
-                &ids.kind,
-                &ids.key_digest,
-                &ids.request_hash,
-                &ids.op_id,
-            );
+            if store
+                .release_client_request_reservation(
+                    &ids.kind,
+                    &ids.key_digest,
+                    &ids.request_hash,
+                    &ids.op_id,
+                )
+                .is_err()
+            {
+                // A failed release leaves the pending row pinned exactly
+                // like a failed terminal write: callers must inspect.
+                return DurableSettle::PersistFailed;
+            }
             DurableSettle::Released
         }
         crate::request_ledger::RequestLedgerState::Pending => DurableSettle::Released,
@@ -744,22 +775,35 @@ pub fn durable_client_request_status(
     // Select by caller scope first: the same key under a different kind or
     // the same raw id submitted by another caller must not leak a foreign
     // record's state, and two kinds may legitimately hold rows for one key.
-    let kind_filter = tool.and_then(client_request_tool_kind);
-    let matches = CLIENT_REQUEST_KINDS
+    // An explicit `tool` that maps to no ledger kind filters to nothing —
+    // it must not silently widen back to "all kinds".
+    let kind_filter = tool.map(client_request_tool_kind);
+    let kind_matches = |kind: &str| match &kind_filter {
+        None => true,
+        Some(Some(expected)) => kind == *expected,
+        Some(None) => false,
+    };
+    let mut matches = CLIENT_REQUEST_KINDS
         .iter()
-        .filter(|kind| kind_filter.is_none() || Some(**kind) == kind_filter)
+        .filter(|kind| kind_matches(kind))
         .filter_map(|kind| {
             store
                 .client_request_record(kind, &client_request_key_digest(kind, key))
                 .ok()
                 .flatten()
         })
-        .chain(
-            store
-                .client_request_record_for_request_id(key)
-                .ok()
-                .flatten(),
-        )
+        .collect::<Vec<_>>();
+    if let Some(record) = store
+        .client_request_record_for_request_id(key)
+        .ok()
+        .flatten()
+        .filter(|record| kind_matches(kind_from_op_id(&record.op_id)))
+        && !matches.iter().any(|seen| seen.op_id == record.op_id)
+    {
+        matches.push(record);
+    }
+    let matches = matches
+        .into_iter()
         .filter(|record| {
             durable_scope_digest_from_hash(&record.request_hash) == Some(scope_digest.as_str())
         })
@@ -778,8 +822,14 @@ pub fn durable_client_request_status(
             "durable": true,
             "ambiguous": true,
             "matches": matches.iter().map(|record| {
+                let kind = kind_from_op_id(&record.op_id);
                 json!({
-                    "kind": kind_from_op_id(&record.op_id),
+                    "kind": kind,
+                    // The `tool` value a caller passes to disambiguate: the
+                    // tool name is the kind minus its `.client_request.v1`
+                    // suffix (`herdr_fs_write.client_request.v1` →
+                    // `herdr_fs_write`).
+                    "tool": kind.strip_suffix(".client_request.v1").unwrap_or(kind),
                     "op_id": record.op_id,
                     "request_id": record_request_id(record),
                     "state": record.state,
@@ -1508,6 +1558,72 @@ mod tests {
         let patch =
             durable_client_request_status(&store, KEY, SCOPE_A, Some("herdr_fs_patch")).unwrap();
         assert_eq!(patch["request_id"], "req_p_1", "{patch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a first-class write tool settled under its own
+    /// kind | When request.status is queried by the first call's request_id
+    /// after a restart | Then the durable row is found — the request_id scan
+    /// covers every client-request kind, not only herdr_call/herdr_exec.
+    #[test]
+    fn user_status_by_request_id_given_write_tool_then_found_after_restart() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt", "content": "x"});
+        {
+            let mut store = open_store(&dir);
+            let ids = client_request_ids(
+                HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                SCOPE_A,
+                "herdr_fs_write",
+                &params,
+                KEY,
+                "req_write_restart",
+                false,
+            );
+            expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        let store = open_store(&dir);
+        let record = store
+            .client_request_record_for_request_id("req_write_restart")
+            .unwrap();
+        assert!(record.is_some(), "request_id row must survive restart");
+        let status =
+            durable_client_request_status(&store, "req_write_restart", SCOPE_A, None).unwrap();
+        assert_eq!(status["found"], true, "{status}");
+        assert_eq!(status["state"], "complete", "{status}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a real SQLite write failure at settle time | When
+    /// an executed write tool's terminal record cannot be persisted | Then
+    /// the settlement reports `PersistFailed` and the reservation row stays
+    /// pending — never a `Completed` verdict the caller would trust.
+    #[test]
+    fn user_settle_given_real_write_failure_then_persist_failed_keeps_pending() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt", "content": "x"});
+        let mut store = open_store(&dir);
+        let ids = client_request_ids(
+            HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+            SCOPE_A,
+            "herdr_fs_write",
+            &params,
+            KEY,
+            "req_fail_1",
+            false,
+        );
+        expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        // Break every subsequent write through a genuine second connection:
+        // renaming the table is a real SQLite DDL failure surface, not a
+        // mocked store.
+        let breaker = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+        breaker
+            .execute_batch("ALTER TABLE operations RENAME TO operations_broken")
+            .unwrap();
+        drop(breaker);
+        let settled = durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        assert_eq!(settled, DurableSettle::PersistFailed);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

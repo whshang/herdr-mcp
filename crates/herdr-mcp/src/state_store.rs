@@ -1652,17 +1652,22 @@ impl StateStore {
         &self,
         request_id: &str,
     ) -> Result<Option<ClientRequestRecord>, String> {
+        // Scan every client-request kind — not just the herdr_call/herdr_exec
+        // pair — so a first-class write tool's first `request_id` resolves too.
+        let kinds = crate::durable_request_ledger::CLIENT_REQUEST_KINDS;
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT op_id, request_hash, phase, state, result_json, boot_id,
+                    created_at, updated_at, expires_at
+             FROM operations
+             WHERE kind IN ({placeholders})"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT op_id, request_hash, phase, state, result_json, boot_id,
-                        created_at, updated_at, expires_at
-                 FROM operations
-                 WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')",
-            )
+            .prepare(&sql)
             .map_err(|error| format!("cannot prepare client request id lookup: {error}"))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(kinds.iter()), |row| {
                 Ok(ClientRequestRecord {
                     op_id: row.get(0)?,
                     request_hash: row.get::<_, Option<String>>(1)?.unwrap_or_default(),

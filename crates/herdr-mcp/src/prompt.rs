@@ -798,6 +798,30 @@ impl PromptRegistry {
         Ok(())
     }
 
+    /// Persist a settled outcome unless the failure provably created and
+    /// delivered nothing: those release the key so a same-key retry (same or
+    /// corrected arguments) re-executes instead of replaying a stale
+    /// refusal — and so this inner record cannot disagree with the durable
+    /// client-request ledger, which releases the same class of failures.
+    /// Returns whether the outcome was persisted.
+    fn settle(&self, key: &str, fingerprint: &str, result: &Value) -> Result<bool, Value> {
+        if prompt_result_created_nothing(result) {
+            self.release(key, fingerprint).map(|_| false)
+        } else {
+            self.complete(key, fingerprint, result).map(|_| true)
+        }
+    }
+
+    fn release(&self, key: &str, fingerprint: &str) -> Result<(), Value> {
+        if let Some(store) = &self.inner.store {
+            return release_persisted(store, key, fingerprint);
+        }
+        if let Ok(mut records) = self.inner.records.lock() {
+            records.remove(key);
+        }
+        Ok(())
+    }
+
     /// Outcome of a first-dispatch handoff injection attempt. `marked_now` is
     /// true only when this call placed the per-pane mark, so a clearly failed
     /// dispatch can un-mark exactly the mark it created.
@@ -4350,6 +4374,54 @@ fn complete_persisted(
         })
 }
 
+fn release_persisted(
+    store: &Arc<Mutex<StateStore>>,
+    key: &str,
+    fingerprint: &str,
+) -> Result<(), Value> {
+    let key_hash = stable_digest(&[b"herdr_prompt/idempotency", key.as_bytes()]);
+    let op_id = format!("op:prompt:{}", &key_hash[..32]);
+    let mut store = store.lock().map_err(|_| {
+        json!({
+            "ok": false,
+            "code": "idempotency_store_unavailable",
+            "message": "durable idempotency store lock is unavailable after prompt execution",
+            "retryable": false,
+        })
+    })?;
+    store
+        .release_operation_reservation(PROMPT_OPERATION_KIND, &key_hash, fingerprint, &op_id)
+        .map_err(|error| {
+            json!({
+                "ok": false,
+                "code": "idempotency_release_persist_failed",
+                "message": format!("durable idempotency release failed: {error}"),
+                "retryable": false,
+            })
+        })
+}
+
+/// True when a failed outcome provably created no pane/worktree/agent and
+/// delivered nothing — the only failure class where releasing the key is as
+/// safe as the durable client-request ledger's `not_delivered` release.
+/// Such failures release the reservation so a same-key retry re-executes;
+/// anything carrying resource markers, a claimed submission, or an
+/// uncertain/delivered state keeps its persisted record so replay or resume
+/// can still reach it. `resumable` checkpoints persist unconditionally:
+/// releasing them would destroy the state a `DispatchReservation::Known`
+/// retry resumes from, and `result_created_spawn_resources` deliberately
+/// excludes them.
+fn prompt_result_created_nothing(result: &Value) -> bool {
+    result.get("ok").and_then(Value::as_bool) == Some(false)
+        && result.get("resumable").and_then(Value::as_bool) != Some(true)
+        && !crate::request_ledger::result_created_spawn_resources(result)
+        && result.get("submitted").and_then(Value::as_bool) != Some(true)
+        && matches!(
+            result.get("delivery_state").and_then(Value::as_str),
+            None | Some("not_delivered")
+        )
+}
+
 fn annotate_idempotency_persistence(mut result: Value, persistence_error: Value) -> Value {
     if let Some(object) = result.as_object_mut() {
         object.insert("idempotency_persistence".to_owned(), persistence_error);
@@ -5265,10 +5337,11 @@ pub fn run_with_parent_session(
             insert_task_id(&mut rejection, task_id);
             return rejection;
         }
-        // This call reserved the key above and created nothing, so the refusal
-        // is this key's outcome: persist it like every other pre-pane failure.
-        // Otherwise the reservation stays pending and a same-key retry inside
-        // the TTL observes `idempotency_in_flight` instead of the refusal.
+        // This call reserved the key above and created nothing, so the
+        // refusal settles as this key's outcome: a provably
+        // side-effect-free failure releases the key for a corrected retry,
+        // anything else persists so a same-key retry replays the recorded
+        // outcome instead of observing `idempotency_in_flight`.
         return finish_spawn_failure(registry, idempotency_key, &fingerprint, task_id, rejection);
     }
 
@@ -5345,7 +5418,7 @@ pub fn run_with_parent_session(
                 insert_dispatch_id(&mut error, task_id);
                 insert_task_id(&mut error, task_id);
                 if let Some(key) = idempotency_key
-                    && let Err(persist_error) = registry.complete(key, &fingerprint, &error)
+                    && let Err(persist_error) = registry.settle(key, &fingerprint, &error)
                 {
                     return annotate_idempotency_persistence(error, persist_error);
                 }
@@ -5366,11 +5439,11 @@ pub fn run_with_parent_session(
             if let Some(object) = budget.as_object_mut() {
                 object.insert("dispatch_id".to_owned(), json!(task_id));
             }
-            // Persist the refusal under this key like every other pre-delivery
-            // failure, so a same-key retry replays it instead of staying in
-            // flight until the reservation TTL.
+            // Settle the refusal under this key like every other outcome: a
+            // provably side-effect-free refusal releases the key so a
+            // corrected retry re-executes, a recorded one replays.
             if let Some(key) = idempotency_key
-                && let Err(persist_error) = registry.complete(key, &fingerprint, &budget)
+                && let Err(persist_error) = registry.settle(key, &fingerprint, &budget)
             {
                 return annotate_idempotency_persistence(budget, persist_error);
             }
@@ -5689,13 +5762,14 @@ pub fn run_with_parent_session(
     // Persist only the submission/task identity outcome. A caller's optional
     // wait is an observation request and must not become the replay payload.
     if let Some(key) = idempotency_key {
-        if let Err(persist_error) = registry.complete(key, &fingerprint, &result) {
-            return annotate_idempotency_persistence(result, persist_error);
-        }
-        if registry.inner.store.is_some()
-            && let Some(object) = result.as_object_mut()
-        {
-            object.insert("idempotency_persisted".to_owned(), json!(true));
+        match registry.settle(key, &fingerprint, &result) {
+            Err(persist_error) => return annotate_idempotency_persistence(result, persist_error),
+            Ok(true) if registry.inner.store.is_some() => {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("idempotency_persisted".to_owned(), json!(true));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -7448,7 +7522,7 @@ fn finish_spawn_failure(
     insert_dispatch_id(&mut failure, dispatch_id);
     insert_task_id(&mut failure, dispatch_id);
     if let Some(key) = idempotency_key
-        && let Err(persist_error) = registry.complete(key, fingerprint, &failure)
+        && let Err(persist_error) = registry.settle(key, fingerprint, &failure)
     {
         return annotate_idempotency_persistence(failure, persist_error);
     }
@@ -10083,9 +10157,14 @@ mod tests {
         assert_eq!(first["spawn"]["created"], false);
         assert_eq!(first["spawn"]["pane_id"], Value::Null);
         assert!(first.get("reclaim").is_none(), "{first}");
+        // The refusal created nothing, so the reservation is released rather
+        // than replayed: a same-key retry re-runs the same local check and
+        // returns the same refusal — still without touching the socket.
         let replay = run(&client, &registry, &args);
-        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert!(replay.get("idempotent_replay").is_none(), "{replay}");
+        assert_eq!(replay["ok"], false, "{replay}");
         assert_eq!(replay["failed_step"], "pane_create");
+        assert_eq!(replay["code"], "pane_split_too_narrow", "{replay}");
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -10453,11 +10532,11 @@ mod tests {
     }
 
     /// user planner | Given a spawn dispatch refused by the delegation guard
-    /// before any pane existed | When the same idempotency key is replayed
-    /// inside the TTL | Then the stored refusal returns instead of an in-flight
-    /// reservation, and nothing is probed, created or prompted again.
+    /// before any pane existed | When the same idempotency key is retried
+    /// inside the TTL | Then the released reservation re-executes the guard
+    /// and returns the same refusal — no pane, agent or prompt is created.
     #[test]
-    fn spawn_dispatch_delegation_refusal_replays_under_the_same_key() {
+    fn spawn_dispatch_delegation_refusal_rerejects_under_the_same_key() {
         let root = spawn_project_root("delegation-replay");
         let socket = temp_socket();
         let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
@@ -10503,8 +10582,12 @@ mod tests {
             "the first refusal is an outcome, not a replay: {first}"
         );
 
-        // A fresh registry over the same durable store proves the refusal was
-        // persisted for the key rather than remembered inside one process.
+        // A refusal that provably created nothing releases its reservation
+        // rather than persisting a replayable failure — the same key may
+        // legitimately be retried once the depth situation changes. A fresh
+        // registry over the same durable store re-executes the guard and
+        // reaches the same refusal; the deterministic dispatch_id still
+        // matches the first attempt.
         // The watch-off guard owns the crate env lock for its lifetime: drop it
         // before the second registry takes the lock again.
         drop(watch_off);
@@ -10513,12 +10596,18 @@ mod tests {
         assert_eq!(replay["ok"], false, "{replay}");
         assert_eq!(replay["code"], "delegation_depth_exceeded", "{replay}");
         assert_eq!(replay["message"], first["message"], "{replay}");
-        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert!(
+            replay.get("idempotent_replay").is_none(),
+            "a released reservation re-executes instead of replaying: {replay}"
+        );
         assert_eq!(replay["dispatch_id"], first["dispatch_id"], "{replay}");
-        assert_eq!(
-            spawn_requested_methods(&requests),
-            vec!["agent.get"],
-            "the replay is a pure observation: no second caller probe, pane, agent or prompt"
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request["method"] == "agent.get"),
+            "the retried refusal still creates no pane, agent or prompt: {requests:?}"
         );
         assert_eq!(reloaded.list_tasks(10).unwrap().len(), 2);
         fs::remove_dir_all(root).unwrap();
@@ -10659,8 +10748,9 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         assert!(registry.list_tasks(10).unwrap().is_empty());
-        // A keyed validate rejection is persisted, so the same key replays the
-        // rejection instead of resolving a spawn after the topology changed.
+        // A keyed validate rejection creates nothing, so the reservation is
+        // released: a same-key retry re-runs the same local check and returns
+        // the same refusal — still without touching the socket.
         let replay = run(
             &client,
             &registry,
@@ -10670,8 +10760,16 @@ mod tests {
                 "idempotency_key": "spawn-outside",
             }),
         );
-        assert_eq!(replay["idempotent_replay"], true, "{replay}");
+        assert!(replay.get("idempotent_replay").is_none(), "{replay}");
+        assert_eq!(replay["ok"], false, "{replay}");
         assert_eq!(replay["failed_step"], "validate", "{replay}");
+        assert!(
+            replay["message"]
+                .as_str()
+                .unwrap()
+                .contains("managed project root"),
+            "{replay}"
+        );
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

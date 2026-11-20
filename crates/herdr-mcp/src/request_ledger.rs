@@ -99,10 +99,26 @@ impl RequestLedgerState {
     }
 }
 
+/// True when a `not_delivered`-shaped result already created external spawn
+/// resources (pane/worktree/agent) that outlive the ledger key. A resumable
+/// checkpoint is excluded on purpose: releasing the key is what lets the
+/// same-key retry resume the persisted spawn through the prompt registry.
+pub(crate) fn result_created_spawn_resources(result: &Value) -> bool {
+    result.get("resumable").and_then(Value::as_bool) != Some(true)
+        && (result.get("reclaim").is_some()
+            || result.pointer("/spawn/created").and_then(Value::as_bool) == Some(true)
+            || result
+                .pointer("/spawn/worktree/created")
+                .and_then(Value::as_bool)
+                == Some(true))
+}
+
 /// Map an execution result to a ledger state.
 ///
 /// - `ok:true` -> `applied`.
-/// - `ok:false` with `delivery_state == "not_delivered"` -> `not_delivered`.
+/// - `ok:false` with `delivery_state == "not_delivered"` -> `not_delivered`,
+///   unless the result already created external spawn resources (-> `unknown`,
+///   keeping a terminal record of what was left behind).
 /// - `ok:false` with `delivery_state == "delivery_unknown"`, or a retryable
 ///   timeout-shaped failure -> `unknown` (the write may have been applied).
 /// - every other `ok:false` -> `rejected` (admission/schema/policy failure;
@@ -112,14 +128,21 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
         return RequestLedgerState::Applied;
     }
     match result.get("delivery_state").and_then(Value::as_str) {
-        // `not_delivered` releases the key even when the result carries a
-        // resumable spawn checkpoint: retrying then re-enters herdr_prompt,
-        // where the (bridged or caller) `idempotency_key` reaches the
-        // DispatchReservation::Known path and resumes the pane/agent that the
-        // first attempt created — dedupe and same-receipt replay are handled
-        // by the prompt registry, so a durable tombstone here would only
-        // block the designed continuation.
-        Some("not_delivered") => return RequestLedgerState::NotDelivered,
+        // `not_delivered` releases the key unless the result already left
+        // external spawn resources behind. A resumable checkpoint still
+        // releases: retrying then re-enters herdr_prompt, where the (bridged
+        // or caller) `idempotency_key` reaches the DispatchReservation::Known
+        // path and resumes the pane/agent the first attempt created. A
+        // non-resumable spawn failure with created resources instead keeps a
+        // terminal record, so `request.status` retains the stranded
+        // worktree/pane (with its reclaim instructions) instead of reporting
+        // a miss while the inner prompt ledger alone remembers the key.
+        Some("not_delivered") => {
+            if result_created_spawn_resources(result) {
+                return RequestLedgerState::Unknown;
+            }
+            return RequestLedgerState::NotDelivered;
+        }
         Some("delivery_unknown") => return RequestLedgerState::Unknown,
         _ => {}
     }

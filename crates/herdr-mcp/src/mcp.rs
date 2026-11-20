@@ -1488,6 +1488,16 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     dispatch_admitted_tool(name, arguments, herdr_call_params, context, route)
 }
 
+/// The inner `idempotency_key` a bridged `client_request_id` maps to inside
+/// `herdr_prompt`: `cr:` + sha256 of the raw key. Keeping the bridged value
+/// out of the caller's native key space means an `idempotency_key=K` prompt
+/// and a `client_request_id=K` prompt are independent requests in either
+/// order; a bounded digest also means any length caller key stays within
+/// `idempotency_key` hygiene limits.
+pub(crate) fn bridged_prompt_idempotency_key(client_request_id: &str) -> String {
+    format!("cr:{}", browser_sha256(client_request_id))
+}
+
 /// `client_request_id` on a first-class write tool goes through the same
 /// durable `operations` ledger as `herdr_call` — D-2: writes without a
 /// resolvable durable caller scope are refused before executing, never
@@ -1523,11 +1533,16 @@ fn write_tool_with_request_ledger(
     // the caller did not supply one (both present is rejected upstream as
     // mutually exclusive): spawn requires an idempotency key, the task
     // registry keys `agent.task.status` lookups by it, and the registry's
-    // own spawn-resume path binds retries to the first dispatch.
+    // own spawn-resume path binds retries to the first dispatch. The bridged
+    // value is namespaced (`cr:` + sha256) so a raw caller key can never
+    // collide with a native `idempotency_key` chosen independently.
     if let Some(object) = arguments.as_object_mut() {
         object.remove("client_request_id");
         if name == "herdr_prompt" && object.get("idempotency_key").is_none() {
-            object.insert("idempotency_key".to_owned(), json!(client_request_id));
+            object.insert(
+                "idempotency_key".to_owned(),
+                json!(bridged_prompt_idempotency_key(client_request_id)),
+            );
         }
     }
     let ids = crate::durable_request_ledger::client_request_ids(
@@ -1651,6 +1666,17 @@ fn execute_durable_ledgered_call(
             let mode = match settled {
                 crate::durable_request_ledger::DurableSettle::Completed => "none",
                 crate::durable_request_ledger::DurableSettle::RecordedUnknown => {
+                    "inspect_before_retry"
+                }
+                // The execution result is returned verbatim either way, but
+                // when its terminal record cannot be proven durable the
+                // caller must inspect instead of trusting a retry verdict.
+                crate::durable_request_ledger::DurableSettle::PersistFailed => {
+                    object.insert("idempotency_persisted".to_owned(), json!(false));
+                    object.insert(
+                        "idempotency_hint".to_owned(),
+                        json!("the call's outcome may be committed while its durable dedupe record is not; query request.status and inspect live state before retrying"),
+                    );
                     "inspect_before_retry"
                 }
                 crate::durable_request_ledger::DurableSettle::Released => {
@@ -35419,11 +35445,15 @@ mod durable_client_request_tests {
 
     /// user caller | Given each first-class write tool name | When the
     /// client_request_id kind map is consulted | Then every write tool maps
-    /// to its own durable ledger kind and non-write tools map to none.
+    /// to its own durable ledger kind — herdr_call/herdr_exec included, so a
+    /// `tool` hint on request.status can disambiguate them — and non-write
+    /// tools map to none.
     #[test]
     fn write_tool_client_request_kinds_cover_all_four_tools() {
         use crate::durable_request_ledger as ledger;
         for (tool, kind) in [
+            ("herdr_call", ledger::HERDR_CALL_CLIENT_REQUEST_KIND),
+            ("herdr_exec", ledger::HERDR_EXEC_CLIENT_REQUEST_KIND),
             ("herdr_fs_write", ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
             ("herdr_fs_edit", ledger::HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
             ("herdr_fs_patch", ledger::HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
@@ -35435,13 +35465,18 @@ mod durable_client_request_tests {
                 "{tool}"
             );
         }
-        for non_write in ["herdr_fs_read", "herdr_call", "herdr_git", "herdr_inspect"] {
+        for non_write in ["herdr_fs_read", "herdr_git", "herdr_inspect"] {
             assert_eq!(
                 crate::durable_request_ledger::client_request_tool_kind(non_write),
                 None,
                 "{non_write}"
             );
         }
+        // An unknown tool name must not widen the filter back to "all".
+        assert_eq!(
+            crate::durable_request_ledger::client_request_tool_kind("totally_unknown"),
+            None
+        );
     }
 
     /// user caller | Given a herdr_prompt keyed by client_request_id | When
@@ -35517,9 +35552,14 @@ mod durable_client_request_tests {
         let task_id = first["task_id"].clone();
         let receipt_id = first["receipt_id"].clone();
         assert!(task_id.is_string() && receipt_id.is_string(), "{first}");
-        // The caller key is bridged to `idempotency_key`: the dispatch's
-        // task is queryable by it even though the caller never passed one.
-        let status = prompt.task_status_by_idempotency("cr-preplay", "pi", None);
+        // The caller key is bridged to a namespaced `idempotency_key`: the
+        // dispatch's task is queryable by the bridged key even though the
+        // caller never passed one.
+        let status = prompt.task_status_by_idempotency(
+            &bridged_prompt_idempotency_key("cr-preplay"),
+            "pi",
+            None,
+        );
         assert_eq!(status["ok"], true, "{status}");
 
         let replay = call_body(&tool_call(&request, &context).unwrap());
@@ -35529,6 +35569,132 @@ mod durable_client_request_tests {
 
         // The fake server exited after exactly agent.get + agent.prompt: a
         // replay cannot have dispatched a second agent.prompt.
+        server.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given prompts already dispatched under native keys |
+    /// When the same raw strings arrive as client_request_id (and vice
+    /// versa) | Then each intent dispatches independently — the bridged
+    /// `cr:` namespace never collides with the native one.
+    #[cfg(unix)]
+    #[test]
+    fn user_prompt_given_shared_raw_key_across_namespaces_then_each_dispatches() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let root = temp_dir("crns");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("h.sock");
+        let _sock_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Four independent dispatches, each agent.get + agent.prompt.
+        let server = thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut line = String::new();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
+                let result = if request["method"] == "agent.get" {
+                    json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}})
+                } else {
+                    assert_eq!(request["method"], "agent.prompt");
+                    json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}})
+                };
+                if writeln!(stream, "{}", json!({"id": request["id"], "result": result})).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let client = HerdrClient::new(&socket);
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(state_store.clone());
+        let skill = SkillService::new();
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        // Order 1: native idempotency_key first, then client_request_id with
+        // the same raw string — the second call must dispatch fresh.
+        let native_first = call_body(
+            &tool_call(
+                &json!({"params": {"name": "herdr_prompt", "arguments": {
+                    "target": "pi", "text": "native work", "idempotency_key": "shared-key-a"
+                }}}),
+                &context,
+            )
+            .unwrap(),
+        );
+        assert_eq!(native_first["ok"], true, "{native_first}");
+        let bridged_second = call_body(
+            &tool_call(
+                &json!({"params": {"name": "herdr_prompt", "arguments": {
+                    "target": "pi", "text": "bridged work", "client_request_id": "shared-key-a"
+                }}}),
+                &context,
+            )
+            .unwrap(),
+        );
+        assert_eq!(bridged_second["ok"], true, "{bridged_second}");
+        assert_eq!(
+            bridged_second["deduplicated"],
+            Value::Null,
+            "{bridged_second}"
+        );
+        assert_ne!(
+            bridged_second["task_id"], native_first["task_id"],
+            "{bridged_second}"
+        );
+
+        // Order 2 (reverse): client_request_id first, then the same raw
+        // string as a native idempotency_key — also independent.
+        let bridged_first = call_body(
+            &tool_call(
+                &json!({"params": {"name": "herdr_prompt", "arguments": {
+                    "target": "pi", "text": "bridged work", "client_request_id": "shared-key-b"
+                }}}),
+                &context,
+            )
+            .unwrap(),
+        );
+        assert_eq!(bridged_first["ok"], true, "{bridged_first}");
+        let native_second = call_body(
+            &tool_call(
+                &json!({"params": {"name": "herdr_prompt", "arguments": {
+                    "target": "pi", "text": "native work", "idempotency_key": "shared-key-b"
+                }}}),
+                &context,
+            )
+            .unwrap(),
+        );
+        assert_eq!(native_second["ok"], true, "{native_second}");
+        assert_ne!(
+            native_second["task_id"], bridged_first["task_id"],
+            "{native_second}"
+        );
+
         server.join().unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
