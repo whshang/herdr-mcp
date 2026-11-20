@@ -1348,6 +1348,23 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
             true,
         ));
     }
+    // `_bridged_client_request_key` marks the durable ledger's own bridged
+    // `cr:` idempotency key injection (write_tool_with_request_ledger, after
+    // this check). A caller-supplied copy is a forged internal marker —
+    // refused outright so no arg surface can mint the prompt parser's
+    // reserved-namespace exemption.
+    if arguments.get(BRIDGED_CLIENT_REQUEST_FLAG).is_some() {
+        return Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "_bridged_client_request_key is a reserved internal field and must not be supplied by callers",
+            }),
+            true,
+        ));
+    }
     let mut expected_target: Option<&Value> = None;
     if let Some(params) = herdr_call_params.as_ref()
         && let Some(value) = params.get("expected_core_target")
@@ -1522,9 +1539,11 @@ pub(crate) fn bridged_prompt_idempotency_key(scope: &str, client_request_id: &st
 
 /// Internal args flag marking a bridged `idempotency_key` so the prompt arg
 /// parser can distinguish it from a caller-supplied `cr:`-prefixed key (the
-/// reserved namespace is rejected otherwise). A forged flag is inert: it can
-/// only replay the scope-bound bridged record the same caller's legitimate
-/// retry would replay anyway.
+/// reserved namespace is rejected otherwise). The flag is set only by the
+/// durable-ledger injection in `write_tool_with_request_ledger`; every
+/// caller-controlled args surface either rejects it (top-level `arguments`)
+/// or strips it (`agent.task.dispatch` params), so a forged flag never
+/// reaches the prompt parser.
 pub(crate) const BRIDGED_CLIENT_REQUEST_FLAG: &str = "_bridged_client_request_key";
 
 /// `client_request_id` on a first-class write tool goes through the same
@@ -2328,10 +2347,15 @@ fn admitted_tool_output(
                 };
                 // The turn text is binding evidence only; it must never travel
                 // into the prompt path that retains or traces the arguments.
+                // The bridged-ledger marker is likewise caller-forgeable here
+                // (params pass through verbatim), so it is stripped: only the
+                // durable-ledger injection in write_tool_with_request_ledger
+                // may carry it into the prompt parser.
                 let mut prompt_params = params.clone();
                 if let Some(object) = prompt_params.as_object_mut() {
                     object.remove("current_user_message");
                     object.remove("parent_session_ref");
+                    object.remove(BRIDGED_CLIENT_REQUEST_FLAG);
                 }
                 let mut result = prompt::run_with_parent_session(
                     context.client,
@@ -35612,6 +35636,116 @@ mod durable_client_request_tests {
         }}});
         let body = call_body(&tool_call(&request, &context).unwrap());
         assert_eq!(body["ok"], false, "{body}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given the internal bridged marker on the wire | When the
+    /// call dispatches | Then it is refused — the flag is minted only by the
+    /// durable-ledger injection and a caller copy is a forgery.
+    #[test]
+    fn user_prompt_given_forged_bridged_flag_then_refused() {
+        let root = temp_dir("crflag");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(state_store.clone());
+        let skill = SkillService::new();
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+        // Forged flag + the exact bridged key it claims to authorize.
+        let forged = bridged_prompt_idempotency_key("local:edge-device-1", "victim-key");
+        let request = json!({"params": {"name": "herdr_prompt", "arguments": {
+            "target": "pi",
+            "text": "work",
+            "idempotency_key": forged,
+            BRIDGED_CLIENT_REQUEST_FLAG: true
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "invalid_params", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved internal field"),
+            "{body}"
+        );
+        // The flag alone — without a cr: key — is equally refused.
+        let request = json!({"params": {"name": "herdr_prompt", "arguments": {
+            "target": "pi",
+            "text": "work",
+            BRIDGED_CLIENT_REQUEST_FLAG: true
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "invalid_params", "{body}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given the forged bridged marker inside agent.task.dispatch
+    /// params | When the inner call reaches the prompt parser | Then the flag
+    /// is stripped first — the cr: key is rejected as a native namespace
+    /// violation, never replayed as a bridged record.
+    #[test]
+    fn user_task_dispatch_given_forged_flag_in_params_then_cr_key_rejected() {
+        let root = temp_dir("crflaginner");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(state_store.clone());
+        let skill = SkillService::new();
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+        let forged = bridged_prompt_idempotency_key("local:edge-device-1", "victim-key");
+        let request = json!({"params": {"name": "herdr_call", "arguments": {
+            "method": crate::prompt::AGENT_TASK_DISPATCH_METHOD,
+            "params": {
+                "target": "pi",
+                "text": "work",
+                "idempotency_key": forged,
+                BRIDGED_CLIENT_REQUEST_FLAG: true
+            }
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        // The flag was stripped before the prompt parser ran: the cr: key is
+        // refused as a native reserved-namespace violation — with the forged
+        // flag intact this exact rejection could not fire.
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved 'cr:' prefix"),
+            "{body}"
+        );
+        assert_ne!(body["submitted"], true, "{body}");
+        assert_ne!(body["idempotent_replay"], true, "{body}");
         std::fs::remove_dir_all(&root).ok();
     }
 
