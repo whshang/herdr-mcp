@@ -4284,8 +4284,10 @@ mod tests {
         /// itself is covered by the test above.
         #[test]
         fn refuses_a_peer_with_another_effective_uid() {
+            // temp-socket-path-only: this path only appears in the refusal
+            // message; nothing is bound or created, so a guard here would
+            // delete a socket another process might own.
             let socket = PathBuf::from("/tmp/herdr-core-peer-foreign.sock");
-            let _sock_guard_socket = crate::test_env::TempUnixSocketGuard::file(&socket);
             let error = ensure_hc_peer_uid(
                 hc_current_effective_uid() + 1,
                 hc_current_effective_uid(),
