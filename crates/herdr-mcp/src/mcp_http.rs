@@ -74,6 +74,17 @@ const MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES: usize = 8 * 1024;
 const MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES: usize = 16;
 const MAX_EDGE_RELAYED_SOURCE_TURN_HEADER_BYTES: usize = 2048;
 const MAX_LEASE_HEADER_BYTES: usize = 256;
+/// Caller-context headers the Edge link attaches. Any one of them marks the
+/// frame as relayed and arms the runtime-generation fence. The expected
+/// generation header is not itself caller context.
+const TRUSTED_EDGE_CONTEXT_HEADERS: &[&str] = &[
+    EDGE_WEBCHAT_CONTROL_GRANTS_HEADER,
+    EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+    EDGE_BROWSER_CALLER_SESSION_HEADER,
+    EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER,
+    EDGE_RELAYED_SOURCE_TURN_HEADER,
+    EDGE_PAGE_ASSIST_GRANTS_HEADER,
+];
 const MAX_SESSIONS: usize = 1024;
 const SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -2898,7 +2909,7 @@ fn push_declared_project_keys(workspaces: &[Value]) -> HashMap<String, String> {
         else {
             continue;
         };
-        let project_key = format!("git:{repo_key}");
+        let project_key = declared_git_project_key(repo_key);
         for root in ["checkout_path", "repo_root"]
             .into_iter()
             .filter_map(|field| worktree.get(field).and_then(Value::as_str))
@@ -2917,18 +2928,27 @@ fn push_local_project_key(
     let keys = roots
         .iter()
         .filter(|root| !root.is_empty())
-        .map(|root| {
-            declared_project_keys
-                .get(root)
-                .cloned()
-                // Push-state projection is a liveness path. Never rediscover
-                // Git identity from the filesystem here: a root may live in a
-                // macOS privacy folder and the rotating runtime must not prompt
-                // merely because the browser extension reconnects.
-                .unwrap_or_else(|| format!("dir:{root}"))
-        })
+        .map(|root| project_key_from_declared_or_directory(root, declared_project_keys))
         .collect::<BTreeSet<_>>();
     (keys.len() == 1).then(|| keys.into_iter().next().unwrap())
+}
+
+fn declared_git_project_key(repo_key: &str) -> String {
+    format!("git:{repo_key}")
+}
+
+/// In-memory fallback for one root. A declared `git:` key wins; otherwise the
+/// label is `dir:<root>`. This function must not stat the root or invoke git.
+/// `push_local_project_key_never_rediscovers_git_from_disk` is the regression
+/// gate for that boundary.
+fn project_key_from_declared_or_directory(
+    root: &str,
+    declared_project_keys: &HashMap<String, String>,
+) -> String {
+    declared_project_keys
+        .get(root)
+        .cloned()
+        .unwrap_or_else(|| format!("dir:{root}"))
 }
 
 fn push_filter_matches(filters: &PushFilters, data: &Value) -> bool {
@@ -3497,16 +3517,9 @@ fn relay_transport(headers: &HeaderMap) -> &'static str {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("relay"));
     let relay = declared
-        || [
-            EDGE_WEBCHAT_CONTROL_GRANTS_HEADER,
-            EDGE_WEBCHAT_AUTHORIZATION_HEADER,
-            EDGE_BROWSER_CALLER_SESSION_HEADER,
-            EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER,
-            EDGE_RELAYED_SOURCE_TURN_HEADER,
-            EDGE_PAGE_ASSIST_GRANTS_HEADER,
-        ]
-        .iter()
-        .any(|name| headers.contains_key(*name));
+        || TRUSTED_EDGE_CONTEXT_HEADERS
+            .iter()
+            .any(|name| headers.contains_key(*name));
     crate::observability::transport_label(relay)
 }
 
@@ -3521,23 +3534,65 @@ fn wants_sse(headers: &HeaderMap, request: &Value) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
 }
 
+/// Shared admission for a trusted Edge header. An untrusted listener and a
+/// missing header are absence. A non-UTF-8 or oversized value fails closed.
+/// Payload structs stay hand-validated; do not switch them to
+/// `#[serde(deny_unknown_fields)]` without an Edge forward-compat test.
+fn trusted_edge_header_text<'a>(
+    trusted_extension_ipc: bool,
+    headers: &'a HeaderMap,
+    name: &'static str,
+    max_bytes: usize,
+) -> Result<Option<&'a str>, ()> {
+    if !trusted_extension_ipc {
+        return Ok(None);
+    }
+    let Some(raw) = headers.get(name) else {
+        return Ok(None);
+    };
+    let text = raw.to_str().map_err(|_| ())?;
+    if text.len() > max_bytes {
+        return Err(());
+    }
+    Ok(Some(text))
+}
+
+fn trusted_edge_header_json(
+    trusted_extension_ipc: bool,
+    headers: &HeaderMap,
+    name: &'static str,
+    max_bytes: usize,
+) -> Result<Option<Value>, ()> {
+    let Some(text) = trusted_edge_header_text(trusted_extension_ipc, headers, name, max_bytes)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(text).map_err(|_| ())?))
+}
+
+fn json_object_has_exact_keys(object: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+}
+
+fn json_object_has_unknown_key(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    object.keys().any(|key| !allowed.contains(&key.as_str()))
+}
+
 fn trusted_edge_webchat_control_grants(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Vec<BrowserCallerGrant>, ()> {
     // The reserved handoff header is ignored on TCP even if a bearer-authenticated
     // client attempts to spoof it. Only the 0600 Unix IPC listener can elevate it.
-    if !state.trusted_extension_ipc {
-        return Ok(Vec::new());
-    }
-    let Some(raw) = headers.get(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER) else {
+    let Some(value) = trusted_edge_header_json(
+        state.trusted_extension_ipc,
+        headers,
+        EDGE_WEBCHAT_CONTROL_GRANTS_HEADER,
+        MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES,
+    )?
+    else {
         return Ok(Vec::new());
     };
-    let text = raw.to_str().map_err(|_| ())?;
-    if text.len() > MAX_EDGE_WEBCHAT_CONTROL_GRANTS_HEADER_BYTES {
-        return Err(());
-    }
-    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let items = value.as_array().ok_or(())?;
     if items.len() > 32 {
         return Err(());
@@ -3551,9 +3606,7 @@ fn trusted_edge_webchat_control_grants(
             &["endpoint_ref", "provider", "account_ref", "device_id"];
         if !object.contains_key("endpoint_ref")
             || !object.contains_key("provider")
-            || object
-                .keys()
-                .any(|key| !ALLOWED_GRANT_KEYS.contains(&key.as_str()))
+            || json_object_has_unknown_key(object, ALLOWED_GRANT_KEYS)
         {
             return Err(());
         }
@@ -3602,17 +3655,15 @@ fn trusted_edge_page_assist_grants(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Vec<PageAssistCallerGrant>, ()> {
-    if !state.trusted_extension_ipc {
-        return Ok(Vec::new());
-    }
-    let Some(raw) = headers.get(EDGE_PAGE_ASSIST_GRANTS_HEADER) else {
+    let Some(value) = trusted_edge_header_json(
+        state.trusted_extension_ipc,
+        headers,
+        EDGE_PAGE_ASSIST_GRANTS_HEADER,
+        MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES,
+    )?
+    else {
         return Ok(Vec::new());
     };
-    let text = raw.to_str().map_err(|_| ())?;
-    if text.len() > MAX_EDGE_PAGE_ASSIST_GRANTS_HEADER_BYTES {
-        return Err(());
-    }
-    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let items = value.as_array().ok_or(())?;
     if items.len() > 32 {
         return Err(());
@@ -3620,7 +3671,7 @@ fn trusted_edge_page_assist_grants(
     let mut grants = Vec::with_capacity(items.len());
     for item in items {
         let object = item.as_object().ok_or(())?;
-        if object.len() != 1 || !object.contains_key("endpoint_ref") {
+        if !json_object_has_exact_keys(object, &["endpoint_ref"]) {
             return Err(());
         }
         let endpoint_ref = object
@@ -3646,23 +3697,20 @@ fn trusted_edge_webchat_authorization(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<BrowserCallerAuthorization>, ()> {
-    if !state.trusted_extension_ipc {
-        return Ok(None);
-    }
-    let Some(raw) = headers.get(EDGE_WEBCHAT_AUTHORIZATION_HEADER) else {
+    let Some(value) = trusted_edge_header_json(
+        state.trusted_extension_ipc,
+        headers,
+        EDGE_WEBCHAT_AUTHORIZATION_HEADER,
+        MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES,
+    )?
+    else {
         return Ok(None);
     };
-    let text = raw.to_str().map_err(|_| ())?;
-    if text.len() > MAX_EDGE_WEBCHAT_AUTHORIZATION_HEADER_BYTES {
-        return Err(());
-    }
-    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
-    if object.len() != 3
-        || !object.contains_key("principal_ref")
-        || !object.contains_key("connector_id")
-        || !object.contains_key("grant_generation")
-    {
+    if !json_object_has_exact_keys(
+        object,
+        &["principal_ref", "connector_id", "grant_generation"],
+    ) {
         return Err(());
     }
     let principal_ref = object
@@ -3700,22 +3748,17 @@ fn trusted_edge_browser_caller_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<BrowserCallerSessionIdentity>, ()> {
-    if !state.trusted_extension_ipc {
-        return Ok(None);
-    }
-    let Some(raw) = headers.get(EDGE_BROWSER_CALLER_SESSION_HEADER) else {
+    let Some(value) = trusted_edge_header_json(
+        state.trusted_extension_ipc,
+        headers,
+        EDGE_BROWSER_CALLER_SESSION_HEADER,
+        MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES,
+    )?
+    else {
         return Ok(None);
     };
-    let text = raw.to_str().map_err(|_| ())?;
-    if text.len() > MAX_EDGE_BROWSER_CALLER_SESSION_HEADER_BYTES {
-        return Err(());
-    }
-    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
-    if object.len() != 2
-        || !object.contains_key("provider")
-        || !object.contains_key("opaque_session_id")
-    {
+    if !json_object_has_exact_keys(object, &["provider", "opaque_session_id"]) {
         return Err(());
     }
     let provider = object.get("provider").and_then(Value::as_str).ok_or(())?;
@@ -3745,18 +3788,18 @@ fn trusted_edge_caller_browser_on_other_device(
     // if a bearer-authenticated client attempts to spoof it, and only the 0600
     // Unix IPC listener can elevate it. Absent means same-device or unknown, so
     // the dispatch keeps its current behavior.
-    if !state.trusted_extension_ipc {
-        return Ok(false);
-    }
-    let Some(raw) = headers.get(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER) else {
-        return Ok(false);
-    };
-    let text = raw.to_str().map_err(|_| ())?;
-    if text.len() > MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES {
-        return Err(());
-    }
+    //
     // Exactly `true`. No device id, account ref, or endpoint may ride this
     // marker; anything else is a malformed trusted caller context.
+    let Some(text) = trusted_edge_header_text(
+        state.trusted_extension_ipc,
+        headers,
+        EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER,
+        MAX_EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER_BYTES,
+    )?
+    else {
+        return Ok(false);
+    };
     if text != "true" {
         return Err(());
     }
@@ -3769,17 +3812,15 @@ fn trusted_edge_relayed_source_turn(
 ) -> Result<Option<RelayedSourceTurnEvidence>, ()> {
     // #775 / #921: ignored on TCP bearer listeners even if a client attempts to
     // spoof the header; only the 0600 Unix IPC listener can admit it.
-    if !state.trusted_extension_ipc {
-        return Ok(None);
-    }
-    let Some(raw) = headers.get(EDGE_RELAYED_SOURCE_TURN_HEADER) else {
+    let Some(value) = trusted_edge_header_json(
+        state.trusted_extension_ipc,
+        headers,
+        EDGE_RELAYED_SOURCE_TURN_HEADER,
+        MAX_EDGE_RELAYED_SOURCE_TURN_HEADER_BYTES,
+    )?
+    else {
         return Ok(None);
     };
-    let text = raw.to_str().map_err(|_| ())?;
-    if text.len() > MAX_EDGE_RELAYED_SOURCE_TURN_HEADER_BYTES {
-        return Err(());
-    }
-    let value = serde_json::from_str::<Value>(text).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
     const ALLOWED_KEYS: &[&str] = &[
         "owning_device_id",
@@ -3791,10 +3832,7 @@ fn trusted_edge_relayed_source_turn(
         "provider",
         "endpoint_ref",
     ];
-    if object
-        .keys()
-        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
-    {
+    if json_object_has_unknown_key(object, ALLOWED_KEYS) {
         return Err(());
     }
     let owning_device_id = object
@@ -3908,12 +3946,9 @@ fn caller_mutation_lease_headers(headers: &HeaderMap) -> Result<CallerMutationLe
 
 fn trusted_edge_runtime_generation_fence(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
     if !state.trusted_extension_ipc
-        || (!headers.contains_key(EDGE_WEBCHAT_CONTROL_GRANTS_HEADER)
-            && !headers.contains_key(EDGE_WEBCHAT_AUTHORIZATION_HEADER)
-            && !headers.contains_key(EDGE_BROWSER_CALLER_SESSION_HEADER)
-            && !headers.contains_key(EDGE_CALLER_BROWSER_ON_OTHER_DEVICE_HEADER)
-            && !headers.contains_key(EDGE_RELAYED_SOURCE_TURN_HEADER)
-            && !headers.contains_key(EDGE_PAGE_ASSIST_GRANTS_HEADER))
+        || !TRUSTED_EDGE_CONTEXT_HEADERS
+            .iter()
+            .any(|name| headers.contains_key(*name))
     {
         return Ok(());
     }
