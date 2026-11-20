@@ -112,6 +112,17 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
         return RequestLedgerState::Applied;
     }
     match result.get("delivery_state").and_then(Value::as_str) {
+        // A spawn dispatch that already created external resources (worktree,
+        // pane, agent) before stopping carries a resumable checkpoint: the
+        // "not_delivered" envelope then means "the prompt text was not
+        // delivered", not "nothing happened" — keep the durable receipt so a
+        // caller can inspect instead of a blind retry erasing evidence.
+        Some("not_delivered")
+            if result.get("resumable").and_then(Value::as_bool) == Some(true)
+                && result.get("spawn").is_some() =>
+        {
+            return RequestLedgerState::Unknown;
+        }
         Some("not_delivered") => return RequestLedgerState::NotDelivered,
         Some("delivery_unknown") => return RequestLedgerState::Unknown,
         _ => {}
@@ -125,14 +136,16 @@ pub fn classify_result_state(result: &Value) -> RequestLedgerState {
         return RequestLedgerState::Unknown;
     }
     // A commit failure whose rollback itself errored may have left staged
-    // mutations partially applied; the mutation layer reports that as
-    // "rollback errors" inside the failure message. That outcome cannot
-    // prove a clean rollback, so it is the "maybe applied" class too —
-    // releasing the reservation here would let a blind retry re-execute.
-    if result
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(|message| message.contains("rollback errors"))
+    // mutations partially applied. The mutation layer reports that as the
+    // structured `rollback_failed` field; the message-substring check is a
+    // legacy fallback for pre-marker payloads. That outcome cannot prove a
+    // clean rollback, so it is the "maybe applied" class too — releasing
+    // the reservation here would let a blind retry re-execute.
+    if result.get("rollback_failed").and_then(Value::as_bool) == Some(true)
+        || result
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("rollback errors"))
     {
         return RequestLedgerState::Unknown;
     }
@@ -556,6 +569,38 @@ mod tests {
         assert_eq!(
             classify_result_state(&json!({"ok": false, "code": "request_timeout"})),
             RequestLedgerState::Unknown
+        );
+        // Structured rollback-failure marker (primary signal) and the legacy
+        // message substring (pre-marker payloads) both classify as unknown.
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "rollback_failed": true})),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(
+                &json!({"ok": false, "message": "stage failed; rollback errors: x"})
+            ),
+            RequestLedgerState::Unknown
+        );
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "rollback_failed": false})),
+            RequestLedgerState::Rejected
+        );
+        // A spawn checkpoint carries not_delivered *and* evidence of created
+        // external resources: keep the receipt (unknown), never release.
+        assert_eq!(
+            classify_result_state(&json!({
+                "ok": false,
+                "delivery_state": "not_delivered",
+                "resumable": true,
+                "spawn": {"pane_id": "w1:p1"}
+            })),
+            RequestLedgerState::Unknown
+        );
+        // A not_delivered refusal with no resource evidence still releases.
+        assert_eq!(
+            classify_result_state(&json!({"ok": false, "delivery_state": "not_delivered"})),
+            RequestLedgerState::NotDelivered
         );
     }
 

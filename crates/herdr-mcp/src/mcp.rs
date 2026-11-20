@@ -1128,11 +1128,6 @@ fn initialize_result(request: &Value) -> Value {
         "protocolVersion": protocol,
         "capabilities": {
             "tools": {"listChanged": false},
-            // Advertised so ingresses (Edge /mcp admission, the same-host
-            // shim) can refuse client_request_id-keyed writes to runtimes
-            // that predate the durable write ledger — an older runtime
-            // silently ignores the undeclared parameter and would re-execute.
-            "experimental": {"herdr_durable_write_client_request_id": true},
         },
         "serverInfo": {
             "name": "herdr-mcp",
@@ -1142,6 +1137,12 @@ fn initialize_result(request: &Value) -> Value {
         "_meta": {
             "herdr_contract_epoch": identity.as_ref().map(|value| value.epoch),
             "herdr_contract_hash": identity.as_ref().map(|value| value.hash.as_str()),
+            // Advertised so ingresses (Edge /mcp admission, the same-host
+            // shim, which reads `_meta` per design §6) can refuse
+            // client_request_id-keyed writes to runtimes that predate the
+            // durable write ledger — an older runtime silently ignores the
+            // undeclared parameter and would re-execute.
+            "herdr_durable_write_client_request_id": true,
         }
     })
 }
@@ -1153,12 +1154,12 @@ fn discover_result() -> Value {
         "supportedVersions": SUPPORTED_VERSIONS,
         "capabilities": {
             "tools": {"listChanged": false},
-            "experimental": {"herdr_durable_write_client_request_id": true},
         },
         "instructions": SERVER_INSTRUCTIONS,
         "ttlMs": 3_600_000,
         "cacheScope": "private",
         "_meta": {
+            "herdr_durable_write_client_request_id": true,
             "io.modelcontextprotocol/serverInfo": {
                 "name": "herdr-mcp",
                 "version": crate::runtime_meta::runtime_version()
@@ -1320,6 +1321,33 @@ fn tool_call(request: &Value, context: &RuntimeContext<'_>) -> Result<Value, Str
     } else {
         None
     };
+    // An inner `client_request_id` on a wrapped *write* method never reaches
+    // a ledger: the write schemas do not declare it, so it would be silently
+    // dropped — a "keyed" write executing with no dedupe. Fail closed; the
+    // key belongs on the outer call or on the first-class write tool
+    // directly. (Read methods like herdr_mcp.request.status legitimately
+    // declare client_request_id inside params and are unaffected.)
+    if let Some(params) = herdr_call_params.as_ref()
+        && params.get("client_request_id").is_some()
+        && client_request_tool_kind(
+            arguments
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )
+        .is_some()
+    {
+        return Ok(tool_result(
+            json!({
+                "ok": false,
+                "code": "invalid_params",
+                "retryable": false,
+                "delivery_state": "not_delivered",
+                "message": "client_request_id inside herdr_call params is not forwarded and would silently skip dedupe; pass it as a top-level argument of this call (or of the first-class write tool) instead",
+            }),
+            true,
+        ));
+    }
     let mut expected_target: Option<&Value> = None;
     if let Some(params) = herdr_call_params.as_ref()
         && let Some(value) = params.get("expected_core_target")
@@ -1504,8 +1532,16 @@ fn write_tool_with_request_ledger(
         crate::durable_request_ledger::preferred_client_request_id(context.wire_request_id);
     // The key is ledger metadata, not tool payload: it leaves the request
     // before the fingerprint and before dispatch so the tool never sees it.
+    // For herdr_prompt the same caller key also fills `idempotency_key` when
+    // the caller did not supply one (both present is rejected upstream as
+    // mutually exclusive): spawn requires an idempotency key, the task
+    // registry keys `agent.task.status` lookups by it, and the registry's
+    // own spawn-resume path binds retries to the first dispatch.
     if let Some(object) = arguments.as_object_mut() {
         object.remove("client_request_id");
+        if name == "herdr_prompt" && object.get("idempotency_key").is_none() {
+            object.insert("idempotency_key".to_owned(), json!(client_request_id));
+        }
     }
     let ids = crate::durable_request_ledger::client_request_ids(
         kind,
@@ -16399,11 +16435,22 @@ fn route_fs_git(op: &str, snapshot: &Value, arguments: &Value) -> Value {
             _ => json!({"ok": false, "code": "unknown_operation", "op": op}),
         },
         Some(Ok(value)) => value,
-        Some(Err(message)) => json!({
-            "ok": false,
-            "code": "broker_failed",
-            "message": message,
-        }),
+        Some(Err(message)) => {
+            // A transport-level broker failure (spawn, timeout, EOF, parse)
+            // on a mutating op cannot prove the child did not already write,
+            // so the durable client-request ledger must treat delivery as
+            // unknown and keep the key tombstoned instead of releasing it
+            // for a blind re-execution.
+            let mut value = json!({
+                "ok": false,
+                "code": "broker_failed",
+                "message": message,
+            });
+            if matches!(op, "fs_write" | "fs_edit" | "fs_patch" | "git") {
+                value["delivery_state"] = json!("delivery_unknown");
+            }
+            value
+        }
     };
     crate::macos_permissions::map_fs_git_result(value)
 }
@@ -35203,7 +35250,7 @@ mod durable_client_request_tests {
         );
 
         let request = json!({"params": {"name": "herdr_prompt", "arguments": {
-            "pane": "w1:p1",
+            "target": "w1:p1",
             "text": "hello",
             "client_request_id": "cr-pdual",
             "idempotency_key": "idem-pdual"
@@ -35211,6 +35258,16 @@ mod durable_client_request_tests {
         let body = call_body(&tool_call(&request, &context).unwrap());
         assert_eq!(body["ok"], false, "{body}");
         assert_eq!(body["code"], "invalid_params", "{body}");
+        // The refusal must come from the D-1 mutual-exclusion guard, not a
+        // later argument validation: a removed guard would dispatch (or fail
+        // elsewhere) instead of naming the two idempotency slots.
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("mutually exclusive"),
+            "{body}"
+        );
         {
             let store = state_store.lock().unwrap();
             let digest = crate::durable_request_ledger::client_request_key_digest(
@@ -35288,22 +35345,190 @@ mod durable_client_request_tests {
     }
 
     /// user ingress | Given initialize/discover negotiation | When an
-    /// ingress inspects server capabilities | Then the durable write
-    /// client_request_id feature is advertised so keyed writes can be
-    /// refused to runtimes that predate it.
+    /// ingress inspects `_meta` | Then the durable write client_request_id
+    /// feature is advertised so keyed writes can be refused to runtimes
+    /// that predate it.
     #[test]
     fn user_ingress_then_handshake_advertises_durable_write_key_capability() {
         let initialize =
             initialize_result(&json!({"params": {"protocolVersion": SDK_WIRE_PROTOCOL}}));
         assert_eq!(
-            initialize["capabilities"]["experimental"]["herdr_durable_write_client_request_id"],
-            true,
+            initialize["_meta"]["herdr_durable_write_client_request_id"], true,
             "{initialize}"
         );
         let discover = discover_result();
         assert_eq!(
-            discover["capabilities"]["experimental"]["herdr_durable_write_client_request_id"], true,
+            discover["_meta"]["herdr_durable_write_client_request_id"], true,
             "{discover}"
         );
+    }
+
+    /// user caller | Given a herdr_call wrapping a write method | When the
+    /// inner params carry client_request_id | Then the call is refused
+    /// instead of silently executing an undeduplicated write.
+    #[test]
+    fn user_herdr_call_given_inner_client_request_id_then_invalid_params() {
+        let root = temp_dir("wcallinner");
+        std::fs::create_dir_all(&root).unwrap();
+        let client = HerdrClient::new(root.join("absent.sock"));
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let prompt = PromptRegistry::new();
+        let skill = SkillService::new();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let request = json!({"params": {"name": "herdr_call", "arguments": {
+            "method": "herdr_fs_write",
+            "params": {
+                "path": "a.txt",
+                "content": "x\n",
+                "client_request_id": "cr-inner-1"
+            }
+        }}});
+        let body = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["code"], "invalid_params", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("client_request_id"),
+            "{body}"
+        );
+        // No durable row was reserved under any write kind.
+        let store = state_store.lock().unwrap();
+        for kind in crate::durable_request_ledger::CLIENT_REQUEST_KINDS {
+            let digest =
+                crate::durable_request_ledger::client_request_key_digest(kind, "cr-inner-1");
+            assert!(
+                store
+                    .client_request_record(kind, &digest)
+                    .unwrap()
+                    .is_none(),
+                "{kind} must hold no row"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// user caller | Given each first-class write tool name | When the
+    /// client_request_id kind map is consulted | Then every write tool maps
+    /// to its own durable ledger kind and non-write tools map to none.
+    #[test]
+    fn write_tool_client_request_kinds_cover_all_four_tools() {
+        use crate::durable_request_ledger as ledger;
+        for (tool, kind) in [
+            ("herdr_fs_write", ledger::HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+            ("herdr_fs_edit", ledger::HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+            ("herdr_fs_patch", ledger::HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+            ("herdr_prompt", ledger::HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        ] {
+            assert_eq!(client_request_tool_kind(tool), Some(kind), "{tool}");
+        }
+        for non_write in ["herdr_fs_read", "herdr_call", "herdr_git", "herdr_inspect"] {
+            assert_eq!(client_request_tool_kind(non_write), None, "{non_write}");
+        }
+    }
+
+    /// user caller | Given a herdr_prompt keyed by client_request_id | When
+    /// the dispatch succeeds and the same key is retried | Then the retry is
+    /// served from the durable ledger with the same task_id/receipt_id and
+    /// the agent socket sees exactly one agent.prompt — the success path,
+    /// not only a manually seeded record.
+    #[cfg(unix)]
+    #[test]
+    fn user_prompt_retry_after_success_then_replay_returns_same_receipt() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::thread;
+
+        let root = temp_dir("wpreplay");
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("h.sock");
+        let _sock_guard = crate::test_env::TempUnixSocketGuard::file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for expected in ["agent.get", "agent.prompt"] {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut line = String::new();
+                match BufReader::new(stream.try_clone().unwrap()).read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    break;
+                };
+                assert_eq!(request["method"], expected);
+                let result = if expected == "agent.get" {
+                    json!({"agent": {"pane_id": "w1:p1", "agent_status": "idle", "state_change_seq": 1}})
+                } else {
+                    json!({"prompt": {"status": "submitted", "agent": {"pane_id": "w1:p1", "agent_status": "working", "state_change_seq": 2}}})
+                };
+                if writeln!(stream, "{}", json!({"id": request["id"], "result": result})).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let client = HerdrClient::new(&socket);
+        let cache = EventCache::from_snapshot_for_test(json!({
+            "workspaces": [], "tabs": [], "panes": [], "agents": []
+        }));
+        let exec = ExecRegistry::new(root.join("exec")).unwrap();
+        let state_store = Arc::new(Mutex::new(StateStore::open_in_dir(&root, "state").unwrap()));
+        let prompt = PromptRegistry::with_store(state_store.clone());
+        let skill = SkillService::new();
+        let backend = crate::test_env::tui_backend_selection();
+        let context = durable_context(
+            &client,
+            &cache,
+            &exec,
+            &prompt,
+            &skill,
+            &state_store,
+            &backend,
+            Some("edge-device-1"),
+        );
+
+        let request = json!({"params": {"name": "herdr_prompt", "arguments": {
+            "target": "pi",
+            "text": "do work",
+            "client_request_id": "cr-preplay"
+        }}});
+        let first = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(first["ok"], true, "{first}");
+        let task_id = first["task_id"].clone();
+        let receipt_id = first["receipt_id"].clone();
+        assert!(task_id.is_string() && receipt_id.is_string(), "{first}");
+        // The caller key is bridged to `idempotency_key`: the dispatch's
+        // task is queryable by it even though the caller never passed one.
+        let status = prompt.task_status_by_idempotency("cr-preplay", "pi", None);
+        assert_eq!(status["ok"], true, "{status}");
+
+        let replay = call_body(&tool_call(&request, &context).unwrap());
+        assert_eq!(replay["deduplicated"], true, "{replay}");
+        assert_eq!(replay["task_id"], task_id, "{replay}");
+        assert_eq!(replay["receipt_id"], receipt_id, "{replay}");
+
+        // The fake server exited after exactly agent.get + agent.prompt: a
+        // replay cannot have dispatched a second agent.prompt.
+        server.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

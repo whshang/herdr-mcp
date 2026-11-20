@@ -25,6 +25,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // summary TTL so a same-key retry within a day finds the first outcome
 // regardless of which idempotency mechanism recorded it.
 const RECORD_TTL_MS: u64 = 24 * 60 * 60_000;
+// The cap is a bound, not a second lifetime: eviction is oldest-first, so a
+// hot loop of distinct keys can expire a record well before RECORD_TTL_MS —
+// callers must not rely on the TTL alone for a 24h dedupe guarantee. The
+// durable client_request_id ledger (24h tombstones) covers that window.
 const RECORD_LIMIT: usize = 512;
 const PROMPT_OPERATION_KIND: &str = "herdr_prompt";
 const PROMPT_TASK_OPERATION_KIND: &str = "herdr_prompt_task";
