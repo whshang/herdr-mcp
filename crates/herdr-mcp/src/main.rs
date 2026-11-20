@@ -247,6 +247,7 @@ fn run() -> Result<ExitCode, String> {
             ))
         }
         cli::Command::TccBrokerRun => Ok(tcc_broker::run_broker_once()),
+        cli::Command::TccBrokerStreamRun => Ok(tcc_broker::run_broker_stream()),
         cli::Command::TccHerdrHost => tcc_broker::run_herdr_host(),
         cli::Command::CredentialHelperRun => Ok(macos_credential_helper::run_once()),
         cli::Command::TccBroker(command) => tcc_broker::run_cli(command),
