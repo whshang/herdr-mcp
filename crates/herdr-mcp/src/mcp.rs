@@ -1084,7 +1084,7 @@ pub fn handle(request: &Value, context: &RuntimeContext<'_>) -> Option<Value> {
 
     let result = match method {
         "initialize" => Ok(initialize_result(request)),
-        "server/discover" => Ok(discover_result()),
+        "server/discover" => Ok(discover_result(context.local_device_id)),
         "tools/list" => contract::tool_catalog().map(|tools| json!({"tools": tools})),
         "tools/call" => tool_call(request, context),
         "ping" => Ok(json!({})),
@@ -1139,7 +1139,7 @@ fn initialize_result(request: &Value) -> Value {
     })
 }
 
-fn discover_result() -> Value {
+fn discover_result(local_device_id: Option<&str>) -> Value {
     let identity = contract::identity().ok();
     json!({
         "resultType": "complete",
@@ -1155,11 +1155,14 @@ fn discover_result() -> Value {
             },
             "herdr_contract_epoch": identity.as_ref().map(|value| value.epoch),
             "herdr_contract_hash": identity.as_ref().map(|value| value.hash.as_str()),
+            // #1094 P0: the same-machine stdio shim compares this against the
+            // enrolled device before trusting the loopback endpoint.
+            "herdr_device_id": local_device_id,
         }
     })
 }
 
-fn canonical_tool_name(raw_name: &str) -> &str {
+pub(crate) fn canonical_tool_name(raw_name: &str) -> &str {
     const NAMESPACE_PREFIXES: [&str; 10] = [
         "mcp__herdr-mcp__",
         "mcp__herdr_mcp__",
@@ -17800,7 +17803,7 @@ mod tests {
 
     #[test]
     fn discover_advertises_current_native_identity_and_versions() {
-        let result = discover_result();
+        let result = discover_result(None);
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], SDK_WIRE_PROTOCOL);
         assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
