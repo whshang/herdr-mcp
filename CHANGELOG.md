@@ -1,8 +1,17 @@
 # Changelog
 
-## Unreleased (post-v1.2.0)
+## Unreleased (post-v1.2.1)
 
 （暂无内容——下一个 1.2.x/1.3 周期开始累计）
+
+## v1.2.1 — 2026-11-20
+
+1.2.1 维护版发布说明见 [docs/releases/v1.2.1.md](docs/releases/v1.2.1.md)（升级路径、兼容性与已知问题以该文件为准）；本节汇总 `v1.2.0..v1.2.1` 合入的全部 28 项变更。
+
+- **发布清单准入、更新器超时与 CI 门禁（#1084 / #1058 / #1054 / #1028）：** `contracts/runtime-exec-v4/v5/v6.json` 记录对应冻结版本的 `state_schema`（v4=15、v5=16、v6=16），`scripts/build-rust-release-manifest.mjs` 在当前 `SCHEMA_VERSION` 与上一冻结契约同为 16 时输出 `contract_migration.state_schema_from = 16` 且不写 `state_schema_migration` 块，并新增 `admit_release_contract` 跨版本准入单测，修复 `v1.1.1`（epoch 5，schema 16）主机执行 `herdr-mcp update` 被 `state_schema_from=15` 拒绝的问题（#1084）；`update_scheduler.rs` 与 `updater.rs` 中全部 `launchctl`、服务启停卸载与候选二进制 `--version` 探测改走 `child_process::run_bounded_output`（5s/10s/30s 超时，32 KiB 上限，#1049 随 #1058 合入）；Standalone 扩展 GitHub 下载 `reqwest` 客户端增加 10s 连接超时与 60s 总超时（#1048 随 #1054 合入）；CI 为 Rust 专属 PR 分流至 `rust` Node 跨语言门禁并在测试前构建根工程，`extension`/`edge` 通道移除冗余根 `tsc`，Cloudflare 生产回归门禁在 `test:edge` 与 `test:built` 之间显式执行 `npm run build`（#1025 随 #1028 合入）。
+- **运行时热路径、子进程与执行会话持久化（#1075 / #1056 / #1050 / #1072 / #1021 / #1051 / #1022）：** `CacheState.state` 改为 `Arc<Value>` 写时复制，`admitted_tool_output` 单次取 `Arc` 快照供 `ToolCallCapture` 与 `herdr_fs_*`/`pane.split`/`herdr_exec`/`work.pickup` 共享，`may_record_tool_call` 对无作用域键的调用前置跳过捕获（#1061 随 #1075 合入）；`herdr_supervisor` 稳态无变化周期零刷盘并实行分级探测（#1052 随 #1056 合入）；`child_process` 的 `wait_bounded`/`run_bounded_output` 采用 250us→10ms 指数微退避轮询，仅在子进程存活超过 25ms 宽限窗后才登记磁盘孤儿表（#1033 随 #1050 合入）；`exec.wait` 采用 10/20/50/100/200ms 有界微退避阶梯（#1063 随 #1072 合入）；`complete_session` 将 `.spool` 原子写入与 SQLite settle 移出状态互斥锁、去重重复写盘并在两项持久化完成前将已关闭会话钉在常驻集内防止淘汰为空输出（#1010-1b 随 #1021 合入，附重启持久化测试顺序修复 #1051）；`exec_compact` 压缩阈值提升至 32 KiB / 200 行（首尾 40/120 行）并在中间省略段保留 Rust/Python/JS/TS 错误栈与编译诊断窗口（#1010-1c 随 #1022 合入）。
+- **文件系统、Git 状态缓存、任务编排与 Semantic 服务（#1020 / #1060 / #1073 / #1078 / #1017 / #1045 / #1042 / #1018 / #1057 / #1015）：** `herdr_inspect` 受管根 `git status` 增加 250ms TTL 缓存与按路径隔离的 singleflight 并发合并，在 `herdr_exec`、文件写改、`text.write` 与 patch 提交后即时失效，并用有界 `wait_timeout` 与 RAII 清理自动恢复卡死探测（#1010-1a 随 #1020 合入，#1023 随 #1060 合入）；递归 `herdr_fs_list` 默认保留 `target`/`node_modules`/`dist`/`.next`/`build` 目录项本身但不展开其子树，显式 glob 或起始路径在目录内时照常展开（#1070 随 #1073 合入）；无 `paths` 过滤的 `herdr_git` diff/status 改用 `--untracked-files=normal` 折叠未跟踪目录（#1071 随 #1078 合入）；`herdr_fs_grep` 单文件默认/最大预算提至 2 MiB / 8 MiB、按路径去重回传 `skipped_large_files` 并在 macOS linked worktree 下使用受限参数集调用 `rg`（#995 随 #1017 合入）；`verify_admitted_backend_config` 按文件指纹缓存解析结果，`post_extension_continuity_turn`/`resolve` 迁入 `spawn_blocking`（#1038 随 #1045 合入）；Utility pane 提交锁按 workspace ID 分桶隔离并对登记在册的自持会话做 2–8s 有界等待（#1032 随 #1042 合入）；`agent.task.status` 支持按 `target` 查询并按 `parent_session_ref` 隔离，`agent.task.ack` 支持 `workspace_id`/`target`/`before_ms` 全量扫描批量确认，`agent.task.inbox` 升级信号过滤已关闭 workspace/pane（#1005 随 #1018 合入）；Semantic 配置单次装载、复用进程级 HTTP client 并异步刷新 Edge 能力（#1057），`capability_json` 暴露后台路由失败计数与冷却剩余时间并将后台对话超时从 60s/120s 收紧至 10s/30s（#1006 随 #1015 合入）。
+- **Cloudflare Edge、浏览器扩展与设计文档（#1059 / #1029 / #1041 / #1043 / #1044 / #1066 / #1019）：** Edge `DeviceRegistryDO` 按存储键后缀缓存 `device:` 目录并在事务清理时按 `<=128` 键分块删除（#1053 随 #1059 合入）；Edge `WorkstationDO` 结算阶段以单次多键 `storage.put` 原子写入 `completed` 与 `idem` 行后再删除 `pending`（#1026 随 #1029 合入）；Edge `EDGE_STATUS_REPLY_INTERVAL_MS` 由 30s 调至 25s 为 30s Link 心跳预留 5s 抖动余量（#1034 随 #1041 合入）；浏览器扩展隐藏空闲标签页自动挂起 `wake.js` 路由与回合轮询（#1039 随 #1043 合入，扩展 `0.1.252`）、手动模式复用驻留流可达性缓存并在标签页关闭或解绑时回收内存（#1036/#1037 随 #1044 合入，扩展 `0.1.253`）、Project `active_conv_key` 原地切换时回收旧会话 nudge 状态（#1066，扩展 `0.1.254`）；新增 macOS `tcc_broker` 执行中介设计文档（#1008 随 #1019 合入）。
 
 ## v1.2.0 — 2026-11-18
 
