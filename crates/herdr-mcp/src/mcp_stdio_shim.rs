@@ -51,19 +51,23 @@ const WRITE_TOOLS_FORWARDED_TO_EDGE: [&str; 4] = [
 ];
 
 /// `herdr_call` inner methods that only exist on Edge (fleet control plus the
-/// Edge-local fleet-administration surface). Forwarded verbatim; the Edge
-/// device-credential path scopes the resulting principal.
-const EDGE_FORWARD_PREFIXES: [&str; 3] = [
+/// Edge-local fleet-administration surface). Mirrors the
+/// `EDGE_RESERVED_PRIVATE_METHOD_PREFIXES` set in `edge/cloudflare/src/
+/// mcp-handler.ts` — anything under these prefixes is never served locally.
+const EDGE_FORWARD_PREFIXES: [&str; 7] = [
+    "herdr_mcp.device.",
+    "herdr_mcp.connector.",
+    "herdr_mcp.automation.",
+    "herdr_mcp.planner_control.",
     "herdr_mcp.work_chain.",
     "herdr_mcp.planner_lease.",
     "herdr_mcp.execution_lane.",
 ];
-const EDGE_FORWARD_EXACT: [&str; 4] = [
-    "herdr_mcp.device.pair",
-    "herdr_mcp.device.revoke",
-    "herdr_mcp.connector.approve",
-    "herdr_mcp.connector.revoke",
-];
+
+/// Direct-path wait budget: the shim applies the same `pane.wait_for_output`
+/// timeout clamp Edge enforces (`REMOTE_PANE_WAIT_TIMEOUT_MS` in
+/// `mcp-handler.ts`) so a local call can never out-wait the Edge contract.
+const DIRECT_WAIT_TIMEOUT_MS: u64 = 20_000;
 
 struct ShimConfig {
     endpoint: String,
@@ -231,12 +235,12 @@ fn dispatch(
     let method = request.get("method").and_then(Value::as_str);
 
     let route = if method == Some("tools/call") {
-        classify_tool_call(request)
+        classify_tool_call(request, &shim.device_id)
     } else {
         Route::Loopback
     };
     let response = match route {
-        Route::Loopback => forward_loopback(client, shim, request),
+        Route::Loopback => forward_loopback(client, shim, &clamp_direct_wait(request)),
         Route::EdgeMcp => match edge_headers(shim) {
             Some(headers) => forward_edge_mcp(client, shim, &headers, request),
             None => Ok(tool_error_envelope(
@@ -280,10 +284,36 @@ enum ResponseBody {
     ToolResult(Value),
 }
 
-fn classify_tool_call(request: &Value) -> Route {
+/// Tool-call `params.arguments`, normalized for policy inspection: accepts
+/// both the object form and the JSON-stringified form some clients emit.
+fn call_arguments(request: &Value) -> Option<serde_json::Map<String, Value>> {
+    let raw = request.pointer("/params/arguments")?;
+    let value = match raw {
+        Value::String(text) => serde_json::from_str::<Value>(text).ok()?,
+        other => other.clone(),
+    };
+    value.as_object().cloned()
+}
+
+fn classify_tool_call(request: &Value, local_device_id: &str) -> Route {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let raw_name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let name = crate::mcp::canonical_tool_name(raw_name);
+    let arguments = call_arguments(request);
+    // A cross-device selector must never be executed by this workstation:
+    // the loopback runtime only resolves `herdr_ref_*` tokens and ignores a
+    // bare `arguments.device`, so a foreign target would otherwise run
+    // silently against the local host. Anything not naming this enrolled
+    // device goes to Edge, where device routing is authoritative.
+    if let Some(device) = arguments
+        .as_ref()
+        .and_then(|args| args.get("device"))
+        .and_then(Value::as_str)
+        && !device.trim().is_empty()
+        && device != local_device_id
+    {
+        return Route::EdgeMcp;
+    }
     if name == "herdr_devices" {
         return Route::EdgeDevices;
     }
@@ -293,11 +323,20 @@ fn classify_tool_call(request: &Value) -> Route {
     if name != "herdr_call" {
         return Route::Loopback;
     }
-    let arguments = match params.get("arguments") {
-        Some(Value::String(text)) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
-        other => other.cloned().unwrap_or(Value::Null),
-    };
-    let arguments = arguments.as_object().cloned().unwrap_or_default();
+    let arguments = arguments.unwrap_or_default();
+    let inner_method = arguments
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // Edge-bound methods keep their own inner idempotency contract
+    // (fleet-control methods REQUIRE `idempotency_key`), so the Edge route is
+    // decided before the direct-path ledger guard below.
+    let edge_bound = EDGE_FORWARD_PREFIXES
+        .iter()
+        .any(|prefix| inner_method.starts_with(prefix));
+    if edge_bound {
+        return Route::EdgeMcp;
+    }
     if arguments.contains_key("idempotency_key") {
         return Route::Reject(json!({
             "ok": false,
@@ -306,17 +345,6 @@ fn classify_tool_call(request: &Value) -> Route {
             "delivery_state": "not_delivered",
             "message": "herdr_call idempotency_key has no Edge replay ledger on the direct path; submit client_request_id instead",
         }));
-    }
-    let inner_method = arguments
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let edge_bound = EDGE_FORWARD_EXACT.contains(&inner_method)
-        || EDGE_FORWARD_PREFIXES
-            .iter()
-            .any(|prefix| inner_method.starts_with(prefix));
-    if edge_bound {
-        return Route::EdgeMcp;
     }
     let mutating = !inner_method.is_empty()
         && !crate::durable_request_ledger::is_read_only_client_request_method(inner_method);
@@ -330,6 +358,73 @@ fn classify_tool_call(request: &Value) -> Route {
         }));
     }
     Route::Loopback
+}
+
+/// Clamp `herdr_call` `pane.wait_for_output` `params.timeout_ms` to the same
+/// 20s budget Edge enforces — the direct path must never out-wait the Edge
+/// contract. Mirrors `normalizeRemoteHerdrCallArgs` in `mcp-handler.ts`:
+/// object and stringified `params` are both handled, and an absent or
+/// non-numeric timeout is left for the runtime to reject.
+fn clamp_direct_wait(request: &Value) -> Value {
+    if request.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return request.clone();
+    }
+    let mut out = request.clone();
+    let Some(params) = out.pointer_mut("/params") else {
+        return out;
+    };
+    let Some(arguments) = params.get_mut("arguments") else {
+        return out;
+    };
+    match arguments {
+        Value::Object(args) => {
+            if args.get("method").and_then(Value::as_str) != Some("pane.wait_for_output") {
+                return out;
+            }
+            if let Some(Value::Object(inner)) = args.get_mut("params") {
+                clamp_timeout_field(inner);
+            } else if let Some(Value::String(text)) = args.get_mut("params")
+                && let Ok(Value::Object(mut inner)) = serde_json::from_str::<Value>(text)
+                && clamp_timeout_field(&mut inner)
+            {
+                *text = Value::Object(inner).to_string();
+            }
+        }
+        Value::String(text) => {
+            let Ok(mut args) = serde_json::from_str::<Value>(text) else {
+                return out;
+            };
+            if args.get("method").and_then(Value::as_str) != Some("pane.wait_for_output") {
+                return out;
+            }
+            let mut rewritten = false;
+            if let Some(Value::Object(inner)) = args.get_mut("params") {
+                rewritten = clamp_timeout_field(inner);
+            } else if let Some(Value::String(inner_text)) = args.get_mut("params")
+                && let Ok(Value::Object(mut inner)) = serde_json::from_str::<Value>(inner_text)
+                && clamp_timeout_field(&mut inner)
+            {
+                *inner_text = Value::Object(inner).to_string();
+                rewritten = true;
+            }
+            if rewritten && let Value::String(text) = arguments {
+                *text = args.to_string();
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn clamp_timeout_field(params: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(timeout) = params.get("timeout_ms").and_then(Value::as_u64) else {
+        return false;
+    };
+    if timeout <= DIRECT_WAIT_TIMEOUT_MS {
+        return false;
+    }
+    params.insert("timeout_ms".to_owned(), Value::from(DIRECT_WAIT_TIMEOUT_MS));
+    true
 }
 
 fn edge_headers(shim: &ShimConfig) -> Option<Vec<(String, String)>> {
@@ -481,6 +576,12 @@ fn write_response(out: &mut impl Write, response: &Value) {
 mod tests {
     use super::*;
 
+    const LOCAL: &str = "dev_01LOCALDEVICE00000000000000";
+
+    fn route(request: &Value) -> Route {
+        classify_tool_call(request, LOCAL)
+    }
+
     fn call(name: &str, arguments: Value) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -493,21 +594,18 @@ mod tests {
     #[test]
     fn write_tools_route_to_edge() {
         for tool in WRITE_TOOLS_FORWARDED_TO_EDGE {
-            assert!(matches!(
-                classify_tool_call(&call(tool, json!({}))),
-                Route::EdgeMcp
-            ));
+            assert!(matches!(route(&call(tool, json!({}))), Route::EdgeMcp));
         }
     }
 
     #[test]
     fn herdr_devices_routes_to_edge_rest() {
         assert!(matches!(
-            classify_tool_call(&call("herdr_devices", json!({}))),
+            route(&call("herdr_devices", json!({}))),
             Route::EdgeDevices
         ));
         assert!(matches!(
-            classify_tool_call(&call("mcp__herdr-mcp__herdr_devices", json!({}))),
+            route(&call("mcp__herdr-mcp__herdr_devices", json!({}))),
             Route::EdgeDevices
         ));
     }
@@ -523,7 +621,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    classify_tool_call(&call("herdr_call", json!({"method": method}))),
+                    route(&call("herdr_call", json!({"method": method}))),
                     Route::EdgeMcp
                 ),
                 "{method} must forward to Edge"
@@ -533,11 +631,10 @@ mod tests {
 
     #[test]
     fn herdr_call_with_idempotency_key_is_refused() {
-        let route = classify_tool_call(&call(
+        let Route::Reject(payload) = route(&call(
             "herdr_call",
             json!({"method": "server.status", "idempotency_key": "k"}),
-        ));
-        let Route::Reject(payload) = route else {
+        )) else {
             panic!("idempotency_key must be refused");
         };
         assert_eq!(payload["code"], "direct_no_edge_replay_ledger");
@@ -545,11 +642,10 @@ mod tests {
 
     #[test]
     fn mutating_herdr_call_requires_client_request_id() {
-        let route = classify_tool_call(&call(
+        let Route::Reject(payload) = route(&call(
             "herdr_call",
             json!({"method": "herdr_mcp.agent.task.dispatch"}),
-        ));
-        let Route::Reject(payload) = route else {
+        )) else {
             panic!("mutating herdr_call without client_request_id must be refused");
         };
         assert_eq!(payload["code"], "client_request_id_required");
@@ -558,7 +654,7 @@ mod tests {
             "herdr_call",
             json!({"method": "herdr_mcp.agent.task.dispatch", "client_request_id": "cr_1"}),
         );
-        assert!(matches!(classify_tool_call(&with_key), Route::Loopback));
+        assert!(matches!(route(&with_key), Route::Loopback));
     }
 
     #[test]
@@ -569,23 +665,25 @@ mod tests {
             "herdr_mcp.skill.list",
         ] {
             assert!(matches!(
-                classify_tool_call(&call("herdr_call", json!({"method": method}))),
+                route(&call("herdr_call", json!({"method": method}))),
                 Route::Loopback
             ));
         }
         assert!(matches!(
-            classify_tool_call(&call("herdr_fs_read", json!({"path": "/tmp/x"}))),
+            route(&call("herdr_fs_read", json!({"path": "/tmp/x"}))),
             Route::Loopback
         ));
         assert!(matches!(
-            classify_tool_call(&call("herdr_exec", json!({"cmd": "ls"}))),
+            route(&call("herdr_exec", json!({"cmd": "ls"}))),
             Route::Loopback
         ));
     }
 
     #[test]
     fn stringified_arguments_are_parsed_for_policy() {
-        let request = json!({
+        // An Edge-bound fleet method keeps its own idempotency contract and
+        // forwards even in stringified-arguments form.
+        let edge_call = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
@@ -594,8 +692,111 @@ mod tests {
                 "arguments": "{\"method\":\"herdr_mcp.work_chain.create\",\"idempotency_key\":\"k\"}",
             },
         });
-        // idempotency_key is checked before the Edge route, so this rejects
-        // rather than forwarding a ledger-less mutation.
-        assert!(matches!(classify_tool_call(&request), Route::Reject(_)));
+        assert!(matches!(route(&edge_call), Route::EdgeMcp));
+
+        // A local mutating call in stringified form still hits the direct-path
+        // ledger guard.
+        let local_call = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "herdr_call",
+                "arguments": "{\"method\":\"herdr_mcp.agent.task.dispatch\",\"idempotency_key\":\"k\"}",
+            },
+        });
+        assert!(matches!(route(&local_call), Route::Reject(_)));
+    }
+
+    #[test]
+    fn foreign_device_selector_routes_to_edge() {
+        let foreign = call(
+            "herdr_fs_read",
+            json!({"path": "/tmp/x", "device": "dev_01OTHER"}),
+        );
+        assert!(matches!(route(&foreign), Route::EdgeMcp));
+
+        let own = call("herdr_fs_read", json!({"path": "/tmp/x", "device": LOCAL}));
+        assert!(matches!(route(&own), Route::Loopback));
+
+        // Same selector through stringified arguments and a namespaced name.
+        let stringified = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mcp__herdr-mcp__herdr_exec",
+                "arguments": "{\"cmd\":\"ls\",\"device\":\"other-mac\"}",
+            },
+        });
+        assert!(matches!(route(&stringified), Route::EdgeMcp));
+    }
+
+    #[test]
+    fn reserved_private_prefixes_route_to_edge() {
+        for method in [
+            "herdr_mcp.automation.create",
+            "herdr_mcp.connector.webchat_control.set",
+            "herdr_mcp.connector.page_assist.set",
+            "herdr_mcp.device.pair",
+            "herdr_mcp.planner_control.set",
+        ] {
+            assert!(
+                matches!(
+                    route(&call("herdr_call", json!({"method": method}))),
+                    Route::EdgeMcp
+                ),
+                "{method} must forward to Edge"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_wait_timeout_is_clamped_to_direct_budget() {
+        // Object arguments + object params.
+        let request = call(
+            "herdr_call",
+            json!({"method": "pane.wait_for_output", "params": {"timeout_ms": 60_000}}),
+        );
+        let clamped = clamp_direct_wait(&request);
+        assert_eq!(
+            clamped.pointer("/params/arguments/params/timeout_ms"),
+            Some(&Value::from(20_000u64))
+        );
+
+        // Object arguments + stringified params.
+        let request = call(
+            "herdr_call",
+            json!({"method": "pane.wait_for_output", "params": "{\"timeout_ms\":45000}"}),
+        );
+        let clamped = clamp_direct_wait(&request);
+        let inner: Value = serde_json::from_str(
+            clamped
+                .pointer("/params/arguments/params")
+                .and_then(Value::as_str)
+                .expect("params stays stringified"),
+        )
+        .unwrap();
+        assert_eq!(inner["timeout_ms"], Value::from(20_000u64));
+
+        // Within-budget and non-numeric values are untouched.
+        for params in [
+            json!({"timeout_ms": 5_000}),
+            json!({"timeout_ms": "60000"}),
+            json!({}),
+        ] {
+            let request = call(
+                "herdr_call",
+                json!({"method": "pane.wait_for_output", "params": params}),
+            );
+            assert_eq!(clamp_direct_wait(&request), request);
+        }
+
+        // Other methods are never rewritten.
+        let request = call(
+            "herdr_call",
+            json!({"method": "server.status", "params": {"timeout_ms": 60_000}}),
+        );
+        assert_eq!(clamp_direct_wait(&request), request);
     }
 }
