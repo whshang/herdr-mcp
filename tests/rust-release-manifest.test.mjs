@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  PREVIOUS_FROZEN_RUNTIME_SCHEMA,
   RUST_RELEASE_MATRIX,
   RUST_RELEASE_PROVENANCE,
   RUST_RELEASE_TARGETS,
@@ -110,16 +111,27 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
   await mkdir(join(root, "contracts"), { recursive: true });
   await mkdir(assetsDir);
   const previous = JSON.parse(await readFile(new URL("../contracts/runtime-exec-v5.json", import.meta.url), "utf8"));
+  assert.equal(PREVIOUS_FROZEN_RUNTIME_SCHEMA, 16);
   assert.deepEqual(
-    { epoch: previous.contract_epoch, hash: previous.contract_hash, tool_count: previous.tool_count },
-    { epoch: 5, hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030", tool_count: 18 },
+    {
+      epoch: previous.contract_epoch,
+      hash: previous.contract_hash,
+      tool_count: previous.tool_count,
+      state_schema: previous.state_schema,
+    },
+    {
+      epoch: 5,
+      hash: "sha256:fb1925844e873f12b609232890788c6297474433ac4bc7f003d73b1a3a60f030",
+      tool_count: 18,
+      state_schema: 16,
+    },
   );
   const current = await readFile(new URL("../contracts/runtime-exec-v6.json", import.meta.url), "utf8");
   await writeFile(join(root, "contracts", "runtime-exec-v6.json"), current);
   await writeFile(join(root, "contracts", "runtime-exec-v5.json"), JSON.stringify(previous));
   await writeFile(join(root, "crates", "herdr-mcp", "Cargo.toml"), '[package]\nversion = "1.1.0-rc.1"\n');
   const schemaPath = join(root, "crates", "herdr-mcp", "src", "state_store.rs");
-  await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 15;\n");
+  await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 16;\n");
   for (const target of RUST_RELEASE_TARGETS) {
     await writeFile(join(assetsDir, releaseAssetName("1.1.0-rc.1", target)), `binary-${target}`);
   }
@@ -131,10 +143,10 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
   try {
     const manifest = await buildRustReleaseManifest(options);
     assert.equal(manifest.schema_version, 2);
-    assert.equal(manifest.state_schema, 15);
+    assert.equal(manifest.state_schema, 16);
     assert.deepEqual(manifest.contract_migration, {
       from: { epoch: 5, hash: previous.contract_hash, tool_count: 18 },
-      state_schema_from: 15,
+      state_schema_from: 16,
     });
     assert.equal(Object.hasOwn(manifest, "state_schema_migration"), false);
     assert.deepEqual(manifest.contract, {
@@ -142,6 +154,22 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
     });
     assert.equal(manifest.release_identity.source_ref, options.sourceRef);
     assert.equal(manifest.assets.length, RUST_RELEASE_TARGETS.length);
+    await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 17;\n");
+    const nextMigrated = await buildRustReleaseManifest(options);
+    assert.equal(nextMigrated.state_schema, 17);
+    assert.deepEqual(nextMigrated.state_schema_migration, { from: 16, to: 17, reversible: false });
+    assert.deepEqual(nextMigrated.contract_migration, {
+      from: { epoch: 5, hash: previous.contract_hash, tool_count: 18 },
+      state_schema_from: 16,
+    });
+    for (const schema of [15, 18]) {
+      await writeFile(schemaPath, `pub const SCHEMA_VERSION: i64 = ${schema};\n`);
+      await assert.rejects(
+        buildRustReleaseManifest(options),
+        /previous frozen runtime requires state schema 16 or 17/,
+      );
+    }
+    await writeFile(join(root, "contracts", "runtime-exec-v5.json"), JSON.stringify({ ...previous, state_schema: 15 }));
     await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 16;\n");
     const migrated = await buildRustReleaseManifest(options);
     assert.equal(migrated.state_schema, 16);
@@ -157,7 +185,7 @@ test("user can cross one runtime epoch | Given the frozen rollback baseline | Wh
         /previous frozen runtime requires state schema 15 or 16/,
       );
     }
-    await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 15;\n");
+    await writeFile(schemaPath, "pub const SCHEMA_VERSION: i64 = 16;\n");
     await writeFile(join(root, "contracts", "runtime-exec-v5.json"), JSON.stringify({ ...previous, contract_epoch: 4 }));
     await assert.rejects(buildRustReleaseManifest(options), /invalid previous frozen runtime contract/);
   } finally {

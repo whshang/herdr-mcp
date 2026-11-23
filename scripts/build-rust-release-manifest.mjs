@@ -28,7 +28,12 @@ export const RUST_RELEASE_PROVENANCE = Object.freeze({
   runnerEnvironment: "github-hosted",
 });
 
-const PREVIOUS_FROZEN_RUNTIME_SCHEMA = 15;
+const previousContractPath = fileURLToPath(new URL("../contracts/runtime-exec-v5.json", import.meta.url));
+const previousContract = JSON.parse(readFileSync(previousContractPath, "utf8"));
+if (!Number.isSafeInteger(previousContract.state_schema) || previousContract.state_schema <= 0) {
+  throw new Error("invalid previous frozen runtime state schema");
+}
+export const PREVIOUS_FROZEN_RUNTIME_SCHEMA = previousContract.state_schema;
 
 export function parseCargoPackageVersion(text) {
   const packageBlock = String(text).match(/\[package\]([\s\S]*?)(?:\n\[|$)/)?.[1] || "";
@@ -94,24 +99,28 @@ export async function buildRustReleaseManifest({
   const version = parseCargoPackageVersion(cargo);
   const stateSchema = parseRustStateSchema(stateStore);
   let contractMigration;
+  let previousStateSchema = PREVIOUS_FROZEN_RUNTIME_SCHEMA;
   if (contract.contract_epoch > 2) {
     const previousPath = join(root, "contracts", `runtime-exec-v${contract.contract_epoch - 1}.json`);
     try {
       const previous = JSON.parse(await readFile(previousPath, "utf8"));
+      const resolvedPreviousSchema = previous.state_schema ?? PREVIOUS_FROZEN_RUNTIME_SCHEMA;
       if (previous.contract_epoch !== contract.contract_epoch - 1
         || !/^sha256:[a-f0-9]{64}$/.test(previous.contract_hash)
-        || !Number.isSafeInteger(previous.tool_count) || previous.tool_count <= 0) {
+        || !Number.isSafeInteger(previous.tool_count) || previous.tool_count <= 0
+        || !Number.isSafeInteger(resolvedPreviousSchema) || resolvedPreviousSchema <= 0) {
         throw new Error("invalid previous frozen runtime contract");
       }
-      if (stateSchema !== PREVIOUS_FROZEN_RUNTIME_SCHEMA
-        && stateSchema !== PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1) {
+      previousStateSchema = resolvedPreviousSchema;
+      if (stateSchema !== previousStateSchema
+        && stateSchema !== previousStateSchema + 1) {
         throw new Error(
-          `previous frozen runtime requires state schema ${PREVIOUS_FROZEN_RUNTIME_SCHEMA} or ${PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1}`,
+          `previous frozen runtime requires state schema ${previousStateSchema} or ${previousStateSchema + 1}`,
         );
       }
       contractMigration = {
         from: { epoch: previous.contract_epoch, hash: previous.contract_hash, tool_count: previous.tool_count },
-        state_schema_from: PREVIOUS_FROZEN_RUNTIME_SCHEMA,
+        state_schema_from: previousStateSchema,
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -151,10 +160,10 @@ export async function buildRustReleaseManifest({
     url: `https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/${encodeURIComponent(edgeName)}`,
   };
 
-  const stateSchemaMigration = stateSchema === PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1
+  const stateSchemaMigration = stateSchema === previousStateSchema + 1
     ? {
-      from: PREVIOUS_FROZEN_RUNTIME_SCHEMA,
-      to: PREVIOUS_FROZEN_RUNTIME_SCHEMA + 1,
+      from: previousStateSchema,
+      to: previousStateSchema + 1,
       reversible: false,
     }
     : undefined;
