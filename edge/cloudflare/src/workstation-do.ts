@@ -97,6 +97,7 @@ import { createLogger } from "./logger.js";
 import { LINK_APPLICATION_PROTOCOL } from "./auth.js";
 import { filterWebChatGrantsForRuntime } from "./webchat-grant-capability.js";
 import {
+  COMPATIBLE_RUNTIME_CONTRACTS,
   RUNTIME_EXECUTION_CONTRACT,
   isCompatibleRuntimeContract,
 } from "./contracts/runtime.js";
@@ -1609,7 +1610,7 @@ export class WorkstationDO {
         workstation_id: expected,
         ok: false,
         code: "contract_mismatch",
-        message: `edge requires runtime contract epoch ${RUNTIME_EXECUTION_CONTRACT.contract_epoch} or the immediately previous rollback baseline`,
+        message: `edge requires runtime contract epoch ${RUNTIME_EXECUTION_CONTRACT.contract_epoch} or a compatible baseline (${COMPATIBLE_RUNTIME_CONTRACTS.map((contract) => contract.contract_epoch).join("/")})`,
       };
       this.sendToSocket(ws, ack);
       this.logger.warn("ws.hello.contract_mismatch", {
