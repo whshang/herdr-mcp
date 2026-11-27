@@ -504,7 +504,7 @@ pub fn run_durable(
             "workspace": workspace_target,
         }));
     };
-    let topology = projects::derive_routing(snapshot);
+    let topology = projects::derive_routing_cached(snapshot);
     let current_projects = projects::projects_for_workspace(&topology, &workspace.id);
     let roots = current_projects
         .iter()
@@ -753,10 +753,18 @@ pub(crate) fn start_private_pane_session(
     workspace_id: &str,
     effective_root: &Path,
     command: &str,
+    expected_real: Option<&Path>,
 ) -> Value {
     #[cfg(windows)]
     {
-        let _ = (client, registry, workspace_id, effective_root, command);
+        let _ = (
+            client,
+            registry,
+            workspace_id,
+            effective_root,
+            command,
+            expected_real,
+        );
         return json!({
             "ok": false,
             "code": "unsupported_platform",
@@ -836,7 +844,7 @@ pub(crate) fn start_private_pane_session(
             return result;
         }
 
-        match registry.start_in_private_pane(effective_root, command, &pane_id) {
+        match registry.start_in_private_pane(effective_root, command, &pane_id, expected_real) {
             Ok(mut value) => {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("workspace".to_owned(), json!(workspace_id));
@@ -886,7 +894,14 @@ fn run_oneshot_readonly(
 ) -> Value {
     let (workspace_id, effective_root) = target;
     let started = Instant::now();
-    let start = start_private_pane_session(client, registry, workspace_id, effective_root, command);
+    let start = start_private_pane_session(
+        client,
+        registry,
+        workspace_id,
+        effective_root,
+        command,
+        None,
+    );
     let pane_id = start
         .get("pane_id")
         .and_then(Value::as_str)
@@ -2201,8 +2216,14 @@ mod tests {
         let client = HerdrClient::new(&socket);
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
-        let result =
-            start_private_pane_session(&client, &registry, "w1", Path::new("/tmp"), "sleep 30");
+        let result = start_private_pane_session(
+            &client,
+            &registry,
+            "w1",
+            Path::new("/tmp"),
+            "sleep 30",
+            None,
+        );
         assert_eq!(result["ok"], true);
         assert_eq!(result["backend"], "private_pane");
         assert_eq!(result["pane_id"], "w1:p9");
@@ -2759,8 +2780,14 @@ mod tests {
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
 
-        let start =
-            start_private_pane_session(&client, &registry, "w1", &root, "printf 'read-only\\n'");
+        let start = start_private_pane_session(
+            &client,
+            &registry,
+            "w1",
+            &root,
+            "printf 'read-only\\n'",
+            None,
+        );
 
         assert_eq!(start["ok"], false, "{start}");
         assert_eq!(start["code"], "exec_start_failed", "{start}");
@@ -2904,8 +2931,14 @@ mod tests {
         let registry =
             ExecRegistry::new_with_client(base.join("state"), Some(client.clone())).unwrap();
 
-        let result =
-            start_private_pane_session(&client, &registry, "w1", &base, "printf 'read-only\\n'");
+        let result = start_private_pane_session(
+            &client,
+            &registry,
+            "w1",
+            &base,
+            "printf 'read-only\\n'",
+            None,
+        );
 
         assert_eq!(result["ok"], false, "{result}");
         assert_eq!(result["code"], "private_pane_unavailable", "{result}");

@@ -644,7 +644,7 @@ fn semantic_cleanup_advisory(preview: &Value) -> Value {
 }
 
 fn managed_project_root(snapshot: &Value, root_raw: &str) -> Result<PathBuf, Value> {
-    let topology = crate::projects::derive_routing(snapshot);
+    let topology = crate::projects::derive_routing_cached(snapshot);
     crate::fs_security::validate_exact_project_root_with_topology(&topology, root_raw)
         .map(|managed| managed.root)
         .map_err(|_| {

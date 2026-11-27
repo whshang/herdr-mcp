@@ -12,6 +12,160 @@ use std::time::{Duration, Instant};
 
 const MAX_TYPED_ARGS: usize = 128;
 
+/// Ask the authorized stable broker to prove a protected exec root's `cd`
+/// target is still the directory the topology declared. Any failure —
+/// missing/outdated broker, resolution error, a real path that is not a
+/// directory, or a real path that no longer spells the declared root — is
+/// `not_delivered` so no pane is created and no command is sent.
+fn verify_protected_exec_root(snapshot: &Value, root: &Path) -> Result<std::path::PathBuf, Value> {
+    let response = match protected_exec_real_path(snapshot, root) {
+        Ok(response) => response,
+        Err(message) => {
+            return Err(json!({
+                "ok": false,
+                "reason": "protected_root_unverifiable",
+                "root": root.to_string_lossy(),
+                "message": message,
+                "delivery_state": "not_delivered",
+            }));
+        }
+    };
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(json!({
+            "ok": false,
+            "reason": "protected_root_unverifiable",
+            "root": root.to_string_lossy(),
+            "broker": response,
+            "delivery_state": "not_delivered",
+        }));
+    }
+    let real = response
+        .get("real")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    let is_dir = response.get("is_dir").and_then(Value::as_bool) == Some(true);
+    match real {
+        Some(real) if is_dir && fs_security::same_declared_spelling(&real, root) => Ok(real),
+        _ => Err(json!({
+            "ok": false,
+            "reason": "protected_root_identity_mismatch",
+            "root": root.to_string_lossy(),
+            "real": response.get("real").cloned().unwrap_or(Value::Null),
+            "delivery_state": "not_delivered",
+            "hint": "the protected root resolves somewhere other than the declared directory (a swapped or newly created symlink); refuse to create the exec pane — retry after refreshing herdr_inspect",
+        })),
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn protected_exec_real_path(snapshot: &Value, root: &Path) -> Result<Value, String> {
+    let config_dir = crate::paths::RuntimePaths::discover()
+        .map_err(|error| format!("cannot discover runtime paths: {error}"))?
+        .config_dir;
+    if !crate::tcc_broker::installed_supports_real_path(&config_dir) {
+        return Err(
+            "the installed stable TCC broker predates real.path support (compat revision 6); run `herdr-mcp permissions setup --upgrade-broker`"
+                .to_owned(),
+        );
+    }
+    crate::tcc_broker::real_path_via_stable_broker(snapshot, root)
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn protected_exec_real_path(_snapshot: &Value, _root: &Path) -> Result<Value, String> {
+    Err("protected exec transport is macOS-only".to_owned())
+}
+
+#[cfg(test)]
+fn protected_exec_real_path(_snapshot: &Value, root: &Path) -> Result<Value, String> {
+    if let Some(response) = TEST_REAL_PATH_RESPONSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&root.to_string_lossy().into_owned())
+        .cloned()
+    {
+        return response;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let config_dir = crate::paths::RuntimePaths::discover()
+            .map_err(|error| format!("cannot discover runtime paths: {error}"))?
+            .config_dir;
+        if !crate::tcc_broker::installed_supports_real_path(&config_dir) {
+            return Err(
+                "the installed stable TCC broker predates real.path support (compat revision 6); run `herdr-mcp permissions setup --upgrade-broker`"
+                    .to_owned(),
+            );
+        }
+        return crate::tcc_broker::real_path_via_stable_broker(_snapshot, root);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(format!(
+            "no test real.path response registered for {}",
+            root.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+fn forced_protected_transport(root: &Path) -> bool {
+    TEST_PROTECTED_ROOTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains(&root.to_string_lossy().into_owned())
+}
+
+#[cfg(not(test))]
+fn forced_protected_transport(_root: &Path) -> bool {
+    false
+}
+
+/// Roots forced through the protected exec transport in tests. Keyed by exact
+/// path so a concurrent test's root is never forced — a process-wide env flag
+/// would leak the protected classification into parallel tests.
+#[cfg(test)]
+static TEST_PROTECTED_ROOTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+fn set_test_protected_root(root: &Path) {
+    TEST_PROTECTED_ROOTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(root.to_string_lossy().into_owned());
+}
+
+#[cfg(test)]
+fn clear_test_protected_roots() {
+    TEST_PROTECTED_ROOTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+}
+
+#[cfg(test)]
+static TEST_REAL_PATH_RESPONSES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Result<Value, String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn set_test_real_path_response(root: &Path, response: Result<Value, String>) {
+    TEST_REAL_PATH_RESPONSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(root.to_string_lossy().into_owned(), response);
+}
+
+#[cfg(test)]
+fn clear_test_real_path_responses() {
+    TEST_REAL_PATH_RESPONSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clear();
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartInvocation {
     Command(String),
@@ -45,9 +199,11 @@ pub fn start(
         Ok(value) => value.unwrap_or(false),
         Err(error) => return error,
     };
-    let topology = projects::derive_routing(snapshot);
+    let topology = projects::derive_routing_cached(snapshot);
+    let mut verified_real: Option<std::path::PathBuf> = None;
     let protected_root =
-        crate::macos_permissions::project_path_needs_protected_transport(Path::new(root));
+        crate::macos_permissions::project_path_needs_protected_transport(Path::new(root))
+            || forced_protected_transport(Path::new(root));
     let managed = match if protected_root {
         fs_security::validate_exact_validated_root_with_topology(&topology, root)
     } else {
@@ -56,6 +212,21 @@ pub fn start(
         Ok(value) => value,
         Err(error) => return error,
     };
+    if protected_root {
+        // The delegated `pane.split`/`cd` below executes in whatever the root
+        // resolves to at that moment. `validate_exact_root_with_roots` is
+        // lexical — it cannot see a protected root swapped for a symlink after
+        // the topology was derived, so the authorized stable broker must
+        // re-prove the cd target is the declared directory before any pane is
+        // created. Every failure is not_delivered: no pane, no command. The
+        // broker's real path is rebound inside the pane script so the
+        // executed `cd` must land on the same directory identity — a swap
+        // after this check cannot redirect where the command runs.
+        verified_real = match verify_protected_exec_root(snapshot, &managed.root) {
+            Ok(real) => Some(real),
+            Err(error) => return error,
+        };
+    }
     if !protected_root {
         if !managed.real.is_dir() {
             return json!({"ok": false, "reason": "not_a_directory", "root": managed.resolved.to_string_lossy()});
@@ -94,6 +265,7 @@ pub fn start(
             workspace_id,
             &managed.real,
             &rendered,
+            verified_real.as_deref(),
         )
     } else {
         let started = match &invocation {
@@ -368,8 +540,9 @@ fn invalid(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartInvocation, exec_wait_poll_delay, resolve_start_invocation, start, wait,
-        wait_view_ready,
+        StartInvocation, clear_test_protected_roots, clear_test_real_path_responses,
+        exec_wait_poll_delay, resolve_start_invocation, set_test_protected_root,
+        set_test_real_path_response, start, wait, wait_view_ready,
     };
     use crate::exec_sessions::ExecRegistry;
     use crate::herdr::HerdrClient;
@@ -581,5 +754,109 @@ mod tests {
             &json!({"ok": false, "code": "missing_session"}),
             10
         ));
+    }
+
+    /// user exec | Given a protected root swapped for a symlink after the
+    /// topology was derived | When herdr_exec.start runs | Then the broker
+    /// real.path verdict refuses the pane with not_delivered before any
+    /// split.
+    #[test]
+    fn exec_start_protected_root_swapped_for_symlink_is_not_delivered() {
+        let _guard = crate::test_env::lock();
+        clear_test_real_path_responses();
+        clear_test_protected_roots();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-mcp-exec-protected-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        set_test_protected_root(&root);
+        let snapshot = json!({
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "cwd": root}],
+            "agents": [],
+            "workspaces": [{"workspace_id": "w1", "root": root}],
+        });
+        // The broker answers the real path of a DIFFERENT directory: the
+        // lexical root was swapped for a symlink after the routing topology
+        // was derived.
+        set_test_real_path_response(
+            &root,
+            Ok(json!({
+                "ok": true,
+                "path": root.to_string_lossy(),
+                "real": "/Users/example/other",
+                "is_dir": true,
+            })),
+        );
+        // No socket behind the client: a split attempt would surface as a
+        // transport error, so a not_delivered refusal proves nothing ran.
+        let client = HerdrClient::new(PathBuf::from("/nonexistent-herdr.sock"));
+        let registry = registry("protected-swap");
+        let refused = start(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"root": root, "program": "pwd"}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(
+            refused["reason"], "protected_root_identity_mismatch",
+            "{refused}"
+        );
+        assert_eq!(refused["delivery_state"], "not_delivered", "{refused}");
+
+        // A broker that cannot answer at all is not_delivered too.
+        set_test_real_path_response(
+            &root,
+            Ok(json!({"ok": false, "reason": "resolve_failed", "os_error": 13})),
+        );
+        let refused = start(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"root": root, "program": "pwd"}),
+        );
+        assert_eq!(
+            refused["reason"], "protected_root_unverifiable",
+            "{refused}"
+        );
+        assert_eq!(refused["delivery_state"], "not_delivered", "{refused}");
+
+        // When the broker proves the cd target is still the declared root
+        // (the /System/Volumes/Data firmlink spelling counts as the same
+        // directory), verification passes and execution proceeds to the next
+        // delegated step — which fails closed on the unreachable client
+        // instead of an identity refusal.
+        set_test_real_path_response(
+            &root,
+            Ok(json!({
+                "ok": true,
+                "path": root.to_string_lossy(),
+                "real": format!(
+                    "/System/Volumes/Data{}",
+                    root.to_string_lossy()
+                ),
+                "is_dir": true,
+            })),
+        );
+        let proceeded = start(
+            &client,
+            &snapshot,
+            &registry,
+            &json!({"root": root, "program": "pwd"}),
+        );
+        assert_ne!(
+            proceeded["reason"], "protected_root_identity_mismatch",
+            "{proceeded}"
+        );
+        assert_ne!(
+            proceeded["reason"], "protected_root_unverifiable",
+            "{proceeded}"
+        );
+
+        clear_test_real_path_responses();
+        clear_test_protected_roots();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

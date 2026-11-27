@@ -178,6 +178,10 @@ struct SessionStatus {
     /// pane-owned).
     pane_reclaimed: Option<bool>,
     pane_reclaim_error: Option<String>,
+    /// Reason the pane script refused to run the caller's command after `cd`
+    /// (e.g. `protected_root_identity_mismatch`); `Some` means the pane was
+    /// created but the command was never delivered.
+    delivery_denied: Option<String>,
 }
 
 #[derive(Debug)]
@@ -204,6 +208,11 @@ struct PaneSpoolPaths {
     stderr: PathBuf,
     status: PathBuf,
     status_tmp: PathBuf,
+    /// Written only when the script's post-`cd` identity check refuses to run
+    /// the caller's command: the pane exists, but the command was never
+    /// delivered. Contents are the refusal reason (e.g.
+    /// `protected_root_identity_mismatch`).
+    denied: PathBuf,
 }
 
 #[derive(Debug)]
@@ -517,6 +526,7 @@ fn load_session_from_spool_or_record(
         evidence_persisted: evidence_loaded,
         pane_reclaimed: None,
         pane_reclaim_error: None,
+        delivery_denied: None,
     };
     Arc::new(Session {
         id: record.session_id.clone(),
@@ -763,7 +773,7 @@ impl ExecRegistry {
         command: &str,
         pane_id: &str,
     ) -> Result<Value, PaneStartError> {
-        self.start_in_pane(cwd, command, pane_id, false, "utility_pane")
+        self.start_in_pane(cwd, command, pane_id, false, "utility_pane", None)
     }
 
     /// Start one command in a task-owned pane that is automatically reclaimed
@@ -773,8 +783,9 @@ impl ExecRegistry {
         cwd: &Path,
         command: &str,
         pane_id: &str,
+        expected_real: Option<&Path>,
     ) -> Result<Value, PaneStartError> {
-        self.start_in_pane(cwd, command, pane_id, true, "private_pane")
+        self.start_in_pane(cwd, command, pane_id, true, "private_pane", expected_real)
     }
 
     /// Failures are typed by the stage that produced them, because only the
@@ -788,6 +799,7 @@ impl ExecRegistry {
         pane_id: &str,
         close_on_complete: bool,
         backend: &str,
+        expected_real: Option<&Path>,
     ) -> Result<Value, PaneStartError> {
         self.prune();
         if command.is_empty() {
@@ -801,7 +813,7 @@ impl ExecRegistry {
         let id = new_session_id();
         let script_path = pane_script_path(&id);
         let spool = pane_spool_paths(&id);
-        write_pane_script(&script_path, cwd, command, &spool)
+        write_pane_script(&script_path, cwd, command, &spool, expected_real)
             .map_err(PaneStartError::before_send)?;
         let session = Arc::new(Session {
             id: id.clone(),
@@ -1023,6 +1035,11 @@ impl ExecRegistry {
         }
         if let Some(error) = &status.pane_reclaim_error {
             result.insert("pane_reclaim_error".to_owned(), json!(error));
+        }
+        if let Some(reason) = &status.delivery_denied {
+            result.insert("delivery_state".to_owned(), json!("not_delivered"));
+            result.insert("pane_created".to_owned(), json!(true));
+            result.insert("reason".to_owned(), json!(reason));
         }
         if status.closed {
             result.insert(
@@ -1378,6 +1395,7 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             evidence_persisted: false,
             pane_reclaimed: None,
             pane_reclaim_error: None,
+            delivery_denied: None,
         },
         |status| SessionStatus {
             closed: status.closed,
@@ -1387,6 +1405,7 @@ fn session_status(session: &Arc<Session>) -> SessionStatus {
             evidence_persisted: status.evidence_persisted,
             pane_reclaimed: status.pane_reclaimed,
             pane_reclaim_error: status.pane_reclaim_error.clone(),
+            delivery_denied: status.delivery_denied.clone(),
         },
     )
 }
@@ -1549,6 +1568,7 @@ fn pane_spool_paths(id: &str) -> PaneSpoolPaths {
         stderr: base.with_extension("stderr"),
         status: base.with_extension("status"),
         status_tmp: base.with_extension("status.tmp"),
+        denied: base.with_extension("denied"),
     }
 }
 
@@ -1557,6 +1577,7 @@ fn write_pane_script(
     cwd: &Path,
     command: &str,
     spool: &PaneSpoolPaths,
+    expected_real: Option<&Path>,
 ) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1565,8 +1586,28 @@ fn write_pane_script(
     let mut file = options
         .open(path)
         .map_err(|error| format!("cannot create pane exec script {}: {error}", path.display()))?;
+    // When the caller proved a directory identity (the broker's real.path
+    // answer for a protected root), bind it to the executed directory: after
+    // `cd` succeeds, `pwd -P` must spell the expected real path. Once `cd`
+    // has succeeded the shell's cwd is pinned to that inode — a later swap of
+    // the path cannot redirect it — so this check closes the window between
+    // the pre-dispatch broker check and the actual `cd`. A mismatch writes
+    // the denial marker BEFORE the status file so a completed status always
+    // implies the marker is already durable.
+    let identity_guard = expected_real
+        .map(|expected| {
+            format!(
+                "herdr_actual=$(pwd -P)\nif [ \"$herdr_actual\" != {} ]; then printf '%s\\n' 'protected_root_identity_mismatch' > {}; printf '%s\\n' 126 > {}; mv -f -- {} {}; exit 126; fi\n",
+                shell_quote(expected.to_string_lossy().as_ref()),
+                shell_quote(spool.denied.to_string_lossy().as_ref()),
+                shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
+                shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
+                shell_quote(spool.status.to_string_lossy().as_ref()),
+            )
+        })
+        .unwrap_or_default();
     let body = format!(
-        "#!{}\nset +e\numask 077\nexport PAGER=cat\nexport GIT_PAGER=cat\nexport GH_PAGER=cat\nexport SYSTEMD_PAGER=cat\nexport MANPAGER=cat\nexport DELTA_PAGER=cat\ntrap 'rm -f -- \"$0\"' EXIT\n: > {}\n: > {}\nrm -f -- {} {}\ncd -- {}\ncd_ec=$?\nif [ \"$cd_ec\" -ne 0 ]; then printf '%s\\n' \"$cd_ec\" > {}; mv -f -- {} {}; exit \"$cd_ec\"; fi\n(\n{}\n) > {} 2> {}\nec=$?\nprintf '%s\\n' \"$ec\" > {}\nmv -f -- {} {}\nexit \"$ec\"\n",
+        "#!{}\nset +e\numask 077\nexport PAGER=cat\nexport GIT_PAGER=cat\nexport GH_PAGER=cat\nexport SYSTEMD_PAGER=cat\nexport MANPAGER=cat\nexport DELTA_PAGER=cat\ntrap 'rm -f -- \"$0\"' EXIT\n: > {}\n: > {}\nrm -f -- {} {}\ncd -P -- {}\ncd_ec=$?\nif [ \"$cd_ec\" -ne 0 ]; then printf '%s\\n' \"$cd_ec\" > {}; mv -f -- {} {}; exit \"$cd_ec\"; fi\n{}(\n{}\n) > {} 2> {}\nec=$?\nprintf '%s\\n' \"$ec\" > {}\nmv -f -- {} {}\nexit \"$ec\"\n",
         resolve_exec_shell().display(),
         shell_quote(spool.stdout.to_string_lossy().as_ref()),
         shell_quote(spool.stderr.to_string_lossy().as_ref()),
@@ -1576,6 +1617,7 @@ fn write_pane_script(
         shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
         shell_quote(spool.status_tmp.to_string_lossy().as_ref()),
         shell_quote(spool.status.to_string_lossy().as_ref()),
+        identity_guard,
         command,
         shell_quote(spool.stdout.to_string_lossy().as_ref()),
         shell_quote(spool.stderr.to_string_lossy().as_ref()),
@@ -1642,6 +1684,7 @@ fn cleanup_pane_files(script_path: &Path, spool: &PaneSpoolPaths) {
         spool.stderr.as_path(),
         spool.status.as_path(),
         spool.status_tmp.as_path(),
+        spool.denied.as_path(),
     ] {
         let _ = fs::remove_file(path);
     }
@@ -1672,6 +1715,19 @@ fn refresh_pane_session(session: &Arc<Session>, registry: Option<&RegistryInner>
         }
         return false;
     };
+    // The script writes the denial marker BEFORE its status file, so a
+    // completed status with a `.denied` sibling means the pane exists but
+    // the caller's command never ran.
+    let denied = fs::read_to_string(&spool.denied)
+        .ok()
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty());
+    if let Some(reason) = denied
+        && let Ok(mut status) = session.status.lock()
+        && !status.closed
+    {
+        status.delivery_denied = Some(reason);
+    }
     let transitioned = complete_session(session, registry, Some(exit_code), None);
     if transitioned {
         cleanup_pane_files(script_path, spool);
@@ -3271,6 +3327,7 @@ mod tests {
             Path::new("/tmp"),
             "printf out; printf err >&2; exit 7",
             &spool,
+            None,
         )
         .unwrap();
         let body = fs::read_to_string(&script).unwrap();
@@ -3280,6 +3337,81 @@ mod tests {
         assert!(body.contains(spool.status.to_string_lossy().as_ref()));
         assert!(body.contains("mv -f --"));
         cleanup_pane_files(&script, &spool);
+    }
+
+    /// user exec | Given the broker-proven real path is bound into the pane
+    /// script | When the declared root is swapped for a symlink between the
+    /// pre-check and the pane's `cd` | Then the script refuses to run the
+    /// command: a denial marker names the reason, the status reports the
+    /// refusal, and nothing executes. A root that still matches runs the
+    /// command normally.
+    #[cfg(unix)]
+    #[test]
+    fn pane_script_refuses_command_when_root_swapped_after_precheck() {
+        let base = env::temp_dir().join(format!(
+            "herdr-mcp-exec-swap-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let declared = base.join("declared");
+        let elsewhere = base.join("elsewhere");
+        let proven = base.join("proven");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(&proven).unwrap();
+        let expected = fs::canonicalize(&proven).unwrap();
+
+        // Post-precheck swap: the declared spelling is now a symlink.
+        std::os::unix::fs::symlink(&elsewhere, &declared).unwrap();
+
+        let id = format!(
+            "es_swap_test_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let script = pane_script_path(&id);
+        let spool = pane_spool_paths(&id);
+        let marker = base.join("command-ran");
+        write_pane_script(
+            &script,
+            &declared,
+            &format!("touch {}", marker.to_string_lossy()),
+            &spool,
+            Some(&expected),
+        )
+        .unwrap();
+        let status = Command::new(&script).status().unwrap();
+        assert_eq!(status.code(), Some(126));
+        assert_eq!(
+            fs::read_to_string(&spool.denied).unwrap().trim(),
+            "protected_root_identity_mismatch"
+        );
+        assert_eq!(read_pane_exit_code(&spool.status), Some(126));
+        assert!(!marker.exists(), "swapped root must not run the command");
+        cleanup_pane_files(&script, &spool);
+
+        // Same binding on an unswapped root runs the command.
+        let id = format!(
+            "es_bind_test_{}_{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        );
+        let script = pane_script_path(&id);
+        let spool = pane_spool_paths(&id);
+        write_pane_script(
+            &script,
+            &proven,
+            &format!("touch {}", marker.to_string_lossy()),
+            &spool,
+            Some(&expected),
+        )
+        .unwrap();
+        let status = Command::new(&script).status().unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(read_pane_exit_code(&spool.status), Some(0));
+        assert!(marker.exists(), "unswapped root must run the command");
+        assert!(!spool.denied.exists());
+        cleanup_pane_files(&script, &spool);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
