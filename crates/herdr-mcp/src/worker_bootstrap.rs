@@ -3318,6 +3318,7 @@ fn create_and_consume_first_pairing(
         Duration::from_secs(2),
         Duration::from_secs(4),
         Duration::from_secs(8),
+        Duration::from_secs(16),
     ];
     let attempts = delays.len();
     let mut ready_pairing = None;
@@ -3387,6 +3388,14 @@ fn create_and_consume_first_pairing(
 }
 
 fn first_pairing_create_is_retryable(status: reqwest::StatusCode, payload: &Value) -> bool {
+    // 401/403 are safe to retry on this endpoint: Edge authentication is
+    // evaluated before any pairing mutation, so a rejected request cannot
+    // have created state. They occur while a freshly uploaded operator
+    // secret is still rolling out across Worker deployments — the same race
+    // the read-only registry probe already retries.
+    if matches!(status.as_u16(), 401 | 403) {
+        return true;
+    }
     status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         && payload.get("code").and_then(Value::as_str) == Some("pairing_unavailable")
 }
@@ -5532,11 +5541,23 @@ mod tests {
     }
 
     #[test]
-    fn first_pairing_retry_is_only_for_pre_mutation_pepper_readiness() {
+    fn first_pairing_retry_is_limited_to_pre_mutation_failures() {
         assert!(first_pairing_create_is_retryable(
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
             &json!({"ok": false, "code": "pairing_unavailable"})
         ));
+        // Authentication is evaluated before any pairing mutation, so a 401/403
+        // during operator-secret rollout can never have created state and is
+        // safe to retry.
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            assert!(first_pairing_create_is_retryable(
+                status,
+                &json!({"ok": false, "code": "pairing_admin_required"})
+            ));
+        }
         assert!(!first_pairing_create_is_retryable(
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
             &json!({"ok": false, "code": "internal_error"})
@@ -5546,8 +5567,8 @@ mod tests {
             &json!({"ok": false, "code": "first_fleet_not_empty"})
         ));
         assert!(!first_pairing_create_is_retryable(
-            reqwest::StatusCode::UNAUTHORIZED,
-            &json!({"ok": false, "code": "pairing_unavailable"})
+            reqwest::StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "code": "bad_request"})
         ));
     }
 
