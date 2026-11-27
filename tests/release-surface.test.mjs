@@ -264,15 +264,22 @@ test("current workflows pin checkout and setup-node to reviewed v7 commits", asy
   }
 });
 
-test("user Linux CI stays schedulable | Given the CI workflow | When Linux jobs are selected | Then rust and test run on GitHub-hosted ubuntu-latest", async () => {
+test("user Linux CI stays schedulable | Given the CI workflow | When Linux jobs are selected | Then rust and test run on the pinned devin-vm self-hosted runner", async () => {
   const ci = await readFile(join(ROOT, ".github/workflows/ci.yml"), "utf8");
   const windows = await readFile(join(ROOT, ".github/workflows/windows-candidate.yml"), "utf8");
+  // Public repo hard gate: only same-repository triggers may schedule on the
+  // persistent self-hosted runner; external fork PRs must fall back to an
+  // isolated GitHub-hosted image instead of reaching it.
   assert.equal(
-    [...ci.matchAll(/^\s*runs-on:\s*ubuntu-latest\s*$/gm)].length,
+    [
+      ...ci.matchAll(
+        /^\s*runs-on:\s*\$\{\{\s*\(github\.event_name != 'pull_request' \|\| github\.event\.pull_request\.head\.repo\.full_name == github\.repository\) && fromJSON\('\["self-hosted", "linux", "x64", "devin-vm"\]'\) \|\| 'ubuntu-latest' \}\}\s*$/gm,
+      ),
+    ].length,
     2,
-    "CI rust and test must both use ubuntu-latest",
+    "CI rust and test must both route same-repo triggers to devin-vm and forks to ubuntu-latest",
   );
-  assert.doesNotMatch(ci, /self-hosted|herdr-box/);
+  assert.doesNotMatch(ci, /runs-on:\s*ubuntu-latest|herdr-box/);
   assert.match(ci, /rustup toolchain install 1\.97\.1 --profile minimal --component clippy,rustfmt/);
   assert.match(ci, /node-version:\s*22/);
   assert.match(ci, /deno-version:\s*v2\.x/);
