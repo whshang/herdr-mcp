@@ -11,7 +11,7 @@ Herdr-MCP には互いに独立した複数のプロトコル層があります�
 | 層 | 現在のプロダクション identity | 有界な互換性 | fail-closed ルール |
 | --- | --- | --- | --- |
 | 公開 MCP クライアントプロトコル | `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`、`2024-10-07` が `initialize` ネゴシエーションで受け入れられます | ChatGPT/OpenAI discovery は probe バージョン `2026-07-28` を advertise する場合がありますが、その probe 値は追加の `initialize` プロトコルではありません | 欠落または未認識の `initialize` プロトコル値は、明示的な legacy baseline `2025-11-25` までネゴシエートダウンします。リストにないプロトコルがサポート済みとして advertise されることはありません |
-| 公開 Edge ツール契約 | epoch **7**、**19** actions | クライアント会話が古いツールスナップショットを保持している場合がありますが、Edge は現在の DEV/PROD 公開 catalog を publish します。epoch 3 identity は、保守的な非 DEV/PROD フォールバックおよび rollback ベースラインとしてのみ残ります | 現在の公開契約の外にあるツールは拒否されます |
+| 公開 Edge ツール契約 | epoch **9**、**19** actions | クライアント会話が古いツールスナップショットを保持している場合がありますが、Edge は現在の DEV/PROD 公開 catalog を publish します。epoch 3 identity は、保守的な非 DEV/PROD フォールバックおよび rollback ベースラインとしてのみ残ります | 現在の公開契約の外にあるツールは拒否されます |
 | Workstation Runtime Execution Contract | epoch **4**、**18** tools | 直前の凍結された epoch **3**、**18** tools が有界な rollback ベースラインとして、また凍結された epoch **2**、**18** ツール catalog とともに受け入れられます | それ以外の epoch/hash の組み合わせは、ワークステーション実行の前に拒否されます |
 | Relay wire protocol | 数値の `protocol_version = 1` | なし | 欠落、文字列値、または未知のプロトコルバージョンは、Relay 状態が書き込まれる前に拒否されます |
 | 永続 runtime 状態 | 現在のバイナリ schema。Release は自動アクティベーションのために同じ rollback 互換の状態 schema を宣言しなければなりません | 古い store は append-only マイグレーションを通じてトランザクショナルに前方移行します | 実行中のバイナリより新しい store は拒否されます。自動 updater は、状態 schema または runtime contract identity が自身の rollback-safe なアクティベーション要件と正確に一致しない Release を拒否します |
