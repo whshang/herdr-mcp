@@ -1354,11 +1354,22 @@ impl StateStore {
         // (1) Drop expired client-request rows. Only rows with a non-NULL
         // `expires_at` can match; pending/unknown/write-complete/tombstone
         // rows all carry NULL by contract, so this can only ever delete
-        // expired read-intent reservations and completions.
+        // expired read-intent reservations and completions. Every durable
+        // client-request kind is covered — a first-class write tool's
+        // records must not escape retention, compaction or capacity.
+        // The kinds are compile-time constants, so they are inlined as SQL
+        // literals rather than positional parameters.
+        let kind_list = crate::durable_request_ledger::CLIENT_REQUEST_KINDS
+            .iter()
+            .map(|kind| format!("'{kind}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         tx.execute(
-            "DELETE FROM operations
-             WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')
-               AND expires_at IS NOT NULL AND expires_at <= ?1",
+            &format!(
+                "DELETE FROM operations
+                 WHERE kind IN ({kind_list})
+                   AND expires_at IS NOT NULL AND expires_at <= ?1",
+            ),
             params![now_ms],
         )
         .map_err(|error| format!("cannot prune expired client requests: {error}"))?;
@@ -1367,22 +1378,24 @@ impl StateStore {
         // a tombstoned key must remain permanently claimed. Rebuilds
         // `result_json` because SQL has no delete-json-key primitive.
         tx.execute(
-            "UPDATE operations
-             SET result_json = json_object(
-                     'schema', 1,
-                     'intent', json_extract(result_json, '$.intent'),
-                     'outcome', 'expired',
-                     'expired', json('true'),
-                     'safe_retry_mode', 'none',
-                     'request_id', json_extract(result_json, '$.request_id'),
-                     'key_digest', ?2,
-                     'request_hash', request_hash),
-                 updated_at = ?1
-             WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')
-               AND state = 'complete'
-               AND COALESCE(json_extract(result_json, '$.expired'), 0) = 0
-               AND json_extract(result_json, '$.summary_expires_at_ms') IS NOT NULL
-               AND json_extract(result_json, '$.summary_expires_at_ms') <= ?1",
+            &format!(
+                "UPDATE operations
+                 SET result_json = json_object(
+                         'schema', 1,
+                         'intent', json_extract(result_json, '$.intent'),
+                         'outcome', 'expired',
+                         'expired', json('true'),
+                         'safe_retry_mode', 'none',
+                         'request_id', json_extract(result_json, '$.request_id'),
+                         'key_digest', ?2,
+                         'request_hash', request_hash),
+                     updated_at = ?1
+                 WHERE kind IN ({kind_list})
+                   AND state = 'complete'
+                   AND COALESCE(json_extract(result_json, '$.expired'), 0) = 0
+                   AND json_extract(result_json, '$.summary_expires_at_ms') IS NOT NULL
+                   AND json_extract(result_json, '$.summary_expires_at_ms') <= ?1",
+            ),
             params![now_ms, key_digest],
         )
         .map_err(|error| format!("cannot compact expired client request summaries: {error}"))?;
@@ -1412,8 +1425,10 @@ impl StateStore {
             // ledger's capacity refusal.
             let rows: i64 = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM operations
-                     WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')",
+                    &format!(
+                        "SELECT COUNT(*) FROM operations
+                         WHERE kind IN ({kind_list})",
+                    ),
                     [],
                     |row| row.get(0),
                 )
@@ -1648,21 +1663,26 @@ impl StateStore {
     /// Read a client-request row by the first call's recorded `request_id`
     /// (the `request_hash` tail). Scans at most the bounded client-request
     /// namespace; status queries are infrequent.
-    pub fn client_request_record_for_request_id(
+    pub fn client_request_records_for_request_id(
         &self,
         request_id: &str,
-    ) -> Result<Option<ClientRequestRecord>, String> {
+    ) -> Result<Vec<ClientRequestRecord>, String> {
+        // Scan every client-request kind — not just the herdr_call/herdr_exec
+        // pair — so a first-class write tool's first `request_id` resolves too.
+        let kinds = crate::durable_request_ledger::CLIENT_REQUEST_KINDS;
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT op_id, request_hash, phase, state, result_json, boot_id,
+                    created_at, updated_at, expires_at
+             FROM operations
+             WHERE kind IN ({placeholders})"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT op_id, request_hash, phase, state, result_json, boot_id,
-                        created_at, updated_at, expires_at
-                 FROM operations
-                 WHERE kind IN ('herdr_call.client_request.v1', 'herdr_exec.client_request.v1')",
-            )
+            .prepare(&sql)
             .map_err(|error| format!("cannot prepare client request id lookup: {error}"))?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(kinds.iter()), |row| {
                 Ok(ClientRequestRecord {
                     op_id: row.get(0)?,
                     request_hash: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -1676,16 +1696,21 @@ impl StateStore {
                 })
             })
             .map_err(|error| format!("cannot query client request id: {error}"))?;
+        // Collect *every* candidate carrying this request_id first: callers
+        // filter by scope and tool afterwards, and a record belonging to
+        // another scope must not shadow this caller's matching row nor
+        // mask a genuine ambiguity.
+        let mut records = Vec::new();
         for record in rows {
             let record =
                 record.map_err(|error| format!("cannot decode client request record: {error}"))?;
             if crate::durable_request_ledger::request_id_from_hash(&record.request_hash)
                 == Some(request_id)
             {
-                return Ok(Some(record));
+                records.push(record);
             }
         }
-        Ok(None)
+        Ok(records)
     }
 
     /// Mark one reserved operation complete and persist the bounded replay

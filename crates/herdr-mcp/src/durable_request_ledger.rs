@@ -41,10 +41,22 @@ pub const HERDR_CALL_CLIENT_REQUEST_KIND: &str = "herdr_call.client_request.v1";
 /// namespace is fixed now; deliberately not wired into `herdr_exec` — that
 /// needs the contract change D-1 deferred to separate review.
 pub const HERDR_EXEC_CLIENT_REQUEST_KIND: &str = "herdr_exec.client_request.v1";
-/// Both durable client-request kinds; shared by cleanup and status scans.
-pub const CLIENT_REQUEST_KINDS: [&str; 2] = [
+/// #1094 P0-a: first-class write tools accept `client_request_id` inside
+/// `params.arguments` (the contracts do not declare it — option (b), no
+/// epoch/hash change). One kind per tool keeps each key's namespace disjoint
+/// from `herdr_call` and from each other.
+pub const HERDR_FS_WRITE_CLIENT_REQUEST_KIND: &str = "herdr_fs_write.client_request.v1";
+pub const HERDR_FS_EDIT_CLIENT_REQUEST_KIND: &str = "herdr_fs_edit.client_request.v1";
+pub const HERDR_FS_PATCH_CLIENT_REQUEST_KIND: &str = "herdr_fs_patch.client_request.v1";
+pub const HERDR_PROMPT_CLIENT_REQUEST_KIND: &str = "herdr_prompt.client_request.v1";
+/// All durable client-request kinds; shared by cleanup and status scans.
+pub const CLIENT_REQUEST_KINDS: [&str; 6] = [
     HERDR_CALL_CLIENT_REQUEST_KIND,
     HERDR_EXEC_CLIENT_REQUEST_KIND,
+    HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+    HERDR_FS_EDIT_CLIENT_REQUEST_KIND,
+    HERDR_FS_PATCH_CLIENT_REQUEST_KIND,
+    HERDR_PROMPT_CLIENT_REQUEST_KIND,
 ];
 /// Logical full-summary retention for settled rows: `result_json` carries the
 /// bounded projection for 24h, after which kind-specific cleanup compacts the
@@ -92,6 +104,55 @@ pub fn client_request_key_digest(kind: &str, client_request_id: &str) -> String 
 /// Stable `op_id` embedding the kind so two kinds reusing one raw key get
 /// independent primary keys. `key_digest[..32]` is 32 hex chars = 16 bytes
 /// (~122 bits) of the SHA-256 prefix.
+/// #1094 P0-a: the first-class write tools that accept `client_request_id` in
+/// `params.arguments`, mapped to their durable-ledger kinds. Every other tool
+/// keeps its pre-existing dedupe surface.
+pub(crate) fn client_request_tool_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "herdr_call" => Some(HERDR_CALL_CLIENT_REQUEST_KIND),
+        "herdr_exec" => Some(HERDR_EXEC_CLIENT_REQUEST_KIND),
+        "herdr_fs_write" => Some(HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+        "herdr_fs_edit" => Some(HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+        "herdr_fs_patch" => Some(HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+        "herdr_prompt" => Some(HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        // A caller may echo back the kind string a `matches` entry reported.
+        _ => CLIENT_REQUEST_KINDS
+            .iter()
+            .find(|kind| **kind == name)
+            .copied(),
+    }
+}
+
+/// The narrower set that actually wraps a dispatch in a durable
+/// `client_request_id` reservation: `herdr_call` keeps its dedicated earlier
+/// path, and `herdr_exec`'s kind is reserved but deliberately *not* wired —
+/// mapping the tool name here only decides status lookups and silent-drop
+/// checks, never ledger wrapping. Keeping the two maps separate means a
+/// `client_request_id` on `herdr_exec` is rejected as unsupported instead of
+/// being silently recorded with a hard-coded write intent or sharing two
+/// idempotency slots.
+pub(crate) fn client_request_dispatch_tool_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "herdr_fs_write" => Some(HERDR_FS_WRITE_CLIENT_REQUEST_KIND),
+        "herdr_fs_edit" => Some(HERDR_FS_EDIT_CLIENT_REQUEST_KIND),
+        "herdr_fs_patch" => Some(HERDR_FS_PATCH_CLIENT_REQUEST_KIND),
+        "herdr_prompt" => Some(HERDR_PROMPT_CLIENT_REQUEST_KIND),
+        _ => None,
+    }
+}
+
+/// The kind embedded in a client-request `op_id` (`op:{kind}:{digest}`).
+/// This relies on kind names never containing `:` — every entry of
+/// `CLIENT_REQUEST_KINDS` is a dotted `*.client_request.v1` identifier, so
+/// `rsplit_once` splits at the digest boundary, not inside the kind.
+fn kind_from_op_id(op_id: &str) -> &str {
+    op_id
+        .strip_prefix("op:")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .map(|(kind, _)| kind)
+        .unwrap_or("")
+}
+
 pub fn client_request_op_id(kind: &str, key_digest: &str) -> String {
     let prefix_len = key_digest.len().min(32);
     format!("op:{kind}:{}", &key_digest[..prefix_len])
@@ -422,7 +483,7 @@ pub fn durable_scope_unavailable_response(client_request_id: &str) -> Value {
 fn replay_response(record: &ClientRequestRecord, client_request_id: &str) -> Value {
     let result = record.result();
     let summary = result.get("result_summary").cloned().unwrap_or(Value::Null);
-    json!({
+    let mut response = json!({
         "ok": summary.get("ok").and_then(Value::as_bool).unwrap_or(false),
         "code": summary.get("code").cloned().unwrap_or_else(|| json!("result_recorded")),
         "result_summary": summary,
@@ -432,8 +493,19 @@ fn replay_response(record: &ClientRequestRecord, client_request_id: &str) -> Val
         "op_id": record.op_id,
         "request_id": record_request_id(record),
         "client_request_id": client_request_id,
-        "message": "the ledger stores a digest-only projection; it never retains the response body",
-    })
+        "message": "the ledger stores a digest-only projection plus whitelisted receipt identifiers; it never retains the response body",
+    });
+    // Surface the whitelisted receipt identifiers the first response carried
+    // (task_id/receipt_id for herdr_prompt) so a replayed submission returns
+    // the same receipt rather than only a digest.
+    if let Some(receipt) = result.get("receipt").and_then(Value::as_object) {
+        for (field, value) in receipt {
+            if !value.is_null() {
+                response[field] = value.clone();
+            }
+        }
+    }
+    response
 }
 
 /// Atomic dedupe + reserve for one durable submission. `Execute` must be
@@ -567,11 +639,20 @@ pub enum DurableSettle {
     Released,
     /// `settled/unknown` tombstone with `inspect_before_retry`.
     RecordedUnknown,
+    /// The terminal write itself failed (e.g. the SQLite commit errored):
+    /// the outcome may be committed while the row still reads as pending,
+    /// so a same-key resubmission pins as in-flight until restart decays it.
+    /// Callers must inspect live state before any retry.
+    PersistFailed,
 }
 
 /// Bounded `result_json` for a settled record: status fields, digest and byte
 /// count only — never response body, stdout, prompt, tokens, file content,
 /// or the raw `client_request_id` (D-1 keeps the raw key out of the DB).
+/// `receipt` carries only small identifier fields a retry legitimately needs
+/// back (`task_id`/`receipt_id` for `herdr_prompt` submissions); it is a
+/// whitelist, not the result body, so payload content still never lands in
+/// the projection.
 fn settled_result_json(
     read_only: bool,
     outcome: &str,
@@ -596,6 +677,10 @@ fn settled_result_json(
             "code": result.get("code").cloned().unwrap_or(Value::Null),
             "result_digest": sha256_hex(&serialized),
             "result_bytes": serialized.len(),
+        },
+        "receipt": {
+            "task_id": result.get("task_id").cloned().unwrap_or(Value::Null),
+            "receipt_id": result.get("receipt_id").cloned().unwrap_or(Value::Null),
         },
     })
     .to_string()
@@ -633,14 +718,19 @@ pub fn durable_settle_result(
                 now_ms,
             );
             let expires_at = read_only.then(|| now_ms + REQUEST_LEDGER_TTL_MS);
-            let _ = store.complete_client_request(
-                &ids.kind,
-                &ids.key_digest,
-                &ids.request_hash,
-                &payload,
-                now_ms,
-                expires_at,
-            );
+            if store
+                .complete_client_request(
+                    &ids.kind,
+                    &ids.key_digest,
+                    &ids.request_hash,
+                    &payload,
+                    now_ms,
+                    expires_at,
+                )
+                .is_err()
+            {
+                return DurableSettle::PersistFailed;
+            }
             DurableSettle::Completed
         }
         crate::request_ledger::RequestLedgerState::Unknown => {
@@ -653,23 +743,35 @@ pub fn durable_settle_result(
                 result,
                 now_ms,
             );
-            let _ = store.complete_client_request_unknown(
-                &ids.kind,
-                &ids.key_digest,
-                &ids.request_hash,
-                &payload,
-                now_ms,
-            );
+            if store
+                .complete_client_request_unknown(
+                    &ids.kind,
+                    &ids.key_digest,
+                    &ids.request_hash,
+                    &payload,
+                    now_ms,
+                )
+                .is_err()
+            {
+                return DurableSettle::PersistFailed;
+            }
             DurableSettle::RecordedUnknown
         }
         crate::request_ledger::RequestLedgerState::Rejected
         | crate::request_ledger::RequestLedgerState::NotDelivered => {
-            let _ = store.release_client_request_reservation(
-                &ids.kind,
-                &ids.key_digest,
-                &ids.request_hash,
-                &ids.op_id,
-            );
+            if store
+                .release_client_request_reservation(
+                    &ids.kind,
+                    &ids.key_digest,
+                    &ids.request_hash,
+                    &ids.op_id,
+                )
+                .is_err()
+            {
+                // A failed release leaves the pending row pinned exactly
+                // like a failed terminal write: callers must inspect.
+                return DurableSettle::PersistFailed;
+            }
             DurableSettle::Released
         }
         crate::request_ledger::RequestLedgerState::Pending => DurableSettle::Released,
@@ -681,25 +783,84 @@ pub fn durable_settle_result(
 /// record only answers for the scope digest embedded in its `request_hash`;
 /// foreign-scope hits return `None` exactly like a miss so existence never
 /// leaks across scopes.
-pub fn durable_client_request_status(store: &StateStore, key: &str, scope: &str) -> Option<Value> {
+pub fn durable_client_request_status(
+    store: &StateStore,
+    key: &str,
+    scope: &str,
+    tool: Option<&str>,
+) -> Option<Value> {
     let scope_digest = durable_scope_digest(scope);
-    let record = CLIENT_REQUEST_KINDS
+    // Select by caller scope first: the same key under a different kind or
+    // the same raw id submitted by another caller must not leak a foreign
+    // record's state, and two kinds may legitimately hold rows for one key.
+    // An explicit `tool` that maps to no ledger kind filters to nothing —
+    // it must not silently widen back to "all kinds".
+    let kind_filter = tool.map(client_request_tool_kind);
+    let kind_matches = |kind: &str| match &kind_filter {
+        None => true,
+        Some(Some(expected)) => kind == *expected,
+        Some(None) => false,
+    };
+    let mut matches = CLIENT_REQUEST_KINDS
         .iter()
-        .find_map(|kind| {
+        .filter(|kind| kind_matches(kind))
+        .filter_map(|kind| {
             store
                 .client_request_record(kind, &client_request_key_digest(kind, key))
                 .ok()
                 .flatten()
         })
-        .or_else(|| {
-            store
-                .client_request_record_for_request_id(key)
-                .ok()
-                .flatten()
-        })?;
-    if durable_scope_digest_from_hash(&record.request_hash) != Some(scope_digest.as_str()) {
+        .collect::<Vec<_>>();
+    for record in store
+        .client_request_records_for_request_id(key)
+        .ok()
+        .unwrap_or_default()
+    {
+        if kind_matches(kind_from_op_id(&record.op_id))
+            && !matches.iter().any(|seen| seen.op_id == record.op_id)
+        {
+            matches.push(record);
+        }
+    }
+    let matches = matches
+        .into_iter()
+        .filter(|record| {
+            durable_scope_digest_from_hash(&record.request_hash) == Some(scope_digest.as_str())
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
         return None;
     }
+    // One caller key may legitimately name several tools (an fs_write and a
+    // prompt retry can share a client_request_id). Guessing by recency would
+    // silently answer for the wrong request, so report the ambiguity and let
+    // the caller pass `tool` to disambiguate.
+    if matches.len() > 1 {
+        return Some(json!({
+            "ok": true,
+            "found": true,
+            "durable": true,
+            "ambiguous": true,
+            "matches": matches.iter().map(|record| {
+                let kind = kind_from_op_id(&record.op_id);
+                json!({
+                    "kind": kind,
+                    // The `tool` value a caller passes to disambiguate: the
+                    // tool name is the kind minus its `.client_request.v1`
+                    // suffix (`herdr_fs_write.client_request.v1` →
+                    // `herdr_fs_write`).
+                    "tool": kind.strip_suffix(".client_request.v1").unwrap_or(kind),
+                    "op_id": record.op_id,
+                    "request_id": record_request_id(record),
+                    "state": record.state,
+                    "created_ms": record.created_at,
+                    "updated_ms": record.updated_at,
+                })
+            }).collect::<Vec<_>>(),
+            "message": "client_request_id maps to several tools; pass the tool name to disambiguate",
+        }));
+    }
+    let record = matches.into_iter().next()?;
     let result = record.result();
     Some(json!({
         "ok": true,
@@ -715,6 +876,7 @@ pub fn durable_client_request_status(store: &StateStore, key: &str, scope: &str)
         "delivery_state": result.get("delivery_state").cloned().unwrap_or(Value::Null),
         "expired": result.get("expired").and_then(Value::as_bool).unwrap_or(false),
         "result": result.get("result_summary").cloned().unwrap_or(Value::Null),
+        "receipt": result.get("receipt").cloned().unwrap_or(Value::Null),
         "created_ms": record.created_at,
         "updated_ms": record.updated_at,
     }))
@@ -868,13 +1030,13 @@ mod tests {
         assert_eq!(body["code"], "idempotency_conflict", "{body}");
 
         // Cross-scope status never proves key existence.
-        assert!(durable_client_request_status(&store, KEY, SCOPE_B).is_none());
-        let status = durable_client_request_status(&store, KEY, SCOPE_A).unwrap();
+        assert!(durable_client_request_status(&store, KEY, SCOPE_B, None).is_none());
+        let status = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
         assert_eq!(status["found"], true, "{status}");
         assert_eq!(status["request_id"], "req_a_1", "{status}");
-        let by_id = durable_client_request_status(&store, "req_a_1", SCOPE_A).unwrap();
+        let by_id = durable_client_request_status(&store, "req_a_1", SCOPE_A, None).unwrap();
         assert_eq!(by_id["found"], true, "{by_id}");
-        assert!(durable_client_request_status(&store, "req_a_1", SCOPE_B).is_none());
+        assert!(durable_client_request_status(&store, "req_a_1", SCOPE_B, None).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1244,5 +1406,371 @@ mod tests {
                 "{write} must classify as write"
             );
         }
+    }
+
+    /// user caller | Given a settled request whose first response carried
+    /// receipt identifiers | When the same key retries | Then the replay
+    /// returns the same task_id/receipt_id while body payload stays out of
+    /// the projection.
+    #[test]
+    fn user_prompt_retry_then_replay_returns_same_receipt_identifiers() {
+        let dir = temp_state_dir();
+        let params = json!({"pane": "w1:p1", "prompt": "do it"});
+        let mut store = open_store(&dir);
+        let ids = ids_for(SCOPE_A, &params, "req_prompt_1", false);
+        expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        durable_settle_result(
+            &mut store,
+            &ids,
+            &json!({
+                "ok": true,
+                "task_id": "task_1",
+                "receipt_id": "rcpt_1",
+                "prompt_echo": "body content that must not persist",
+            }),
+            false,
+            1_100,
+        );
+
+        let retry = ids_for(SCOPE_A, &params, "req_prompt_2", false);
+        let replay = replay_body(begin(&mut store, &retry, SCOPE_A, &params, false, 2_000));
+        assert_eq!(replay["deduplicated"], true, "{replay}");
+        assert_eq!(replay["task_id"], "task_1", "{replay}");
+        assert_eq!(replay["receipt_id"], "rcpt_1", "{replay}");
+        assert!(
+            !replay.to_string().contains("prompt_echo"),
+            "receipt whitelist must not retain body fields: {replay}"
+        );
+        // request.status surfaces the same receipt for inspection.
+        let status = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
+        assert_eq!(status["receipt"]["task_id"], "task_1", "{status}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a commit failure whose rollback itself errored |
+    /// When the result settles | Then a delivery_unknown tombstone persists
+    /// and a same-key retry is refused with inspect_before_retry instead of
+    /// re-executing a possibly-applied write.
+    #[test]
+    fn user_write_retry_given_partial_rollback_then_inspect_before_retry() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        let ids = ids_for(SCOPE_A, &params, "req_patch_1", false);
+        expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        assert_eq!(
+            durable_settle_result(
+                &mut store,
+                &ids,
+                &json!({
+                    "ok": false,
+                    "code": "PATCH_COMMIT_FAILED",
+                    "message": "stage failed; rollback errors: remove a.txt: busy",
+                }),
+                false,
+                1_100,
+            ),
+            DurableSettle::RecordedUnknown
+        );
+
+        let retry = ids_for(SCOPE_A, &params, "req_patch_2", false);
+        let body = respond_body(begin(&mut store, &retry, SCOPE_A, &params, false, 2_000));
+        assert_eq!(body["safe_retry_mode"], "inspect_before_retry", "{body}");
+        assert_eq!(body["delivery_state"], "delivery_unknown", "{body}");
+
+        // A clean rollback (no rollback errors) stays rejected: under a
+        // different key the reservation releases and a retry reserves fresh.
+        let clean_params = json!({"path": "b.txt"});
+        let clean = client_request_ids(
+            KIND,
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            "cr-key-2",
+            "req_patch_3",
+            false,
+        );
+        expect_execute(durable_begin_or_replay(
+            &mut store,
+            &clean,
+            "cr-key-2",
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            false,
+            3_000,
+        ));
+        durable_settle_result(
+            &mut store,
+            &clean,
+            &json!({"ok": false, "code": "PATCH_COMMIT_FAILED", "message": "stage failed"}),
+            false,
+            3_100,
+        );
+        let retry = client_request_ids(
+            KIND,
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            "cr-key-2",
+            "req_patch_4",
+            false,
+        );
+        expect_execute(durable_begin_or_replay(
+            &mut store,
+            &retry,
+            "cr-key-2",
+            SCOPE_A,
+            METHOD,
+            &clean_params,
+            false,
+            4_000,
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given the same key stored under two kinds and two
+    /// scopes | When request.status runs per scope | Then each scope reads
+    /// its own record instead of whichever kind scans first.
+    #[test]
+    fn user_status_given_same_key_across_kinds_then_scope_selects_record() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        for (kind, scope, request_id) in [
+            (HERDR_CALL_CLIENT_REQUEST_KIND, SCOPE_A, "req_call_1"),
+            (HERDR_FS_WRITE_CLIENT_REQUEST_KIND, SCOPE_B, "req_write_1"),
+        ] {
+            let ids = client_request_ids(kind, scope, METHOD, &params, KEY, request_id, false);
+            expect_execute(begin(&mut store, &ids, scope, &params, false, 1_000));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        let status_a = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
+        assert_eq!(status_a["request_id"], "req_call_1", "{status_a}");
+        let status_b = durable_client_request_status(&store, KEY, SCOPE_B, None).unwrap();
+        assert_eq!(status_b["request_id"], "req_write_1", "{status_b}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given the same key settled under two write-tool kinds in
+    /// one scope | When request.status runs without a tool hint | Then it
+    /// reports the ambiguity instead of answering for whichever row is newer,
+    /// and a `tool` hint selects the intended record.
+    #[test]
+    fn user_status_given_key_shared_by_two_tools_then_ambiguous_until_tool_hint() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        for (kind, request_id) in [
+            (HERDR_FS_WRITE_CLIENT_REQUEST_KIND, "req_w_1"),
+            (HERDR_FS_PATCH_CLIENT_REQUEST_KIND, "req_p_1"),
+        ] {
+            let ids = client_request_ids(kind, SCOPE_A, METHOD, &params, KEY, request_id, false);
+            expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        let status = durable_client_request_status(&store, KEY, SCOPE_A, None).unwrap();
+        assert_eq!(status["ambiguous"], true, "{status}");
+        assert_eq!(status["matches"].as_array().unwrap().len(), 2, "{status}");
+        let write =
+            durable_client_request_status(&store, KEY, SCOPE_A, Some("herdr_fs_write")).unwrap();
+        assert_eq!(write["request_id"], "req_w_1", "{write}");
+        let patch =
+            durable_client_request_status(&store, KEY, SCOPE_A, Some("herdr_fs_patch")).unwrap();
+        assert_eq!(patch["request_id"], "req_p_1", "{patch}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a first-class write tool settled under its own
+    /// kind | When request.status is queried by the first call's request_id
+    /// after a restart | Then the durable row is found — the request_id scan
+    /// covers every client-request kind, not only herdr_call/herdr_exec.
+    #[test]
+    fn user_status_by_request_id_given_write_tool_then_found_after_restart() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt", "content": "x"});
+        {
+            let mut store = open_store(&dir);
+            let ids = client_request_ids(
+                HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                SCOPE_A,
+                "herdr_fs_write",
+                &params,
+                KEY,
+                "req_write_restart",
+                false,
+            );
+            expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        let store = open_store(&dir);
+        let records = store
+            .client_request_records_for_request_id("req_write_restart")
+            .unwrap();
+        assert_eq!(records.len(), 1, "request_id row must survive restart");
+        let status =
+            durable_client_request_status(&store, "req_write_restart", SCOPE_A, None).unwrap();
+        assert_eq!(status["found"], true, "{status}");
+        assert_eq!(status["state"], "complete", "{status}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a real SQLite write failure at settle time | When
+    /// an executed write tool's terminal record cannot be persisted | Then
+    /// the settlement reports `PersistFailed` and the reservation row stays
+    /// pending — never a `Completed` verdict the caller would trust.
+    #[test]
+    fn user_settle_given_real_write_failure_then_persist_failed_keeps_pending() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt", "content": "x"});
+        let mut store = open_store(&dir);
+        let ids = client_request_ids(
+            HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+            SCOPE_A,
+            "herdr_fs_write",
+            &params,
+            KEY,
+            "req_fail_1",
+            false,
+        );
+        expect_execute(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        // Break every subsequent write through a genuine second connection:
+        // renaming the table is a real SQLite DDL failure surface, not a
+        // mocked store.
+        let breaker = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+        breaker
+            .execute_batch("ALTER TABLE operations RENAME TO operations_broken")
+            .unwrap();
+        drop(breaker);
+        let settled = durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        assert_eq!(settled, DurableSettle::PersistFailed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given one request_id carried by records in different
+    /// scopes and kinds | When request.status resolves the id | Then every
+    /// scope sees its own record, a same-scope cross-kind pair reports
+    /// ambiguity, and a tool hint disambiguates — a foreign row never
+    /// shadows the caller's.
+    #[test]
+    fn user_status_given_request_id_shared_across_scopes_then_each_scope_finds_own() {
+        let dir = temp_state_dir();
+        let params = json!({});
+        let mut store = open_store(&dir);
+        // Scope A holds the id under two kinds (genuinely ambiguous); scope B
+        // under one. Scope B must use a different raw key — the key digest is
+        // scope-blind, so reusing scope A's key would hit idempotency_conflict
+        // at reservation time. Before collecting all candidates the first
+        // scanned row could shadow the caller's own.
+        for (kind, scope, key, req) in [
+            (
+                HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                SCOPE_A,
+                KEY,
+                "req_shared",
+            ),
+            (HERDR_PROMPT_CLIENT_REQUEST_KIND, SCOPE_A, KEY, "req_shared"),
+            (
+                HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+                SCOPE_B,
+                "key-b",
+                "req_shared",
+            ),
+        ] {
+            let ids = client_request_ids(kind, scope, METHOD, &params, key, req, false);
+            expect_execute(durable_begin_or_replay(
+                &mut store, &ids, key, scope, METHOD, &params, false, 1_000,
+            ));
+            durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+        }
+        // Scope B: exactly one candidate under its scope — found, not
+        // shadowed by scope A's earlier rows.
+        let status_b = durable_client_request_status(&store, "req_shared", SCOPE_B, None).unwrap();
+        assert_eq!(status_b["found"], true, "{status_b}");
+        assert_ne!(status_b["ambiguous"], true, "{status_b}");
+        // Scope A: both kinds match — reported ambiguous, then a tool hint
+        // resolves to the fs_write record.
+        let status_a = durable_client_request_status(&store, "req_shared", SCOPE_A, None).unwrap();
+        assert_eq!(status_a["found"], true, "{status_a}");
+        assert_eq!(status_a["ambiguous"], true, "{status_a}");
+        let hinted =
+            durable_client_request_status(&store, "req_shared", SCOPE_A, Some("herdr_fs_write"))
+                .unwrap();
+        assert_eq!(hinted["found"], true, "{hinted}");
+        assert_ne!(hinted["ambiguous"], true, "{hinted}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given first-class write-tool rows filling the ledger |
+    /// When the shared capacity limit is reached | Then the next
+    /// reservation is refused — the new kinds count toward the same
+    /// 1024-row budget and are not exempt from pruning or compaction.
+    #[test]
+    fn user_reservation_given_new_kinds_fill_capacity_then_refused() {
+        let dir = temp_state_dir();
+        let params = json!({});
+        let mut store = open_store(&dir);
+        for i in 0..CLIENT_REQUEST_LEDGER_MAX_ROWS {
+            let kind = CLIENT_REQUEST_KINDS[(i as usize) % CLIENT_REQUEST_KINDS.len()];
+            let key = format!("cap-key-{i}");
+            let ids = client_request_ids(kind, SCOPE_A, METHOD, &params, &key, "req_cap", false);
+            match durable_begin_or_replay(
+                &mut store, &ids, &key, SCOPE_A, METHOD, &params, false, 1_000,
+            ) {
+                ClientRequestOutcome::Execute { .. } => {}
+                ClientRequestOutcome::Replay(v) => panic!("row {i} replayed: {v}"),
+                ClientRequestOutcome::Respond(v) => panic!("row {i} responded: {v}"),
+            }
+        }
+        let ids = ids_for(SCOPE_A, &params, "req_cap_over", false);
+        let body = respond_body(begin(&mut store, &ids, SCOPE_A, &params, false, 1_000));
+        assert_eq!(body["code"], "client_request_ledger_full", "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// user caller | Given a settled first-class write-tool summary past its
+    /// deadline | When the next reservation triggers cleanup | Then the
+    /// new-kind row compacts to the same hash-only tombstone as herdr_call.
+    #[test]
+    fn user_retry_given_expired_summary_on_write_tool_kind_then_tombstoned() {
+        let dir = temp_state_dir();
+        let params = json!({"path": "a.txt"});
+        let mut store = open_store(&dir);
+        let ids = client_request_ids(
+            HERDR_FS_WRITE_CLIENT_REQUEST_KIND,
+            SCOPE_A,
+            "herdr_fs_write",
+            &params,
+            KEY,
+            "req_t_fw",
+            false,
+        );
+        expect_execute(durable_begin_or_replay(
+            &mut store,
+            &ids,
+            KEY,
+            SCOPE_A,
+            "herdr_fs_write",
+            &params,
+            false,
+            1_000,
+        ));
+        durable_settle_result(&mut store, &ids, &ok_result(), false, 1_100);
+
+        // A later reservation (any kind) must run the same compaction pass
+        // over the fs_write row.
+        let past = 1_100 + CLIENT_REQUEST_SUMMARY_TTL_MS + 1;
+        let other = ids_for(SCOPE_A, &params, "req_t_other", false);
+        let _ = begin(&mut store, &other, SCOPE_A, &params, false, past);
+        let record = store
+            .client_request_record(HERDR_FS_WRITE_CLIENT_REQUEST_KIND, &ids.key_digest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state.as_deref(), Some("complete"));
+        assert_eq!(record.expires_at, None, "tombstone must stay unprunable");
+        let result = record.result();
+        assert_eq!(result["expired"], true, "{result}");
+        assert_eq!(result["outcome"], "expired", "{result}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

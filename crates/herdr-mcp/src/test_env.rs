@@ -120,8 +120,18 @@ pub(crate) struct TempUnixSocketGuard {
 impl TempUnixSocketGuard {
     /// Guard a socket file: `Drop` runs `fs::remove_file`, ignoring `NotFound`.
     pub(crate) fn file(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        // Static SUN_LEN guard: a socket path that fits nowhere fails only
+        // on the platform whose temp root is long (macOS), so assert the
+        // budget here instead of discovering it on one developer machine.
+        #[cfg(unix)]
+        assert!(
+            path.as_os_str().len() <= 100,
+            "test unix socket path exceeds the SUN_LEN budget: {}",
+            path.display()
+        );
         Self {
-            path: path.into(),
+            path,
             remove_dir: false,
         }
     }

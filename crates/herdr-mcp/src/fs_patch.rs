@@ -251,11 +251,16 @@ pub fn apply(snapshot: &Value, args: &Value) -> Value {
             .iter()
             .map(|item| item.stage.clone())
             .collect::<Vec<_>>();
-        if let Err(message) = mutation::commit_atomic(&transaction) {
+        if let Err(error) = mutation::commit_atomic(&transaction) {
             return json!({
                 "ok": false,
                 "code": "PATCH_COMMIT_FAILED",
-                "message": message,
+                "message": error.message,
+                // Structured signal for the durable client-request ledger: a
+                // failed rollback may have left staged mutations partially
+                // applied, so the settle classifier marks delivery unknown
+                // instead of releasing the reservation.
+                "rollback_failed": error.rollback_failed,
                 "hint": "patch rolled back when possible; re-read files and regenerate",
             });
         }

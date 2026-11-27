@@ -598,7 +598,7 @@ pub(crate) fn persist_tcc_preflight(
             .map(|elapsed| elapsed.as_millis() as u64)
             .unwrap_or_default()
     );
-    crate::mutation::atomic_write(&path, view.to_string().as_bytes())
+    crate::mutation::atomic_write(&path, view.to_string().as_bytes()).map_err(|error| error.message)
 }
 
 /// Persisted preflight view, or an explicit `unknown` shape when no update has
