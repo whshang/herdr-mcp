@@ -61,6 +61,11 @@ const HERDR_CALL_TOP_LEVEL_ARGS: ReadonlySet<string> = new Set([
   "params",
   "device",
   "idempotency_key",
+  // #1094: durable write dedupe key. Opaque to the Edge (forwarded to the
+  // runtime untouched); accepting it here lets P0-a first-class write tools
+  // also flow through the generic herdr_call surface without a whitelist
+  // rejection.
+  "client_request_id",
 ]);
 
 /**
@@ -189,7 +194,7 @@ export interface McpClientContext {
   /** Display identity only. Never used as a grant principal. */
   platformAccount?: string | null;
   grantGeneration?: number | null;
-  authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | null;
+  authSource?: "dev_bearer" | "static_bearer" | "oauth_jwt" | "oauth_edge" | "device_credential" | null;
   webchatControlGrants?: readonly WebChatControlGrant[];
   pageAssistGrants?: readonly PageAssistGrant[];
   /** Bound device_id for an automation principal; forces routing to that device. */
@@ -1385,7 +1390,7 @@ export async function handleMcp(
           retryable: false,
           delivery_state: "not_delivered",
           failure_layer: "edge_routing",
-          message: `unknown top-level argument '${key}'; herdr_call only accepts 'method', 'params', optional 'device' and optional 'idempotency_key'`,
+          message: `unknown top-level argument '${key}'; herdr_call only accepts 'method', 'params', optional 'device', optional 'idempotency_key' and optional 'client_request_id'`,
         }, true));
       }
       if (args.params !== undefined && args.params !== null) {
