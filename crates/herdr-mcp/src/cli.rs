@@ -75,6 +75,11 @@ pub enum Command {
     /// Internal clean filter: strip the managed handoff block from stdin.
     GitFilterStripHandoff,
     Link(LinkCommand),
+    /// #1094 P0: resident same-machine stdio shim bridging to loopback `/mcp`.
+    McpStdio {
+        /// Print the client connection details (no credential) and exit.
+        print_config: bool,
+    },
     TccBroker(TccBrokerCommand),
     TccBrokerRun,
     TccHerdrHost,
@@ -719,7 +724,18 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         "artifact" => parse_artifact(&args[1..]),
         "git-filter" => parse_git_filter(&args[1..]),
         "link" => parse_link(&args[1..]),
+        "mcp-stdio" => parse_mcp_stdio(&args[1..]),
         value => Err(format!("unknown command '{value}'\n\n{}", help())),
+    }
+}
+
+fn parse_mcp_stdio(args: &[String]) -> Result<Command, String> {
+    match args {
+        [] => Ok(Command::McpStdio {
+            print_config: false,
+        }),
+        [flag] if flag == "--print-config" => Ok(Command::McpStdio { print_config: true }),
+        _ => Err("usage: herdr-mcp mcp-stdio [--print-config]".to_owned()),
     }
 }
 

@@ -55,6 +55,7 @@ mod macos_permissions;
 mod macos_privacy;
 mod mcp;
 mod mcp_http;
+mod mcp_stdio_shim;
 mod model_alias;
 mod mutation;
 mod native_host;
@@ -190,6 +191,7 @@ fn run() -> Result<ExitCode, String> {
             println!("contract hash {}", contract.hash);
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::McpStdio { print_config } => mcp_stdio_shim::run(print_config),
         cli::Command::Status { verbose } => {
             let paths = paths::RuntimePaths::discover()?;
             let config = config::Config::load_for_instance(&paths.config_file, &paths.instance)?;
