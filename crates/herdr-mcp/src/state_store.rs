@@ -9221,7 +9221,8 @@ impl StateStore {
             .prepare(
                 "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
                  FROM exec_sessions
-                 WHERE session_id = ?1 AND state = 'closed'",
+                 WHERE session_id = ?1
+                   AND state = 'closed'",
             )
             .map_err(|error| format!("cannot prepare closed exec session query: {error}"))?;
         let mut rows = stmt
@@ -9251,6 +9252,299 @@ impl StateStore {
                     exit_code,
                     signal,
                     expires_at_ms,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// A `closed_before_restart` row whose retention window is still open.
+    /// The settle already proved the process dead, so unlike
+    /// `get_unsettled_exec_session` this state may serve a committed spool
+    /// without any live-process fence; `reaped_on_restart` and
+    /// `detached_unverified` rows are deliberately not matched here
+    /// (Codex 7037326311 P1).
+    pub fn get_closed_before_restart_exec_session(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1
+                   AND state = 'closed_before_restart'
+                   AND (expires_at IS NULL OR expires_at > ?2)",
+            )
+            .map_err(|error| format!("cannot prepare recovered exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![session_id, now_i64], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query recovered exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode recovered exec session: {error}"))?;
+                let started_at_ms = u64::try_from(started_at).unwrap_or(0);
+                let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
+                let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms,
+                    ended_at_ms,
+                    exit_code,
+                    signal,
+                    expires_at_ms,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The persisted `started_at` for any session state — used to keep real
+    /// timestamps on records reconstructed for spool reads (pi 7037465609).
+    pub fn exec_session_started_at(&self, session_id: &str) -> Result<Option<u64>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT started_at FROM exec_sessions WHERE session_id = ?1")
+            .map_err(|error| format!("cannot prepare exec session started_at query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("cannot query exec session started_at: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let started_at =
+                    row.map_err(|error| format!("cannot decode started_at: {error}"))?;
+                Ok(Some(u64::try_from(started_at).unwrap_or(0)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// A close whose SQLite settle failed. The row is no longer `running`, so
+    /// restart recovery will not treat the command as a live process, and a
+    /// later read can rebuild incomplete evidence instead of `session_not_found`.
+    /// `expires_at` is required so the abandoned fact cannot outlive the
+    /// session TTL. Callers must not replay the command from this state.
+    #[cfg(test)]
+    pub fn fail_next_exec_settle_for_test(&self) {
+        let _ = self
+            .conn
+            .execute("CREATE TRIGGER fail_exec_settle BEFORE UPDATE OF state ON exec_sessions WHEN NEW.state = 'closed' BEGIN SELECT RAISE(ABORT, 'test settle failure'); END", []);
+    }
+
+    /// Both the closed settle and the abandoned marker fail, matching a
+    /// `PRAGMA query_only` database. The row stays `running`.
+    #[cfg(test)]
+    pub fn fail_exec_state_writes_for_test(&self) {
+        let _ = self.conn.execute(
+            "CREATE TRIGGER fail_exec_state_writes BEFORE UPDATE OF state ON exec_sessions BEGIN SELECT RAISE(ABORT, 'test query_only'); END",
+            [],
+        );
+    }
+
+    /// A close whose settle and abandoned marker both failed. The row is still
+    /// `running`, so this lookup is only a read-side fallback for a committed
+    /// spool. It does not make the command replayable and does not change the
+    /// row into a live process recovery candidate. A native row keeps its pid;
+    /// restart recovery settles that dead process before this lookup runs.
+    #[cfg(test)]
+    pub fn exec_session_pid_for_test(&self, session_id: &str) -> Result<Option<u32>, String> {
+        let pid = self
+            .conn
+            .query_row(
+                "SELECT pid FROM exec_sessions WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|error| format!("cannot read exec session pid: {error}"))?;
+        Ok(pid.and_then(|pid| u32::try_from(pid).ok()))
+    }
+
+    #[cfg(test)]
+    pub fn expire_exec_session_for_test(
+        &self,
+        session_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE exec_sessions SET expires_at = ?2 WHERE session_id = ?1",
+                rusqlite::params![session_id, i64::try_from(expires_at_ms).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| format!("cannot expire exec session: {error}"))?;
+        Ok(())
+    }
+
+    pub fn unsettled_pidless_exec_session_ids(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id FROM exec_sessions
+                 WHERE state = 'running' AND pid IS NULL AND expires_at IS NULL",
+            )
+            .map_err(|error| format!("cannot prepare pidless exec session query: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("cannot query pidless exec sessions: {error}"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(|error| format!("cannot decode pidless exec session: {error}"))?);
+        }
+        Ok(ids)
+    }
+
+    pub fn bound_unsettled_exec_session(
+        &self,
+        session_id: &str,
+        ended_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE exec_sessions SET
+                    ended_at = COALESCE(ended_at, ?2),
+                    expires_at = COALESCE(expires_at, ?3)
+                 WHERE session_id = ?1
+                   AND state = 'running'
+                   AND pid IS NULL
+                   AND ended_at IS NULL",
+                rusqlite::params![
+                    session_id,
+                    i64::try_from(ended_at_ms).unwrap_or(i64::MAX),
+                    i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("cannot bound unsettled exec session: {error}"))?;
+        Ok(changed == 1)
+    }
+
+    pub fn get_unsettled_exec_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1 AND state = 'running' AND pid IS NULL",
+            )
+            .map_err(|error| format!("cannot prepare unsettled exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i32>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .map_err(|error| format!("cannot query unsettled exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode unsettled exec session: {error}"))?;
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms: u64::try_from(started_at).unwrap_or(0),
+                    ended_at_ms: ended_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                    exit_code,
+                    signal,
+                    expires_at_ms: expires_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn mark_exec_session_abandoned(
+        &self,
+        session_id: &str,
+        ended_at_ms: u64,
+        exit_code: Option<i32>,
+        signal: Option<&str>,
+        expires_at_ms: u64,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE exec_sessions SET
+                    ended_at = ?2,
+                    exit_code = ?3,
+                    signal = ?4,
+                    state = 'abandoned',
+                    expires_at = ?5
+                 WHERE session_id = ?1 AND state = 'running'",
+                rusqlite::params![
+                    session_id,
+                    i64::try_from(ended_at_ms).unwrap_or(i64::MAX),
+                    exit_code,
+                    signal,
+                    i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("cannot mark abandoned exec session: {error}"))?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot mark abandoned exec session {session_id}: durable running row is missing"
+            ))
+        }
+    }
+
+    pub fn get_abandoned_exec_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ClosedExecSessionRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE session_id = ?1 AND state = 'abandoned'",
+            )
+            .map_err(|error| format!("cannot prepare abandoned exec session query: {error}"))?;
+        let mut rows = stmt
+            .query_map([session_id], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query abandoned exec session: {error}"))?;
+        match rows.next() {
+            Some(row) => {
+                let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                    row.map_err(|error| format!("cannot decode abandoned exec session: {error}"))?;
+                Ok(Some(ClosedExecSessionRecord {
+                    session_id,
+                    started_at_ms: u64::try_from(started_at).unwrap_or(0),
+                    ended_at_ms: ended_at.map(|value| u64::try_from(value).unwrap_or(0)),
+                    exit_code,
+                    signal,
+                    expires_at_ms: expires_at.map(|value| u64::try_from(value).unwrap_or(0)),
                 }))
             }
             None => Ok(None),
@@ -9291,6 +9585,60 @@ impl StateStore {
         for row in rows {
             let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
                 row.map_err(|error| format!("cannot decode closed exec sessions row: {error}"))?;
+            let started_at_ms = u64::try_from(started_at).unwrap_or(0);
+            let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
+            let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
+            result.push(ClosedExecSessionRecord {
+                session_id,
+                started_at_ms,
+                ended_at_ms,
+                exit_code,
+                signal,
+                expires_at_ms,
+            });
+        }
+        Ok(result)
+    }
+
+    /// `closed_before_restart` rows whose retention window is still open —
+    /// settled-dead sessions that must stay listable and readable across
+    /// further restarts (Codex 7038025777 P2). Live-fence states
+    /// (`reaped_on_restart`, `detached_unverified`) are not matched.
+    pub fn closed_before_restart_exec_sessions(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<ClosedExecSessionRecord>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id, started_at, ended_at, exit_code, signal, expires_at
+                 FROM exec_sessions
+                 WHERE state = 'closed_before_restart'
+                   AND (expires_at IS NULL OR expires_at > ?1)
+                 ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, session_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| format!("cannot prepare recovered exec sessions query: {error}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![now_i64, limit], |row| {
+                let session_id: String = row.get(0)?;
+                let started_at: i64 = row.get(1)?;
+                let ended_at: Option<i64> = row.get(2)?;
+                let exit_code: Option<i32> = row.get(3)?;
+                let signal: Option<String> = row.get(4)?;
+                let expires_at: Option<i64> = row.get(5)?;
+                Ok((
+                    session_id, started_at, ended_at, exit_code, signal, expires_at,
+                ))
+            })
+            .map_err(|error| format!("cannot query recovered exec sessions: {error}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (session_id, started_at, ended_at, exit_code, signal, expires_at) =
+                row.map_err(|error| format!("cannot decode recovered exec sessions row: {error}"))?;
             let started_at_ms = u64::try_from(started_at).unwrap_or(0);
             let ended_at_ms = ended_at.map(|v| u64::try_from(v).unwrap_or(0));
             let expires_at_ms = expires_at.map(|v| u64::try_from(v).unwrap_or(0));
